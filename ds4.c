@@ -17764,6 +17764,16 @@ int ds4_engine_vocab_size(ds4_engine *e) {
     return e ? e->vocab.n_vocab : 0;
 }
 
+int ds4_engine_power(ds4_engine *e) {
+    return e ? e->power_percent : 100;
+}
+
+int ds4_engine_set_power(ds4_engine *e, int power_percent) {
+    if (!e || power_percent < 1 || power_percent > 100) return 1;
+    e->power_percent = power_percent;
+    return 0;
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
     weights_free(&e->weights);
@@ -17844,6 +17854,20 @@ void ds4_session_free(ds4_session *s) {
     free(s->logits);
     free(s->mtp_logits);
     free(s);
+}
+
+int ds4_session_power(ds4_session *s) {
+    if (!s || !s->engine) return 100;
+    return s->engine->power_percent;
+}
+
+int ds4_session_set_power(ds4_session *s, int power_percent) {
+    if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
+    s->engine->power_percent = power_percent;
+#ifndef DS4_NO_GPU
+    if (!ds4_session_is_cpu(s)) s->graph.power_percent = (uint32_t)power_percent;
+#endif
+    return 0;
 }
 
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {

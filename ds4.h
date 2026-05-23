@@ -97,6 +97,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
+int ds4_engine_power(ds4_engine *e);
+int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
@@ -152,6 +154,8 @@ int ds4_token_assistant(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
+int ds4_session_power(ds4_session *s);
+int ds4_session_set_power(ds4_session *s, int power_percent);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
  * callers must not treat it as a durable KV checkpoint boundary. */

@@ -106,6 +106,8 @@ typedef struct {
     bool initialized;
     bool queued_user_pending;
     bool save_requested;
+    bool power_requested;
+    int requested_power;
     int progress_base;
     char *cmd_text;
     agent_status status;
@@ -368,6 +370,14 @@ static int parse_int(const char *s, const char *opt) {
     return (int)v;
 }
 
+static bool parse_power_percent(const char *arg, int *out) {
+    char *end = NULL;
+    long v = strtol(arg, &end, 10);
+    if (!arg[0] || *end != '\0' || v < 1 || v > 100) return false;
+    *out = (int)v;
+    return true;
+}
+
 static uint64_t parse_u64(const char *s, const char *opt) {
     char *end = NULL;
     unsigned long long v = strtoull(s, &end, 10);
@@ -456,6 +466,7 @@ static void usage(FILE *fp) {
         "  /list                  List saved sessions in ~/.ds4/kvcache.\n"
         "  /switch SHA            Load a saved session and show recent history.\n"
         "  /history [N]           Show N recent user turns from the current session.\n"
+        "  /power N               Set GPU duty cycle percentage, 1..100.\n"
         "  /new                   Start a fresh session from the system prompt.\n"
         "  /quit, /exit           Exit.\n");
 }
@@ -6174,10 +6185,30 @@ static void worker_request_save(agent_worker *w) {
     pthread_mutex_unlock(&w->mu);
 }
 
+static void worker_request_power(agent_worker *w, int power) {
+    pthread_mutex_lock(&w->mu);
+    w->requested_power = power;
+    w->power_requested = true;
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
 static bool worker_take_save_requested(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool requested = w->save_requested;
     w->save_requested = false;
+    pthread_mutex_unlock(&w->mu);
+    return requested;
+}
+
+static bool worker_take_power_requested(agent_worker *w, int *power) {
+    pthread_mutex_lock(&w->mu);
+    bool requested = w->power_requested;
+    if (requested) {
+        if (power) *power = w->requested_power;
+        w->power_requested = false;
+    }
     pthread_mutex_unlock(&w->mu);
     return requested;
 }
@@ -6193,6 +6224,17 @@ static void worker_run_deferred_save(agent_worker *w) {
     else
         agent_publishf(w, "\nsave failed: %s\n", err[0] ? err : "unknown error");
     agent_set_status(w, AGENT_WORKER_IDLE);
+}
+
+static void worker_run_deferred_power(agent_worker *w) {
+    int power = 0;
+    if (!worker_take_power_requested(w, &power)) return;
+    if (ds4_session_set_power(w->session, power) != 0) {
+        agent_publishf(w, "\npower change failed\n");
+        return;
+    }
+    w->cfg->engine.power_percent = power;
+    agent_publishf(w, "\npower set to %d%%\n", power);
 }
 
 /* Worker thread entry point.  The UI thread submits plain user text; this
@@ -6216,11 +6258,16 @@ static void *worker_main(void *arg) {
 
     while (true) {
         pthread_mutex_lock(&w->mu);
-        while (!w->stop && !w->cmd_text && !w->save_requested)
+        while (!w->stop && !w->cmd_text && !w->save_requested && !w->power_requested)
             pthread_cond_wait(&w->cond, &w->mu);
         if (w->stop) {
             pthread_mutex_unlock(&w->mu);
             break;
+        }
+        if (w->power_requested) {
+            pthread_mutex_unlock(&w->mu);
+            worker_run_deferred_power(w);
+            continue;
         }
         if (!w->cmd_text && w->save_requested) {
             pthread_mutex_unlock(&w->mu);
@@ -6233,6 +6280,7 @@ static void *worker_main(void *arg) {
 
         worker_run_turn(w, cmd);
         free(cmd);
+        worker_run_deferred_power(w);
         worker_run_deferred_save(w);
     }
 
@@ -7380,6 +7428,7 @@ static void runtime_help(void) {
     puts("  /list        List saved sessions.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /history [N] Show N recent user turns from the current session.");
+    puts("  /power N     Set GPU duty cycle percentage, 1..100.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");
@@ -7896,6 +7945,22 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     }
                 } else if (!strcmp(cmd, "/list")) {
                     agent_worker_list_sessions(&worker);
+                } else if (!strncmp(cmd, "/power", 6) &&
+                           (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
+                    char *arg = cmd + 6;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (!arg[0]) {
+                        printf("power: %d%%\n", cfg->engine.power_percent > 0 ?
+                               cfg->engine.power_percent : ds4_engine_power(engine));
+                    } else {
+                        int power = 0;
+                        if (!parse_power_percent(arg, &power)) {
+                            printf("usage: /power <1..100>\n");
+                        } else {
+                            worker_request_power(&worker, power);
+                            if (busy) printf("power change scheduled: %d%%\n", power);
+                        }
+                    }
                 } else if (cmd[0] == '/' && busy) {
                     printf("command requires the model to be idle: %s\n", cmd);
                 } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
