@@ -818,6 +818,25 @@ static bool web_cdp_prepare_page(cdp_ws *ws, char *err, size_t err_len) {
     return web_wait_ready(ws, err, err_len);
 }
 
+static void web_scroll_dynamic_page(cdp_ws *ws) {
+    const char *expr =
+        "(() => new Promise(resolve => {"
+        "let last=-1,same=0,steps=0;"
+        "const tick=()=>{"
+        "const text=((document.body&&document.body.innerText)||'').length;"
+        "if(text===last)same++;else same=0;last=text;"
+        "window.scrollBy(0,Math.max(700,Math.floor(innerHeight*0.85)));"
+        "steps++;"
+        "if(steps>=14||same>=3){resolve('scrolled '+steps+' text='+text);return;}"
+        "setTimeout(tick,650);"
+        "};"
+        "tick();"
+        "}))()";
+    char err[160] = {0};
+    char *res = web_cdp_eval_string(ws, expr, err, sizeof(err));
+    free(res);
+}
+
 static char *web_chrome_executable(void) {
     const char *env = getenv("DS4_CHROME");
     if (env && env[0]) return web_xstrdup(env);
@@ -1043,7 +1062,7 @@ static const char *web_extract_page_js =
 "if(el.tagName==='CODE')return '`'+clean(el.innerText||el.textContent).replace(/`/g,'\\\\`')+'`';"
 "return [...el.childNodes].map(inline).join('');};"
 "const lines=[`# ${clean(document.title)||location.href}`,'',`URL: ${location.href}`,'','## Content'];"
-"const blocks=[...document.body.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,pre,blockquote,td,th')];"
+"const blocks=[...document.body.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,pre,blockquote,td,th,[id=\"content-text\"],[class*=\"comment-body\"],[class*=\"comment-content\"],[data-testid*=\"comment-text\"]')];"
 "const seen=new Set();"
 "for(const el of blocks){if(!visible(el))continue;let s='';const tag=el.tagName;"
 "if(/^H[1-6]$/.test(tag)){s='#'.repeat(Number(tag[1]))+' '+inline(el);}"
@@ -1060,6 +1079,7 @@ static const char *web_extract_page_js =
 "})()";
 
 static char *web_run_page_js(ds4_web *web, const char *url, const char *js,
+                             bool dynamic_scroll,
                              char *err, size_t err_len) {
     if (!web_ensure_browser(web, err, err_len)) return NULL;
     web_tab tab = {0};
@@ -1091,6 +1111,7 @@ static char *web_run_page_js(ds4_web *web, const char *url, const char *js,
         (void)web_wait_navigated_ready(&ws, url, err, err_len);
     }
     free(clicked);
+    if (dynamic_scroll) web_scroll_dynamic_page(&ws);
     char *out = web_cdp_eval_string(&ws, js, err, err_len);
     web_ws_close(&ws);
     web_close_tab(web, &tab);
@@ -1141,7 +1162,7 @@ char *ds4_web_google_search(ds4_web *web, const char *query,
     web_buf_puts(&url, q);
     free(q);
     char *url_s = web_buf_take(&url);
-    char *out = web_run_page_js(web, url_s, web_extract_search_js, err, err_len);
+    char *out = web_run_page_js(web, url_s, web_extract_search_js, false, err, err_len);
     free(url_s);
     return out;
 }
@@ -1156,5 +1177,5 @@ char *ds4_web_visit_page(ds4_web *web, const char *url,
         web_set_err(err, err_len, "visit_page requires url");
         return NULL;
     }
-    return web_run_page_js(web, url, web_extract_page_js, err, err_len);
+    return web_run_page_js(web, url, web_extract_page_js, true, err, err_len);
 }
