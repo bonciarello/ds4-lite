@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_web.h"
 #include "linenoise.h"
@@ -486,62 +487,8 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "Usage: ds4-agent [options]\n"
-        "\n"
-        "This is an experimental native DS4 agent MVP. It keeps the terminal\n"
-        "responsive with linenoise's multiplexed API while a model worker owns\n"
-        "the live KV session.\n"
-        "\n"
-        "Options:\n"
-        "  -m, --model FILE        GGUF model path. Default: ds4flash.gguf\n"
-        "  --mtp FILE             Optional MTP support GGUF.\n"
-        "  --mtp-draft N          Maximum MTP draft tokens. Default: 1\n"
-        "  --mtp-margin F         MTP verifier margin. Default: 3\n"
-        "  -c, --ctx N            Context size. Default: 100000\n"
-        "  -n, --tokens N         Max generated tokens per turn. Default: 50000\n"
-        "  -p, --prompt TEXT      Submit an initial prompt after startup.\n"
-        "  --non-interactive      Run without the TUI. With -p: one turn and exit;\n"
-        "                         without -p: read repeated prompts from stdin.\n"
-        "  -sys, --system TEXT    Extra system prompt. Empty disables extra text.\n"
-        "  --trace FILE           Write prompt, token, and DSML debug trace.\n"
-        "  --temp F               Sampling temperature. Default: 1\n"
-        "  --top-p F              Nucleus sampling probability. Default: 1\n"
-        "  --min-p F              Min-p sampling threshold. Default: 0.05\n"
-        "  --seed N               Sampling seed.\n"
-        "  --think                Use normal thinking mode. Default.\n"
-        "  --think-max            Use Think Max when context is large enough.\n"
-        "  --nothink              Disable thinking.\n"
-        "  --backend NAME         metal, cuda, or cpu.\n"
-        "  --metal, --cuda, --cpu Select backend explicitly.\n"
-        "  -t, --threads N        CPU helper threads.\n"
-        "  --chdir DIR            Change working directory before loading runtime assets.\n"
-        "  --quality              Prefer exact kernels where available.\n"
-        "  --warm-weights         Touch mapped tensor pages before generation.\n"
-        "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
-        "  --dir-steering-file FILE\n"
-        "  --dir-steering-ffn F\n"
-        "  --dir-steering-attn F\n"
-        "\n"
-        "Distributed:\n");
-    ds4_dist_usage(fp);
-    fprintf(fp,
-        "\n"
-        "  -h, --help             Show this help.\n"
-        "\n"
-        "Commands:\n"
-        "  /help                  Show runtime help.\n"
-        "  /save                  Save the current agent session.\n"
-        "  /compact               Compact the current session context now.\n"
-        "  /list                  List saved sessions in ~/.ds4/kvcache.\n"
-        "  /switch SHA            Load a saved session and show recent history.\n"
-        "  /del SHA               Delete a saved session.\n"
-        "  /strip SHA             Remove KV payload from a saved session.\n"
-        "  /history [N]           Show N recent user turns from the current session.\n"
-        "  /power N               Set GPU duty cycle percentage, 1..100.\n"
-        "  /new                   Start a fresh session from the system prompt.\n"
-        "  /quit, /exit           Exit.\n");
+static void usage(FILE *fp, const char *topic) {
+    ds4_help_print(fp, DS4_HELP_AGENT, topic);
 }
 
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
@@ -575,7 +522,9 @@ static agent_config parse_options(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            usage(stdout);
+            const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                argv[i + 1] : NULL;
+            usage(stdout, topic);
             exit(0);
         }
         char dist_parse_err[256] = {0};
@@ -661,7 +610,7 @@ static agent_config parse_options(int argc, char **argv) {
             steering_scale_set = true;
         } else {
             fprintf(stderr, "ds4-agent: unknown option: %s\n", arg);
-            usage(stderr);
+            usage(stderr, NULL);
             exit(2);
         }
     }
