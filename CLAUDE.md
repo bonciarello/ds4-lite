@@ -104,9 +104,14 @@ Stato:
       `ds4_dense_generate` (helper `ds4_model_is_dense` in `ds4.c`, routing in `main()`
       di `ds4_cli.c`). `./ds4 -m qwen2.gguf -p "..."` funziona. (Chat/server dense = follow-up.)
     - ⏸️ **Velocità** (~4 tok/s, ~10x più lento di llama.cpp): **compute-bound** sui kernel
-      reference 1-thread/riga. Il batching dei command buffer (`begin/end_commands`) NON
-      aiuta (provato e revertito) — l'overhead di dispatch non è il collo di bottiglia. Il
-      vero lever è kernel matvec **simdgroup-cooperativi** (riscrittura, da validare passo-passo).
+      reference 1-thread/riga. Tentativi (entrambi corretti ma NON più veloci, revertiti):
+      (a) **batching** command buffer (`begin/end_commands`) — l'overhead dispatch non è il
+      collo di bottiglia; (b) **simdgroup-per-riga** (32 thread/riga, blocchi strided +
+      `simd_sum`) — **più lento**: con `n_embd=3584` ci sono solo 14 blocchi/riga (<32 lane)
+      → sotto-utilizzo + overhead simd_sum, e l'output matvec lancia 4.8M thread per lavoro
+      minimo. Il vero lever resta un matvec a **parallelismo per-elemento** (32 thread sui
+      ~3584 elementi della riga, non sui 14 blocchi) con dequant per-elemento — più complesso,
+      payoff incerto, follow-up dedicato.
     - ⏸️ **Zero-copy weight wrap**: `ds4_gpu_wrap_model_range` restituisce un `MTLBuffer`
       grezzo, i miei helper usano `ds4_gpu_tensor` (mismatch astrazione) → più invasivo.
       Ora copia ~4.7GB su GPU (ok su 32GB unified; `ds4_gpu_set_model_map_range` mappa le view).
