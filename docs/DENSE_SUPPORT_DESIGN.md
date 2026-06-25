@@ -238,6 +238,32 @@ richiedono il grafo dense su Metal, costruito incrementalmente confrontando lo
 stato nascosto layer-per-layer con llama.cpp. Lo strumento di validazione è
 `tests/bench_dense.sh` (gate finale: 3.7 PASS = output identico all'oracolo).
 
+## 4d. Ricognizione Fase 3.5 — port Metal (kernel disponibili)
+
+**Metal gira su macOS** (solo il path CPU crasha): il port Metal È validabile su
+Mac. Mattoni già presenti, in gran parte NON DeepSeek-specifici:
+
+- `metal/dense.metal` (~1600 righe): matmul/matvec generici
+  `kernel_mul_mv_{f32,f16}_f32`, `kernel_mul_mm_{q8_0,q4_K,f16}_f32` + dequant
+  `dequantize_{f16,q8_0}`. **Sono i mattoni del path denso.**
+- `metal/flash_attn.metal`: `kernel_flash_attn_ext*` (attention) — ma tarata su
+  dim DeepSeek (dk512/dv512); una variante GQA dense vuole head_dim=128.
+- `kernel_dsv4_qkv_rms_norm_f32_4` (RMSNorm), `kernel_dsv4_rope_tail_f32` (RoPE
+  **GPT-J**, serve variante **NEOX** per Qwen2).
+
+Sequenza di build proposta (host-side in `ds4.c`, entry da affiancare a
+`metal_graph_encode_layer_{attention,ffn}_batch` e `metal_graph_eval_token_raw_swa`):
+1. Buffer GPU per pesi densi + KV cache dense standard (K/V [n_kv*hd*ctx]).
+2. Kernel RoPE NEOX (adattare `dsv4_rope_tail` o nuovo in `metal/dense.metal`).
+3. Encode layer denso: rms_norm → mul_mv Q/K/V (+bias) → rope → flash_attn (o
+   softmax pool) → mul_mv out → residuo → rms_norm → SwiGLU (mul_mv gate/up +
+   silu·mul + mul_mv down) → residuo.
+4. Embedding (dequant riga) + output (rms_norm + mul_mv) → logits.
+5. Wire in `metal_graph_eval_token_raw_swa` dietro `ds4_arch_is_deepseek()`.
+Validazione: stato nascosto layer-0 e poi greedy completo vs llama.cpp
+(`tests/bench_dense.sh`), **eseguibile su questo Mac**. Oracolo numerico: il
+CPU reference (Fase 3.4) una volta validato su Linux, o direttamente llama.cpp.
+
 ## 5. Prossimo passo concreto (inizio Fase 1)
 
 1. Aggiungere `ds4_arch_family` e i campi `arch/n_ff/meta_ns` a `ds4_shape`
