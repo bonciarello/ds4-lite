@@ -71,14 +71,19 @@ Stato:
     esegue `kernel_mul_mv_f32_f32` su GPU e confronta col dot product CPU → **PASS**
     (<1e-4). Valida il path di dispatch denso (buffer/args/pipeline/encode/readback)
     end-to-end, senza modello. Kernel densi confermati in `metal/dense.metal`.
-    Step validati (in `--metal-dense-selftest`, su M1 Max):
-    - step 1 ✅ matvec **Q8_0** GPU vs CPU dequant (<1e-4)
-    - step 2 ✅ kernel **RoPE NEOX** (`kernel_dense_rope_neox_f32` in `metal/dense.metal`) vs CPU (<1e-5)
-  - **Prossimi 3.5**: step 3 = encode layer denso completo (attn GQA + softmax/flash
-    + FFN SwiGLU) con confronto hidden-state; step 4 = KV cache dense GPU + wiring in
+    Step validati (in `--metal-dense-selftest`, su M1 Max, tutti vs CPU ref):
+    - step 0/1 ✅ matvec **F32 + Q8_0** (<1e-4)
+    - step 2 ✅ kernel **RoPE NEOX** (`kernel_dense_rope_neox_f32`) (<1e-5)
+    - step 3a ✅ kernel **SwiGLU + RMSNorm** densi (<1e-5)
+    - step 3b ✅ **blocco FFN completo** (rmsnorm→gate/up→swiglu→down→residuo) chainato (<1e-4)
+    Kernel densi in `metal/dense.metal`; helper host riusabili `ds4_gpu_run_simple`,
+    `ds4_gpu_dense_matvec_f32`, `ds4_gpu_matvec_run_once`.
+  - **Prossimi 3.5**: step 3c = **blocco attention GQA** (q/k/v matvec+bias → RoPE →
+    softmax su KV → out matvec → residuo) — serve kernel softmax/attention + KV.
+    step 4 = layer denso completo + KV cache dense GPU + wiring in
     `metal_graph_eval_token_raw_swa` dietro `ds4_arch_is_deepseek()` → greedy vs llama.cpp.
-    Nota: i kernel `.metal` sono caricati da disco a runtime (no rebuild di ds4_metal.o
-    per modifiche ai soli `.metal`); eseguire `./ds4` dalla root del repo.
+    Nota: i kernel `.metal` sono caricati da disco a runtime (modifiche ai soli `.metal`
+    non richiedono rebuild di ds4_metal.o); eseguire `./ds4` dalla root del repo.
   - 3.7 wiring eval dispatch + validazione greedy vs llama.cpp (su questo Mac).
   - Nota quant: ds4 supporta F32/F16/Q8_0/Q4_K/Q2_K/IQ2_XXS ma **NON Q6_K**
     (assente dall'enum). RoPE DeepSeek è GPT-J (coppie i,i+1); densi usano NEOX.
