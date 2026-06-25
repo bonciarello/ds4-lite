@@ -400,6 +400,25 @@ typedef struct {
     uint16_t qs[QK_K / 8];
 } block_iq2_xxs;
 
+/* GGML Q3_K super-block (256 values): 2-bit quants (qs) + high bit (hmask),
+ * 6-bit packed group scales, one f16 super-block scale. */
+typedef struct {
+    uint8_t  hmask[QK_K / 8];  /* quant high bit, 32 bytes */
+    uint8_t  qs[QK_K / 4];     /* quant low 2 bits, 64 bytes */
+    uint8_t  scales[12];       /* 6-bit packed scales */
+    uint16_t d;                /* f16 super-block scale */
+} block_q3_K;
+
+/* GGML Q5_K super-block (256 values): 4-bit quants (qs) + high bit (qh),
+ * 6-bit packed scales/mins, f16 scale + f16 min. */
+typedef struct {
+    uint16_t d;                /* f16 super-block scale */
+    uint16_t dmin;             /* f16 super-block min */
+    uint8_t  scales[12];       /* 6-bit packed scales/mins */
+    uint8_t  qh[QK_K / 8];     /* quant high bit, 32 bytes */
+    uint8_t  qs[QK_K / 2];     /* quant low 4 bits, 128 bytes */
+} block_q5_K;
+
 /* GGML Q6_K super-block (256 values): 6-bit quants split into low 4 bits (ql)
  * and high 2 bits (qh), 8-bit per-16 group scales, one f16 super-block scale. */
 typedef struct {
@@ -411,7 +430,9 @@ typedef struct {
 
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
+DS4_STATIC_ASSERT(ds4_block_q3_k_size, sizeof(block_q3_K) == 110);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
+DS4_STATIC_ASSERT(ds4_block_q5_k_size, sizeof(block_q5_K) == 176);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
@@ -1633,7 +1654,9 @@ enum {
     DS4_TENSOR_F16      = 1,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
+    DS4_TENSOR_Q3_K     = 11,
     DS4_TENSOR_Q4_K     = 12,
+    DS4_TENSOR_Q5_K     = 13,
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,

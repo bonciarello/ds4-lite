@@ -3838,6 +3838,58 @@ static float ds4_q4k_block_dot(const uint8_t *blk, const float *xb) {
     return acc;
 }
 
+/* CPU reference: dot of a dequantized Q5_K block (176 bytes) with 256 floats. */
+static float ds4_q5k_block_dot(const uint8_t *blk, const float *xb) {
+    __fp16 dh, dmh; memcpy(&dh, blk, 2); memcpy(&dmh, blk + 2, 2);
+    const float d = (float)dh, dmn = (float)dmh;
+    const uint8_t *scales = blk + 4;
+    const uint8_t *qh = blk + 16;
+    const uint8_t *ql = blk + 48;
+    float acc = 0.0f; int xi = 0, is = 0; uint8_t u1 = 1, u2 = 2;
+    for (int j = 0; j < 256; j += 64) {
+        uint8_t sc, m;
+        ds4_get_scale_min_k4_cpu(is + 0, scales, &sc, &m); const float d1 = d*(float)sc, m1 = dmn*(float)m;
+        ds4_get_scale_min_k4_cpu(is + 1, scales, &sc, &m); const float d2 = d*(float)sc, m2 = dmn*(float)m;
+        for (int l = 0; l < 32; l++) acc += (d1*(float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1) * xb[xi++];
+        for (int l = 0; l < 32; l++) acc += (d2*(float)((ql[l] >>  4) + ((qh[l] & u2) ? 16 : 0)) - m2) * xb[xi++];
+        ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+    }
+    return acc;
+}
+
+/* CPU reference: dot of a dequantized Q3_K block (110 bytes) with 256 floats. */
+static float ds4_q3k_block_dot(const uint8_t *blk, const float *xb) {
+    const uint8_t *hm = blk;
+    const uint8_t *qbase = blk + 32;
+    const uint8_t *sb = blk + 96;
+    __fp16 dh; memcpy(&dh, blk + 108, 2);
+    const float d_all = (float)dh;
+    const uint32_t kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
+    uint32_t a0 = sb[0]|((uint32_t)sb[1]<<8)|((uint32_t)sb[2]<<16)|((uint32_t)sb[3]<<24);
+    uint32_t a1 = sb[4]|((uint32_t)sb[5]<<8)|((uint32_t)sb[6]<<16)|((uint32_t)sb[7]<<24);
+    uint32_t a2 = sb[8]|((uint32_t)sb[9]<<8)|((uint32_t)sb[10]<<16)|((uint32_t)sb[11]<<24);
+    uint32_t tmp = a2;
+    uint32_t A2 = ((a0>>4)&kmask2)|(((tmp>>4)&kmask1)<<4);
+    uint32_t A3 = ((a1>>4)&kmask2)|(((tmp>>6)&kmask1)<<4);
+    uint32_t A0 = (a0&kmask2)|(((tmp>>0)&kmask1)<<4);
+    uint32_t A1 = (a1&kmask2)|(((tmp>>2)&kmask1)<<4);
+    int8_t sc8[16]; uint32_t av[4] = { A0, A1, A2, A3 };
+    for (int k = 0; k < 16; k++) sc8[k] = (int8_t)((av[k>>2] >> (8*(k&3))) & 0xFF);
+    float acc = 0.0f; int xi = 0, is = 0; uint8_t m = 1;
+    for (int n = 0; n < 256; n += 128) {
+        const uint8_t *q = qbase + (n/128)*32;
+        int shift = 0;
+        for (int jj = 0; jj < 4; jj++) {
+            float dl = d_all * (float)((int)sc8[is++] - 32);
+            for (int l = 0; l < 16; l++) acc += dl * (float)((int)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)) * xb[xi++];
+            dl = d_all * (float)((int)sc8[is++] - 32);
+            for (int l = 0; l < 16; l++) acc += dl * (float)((int)((q[l+16] >> shift) & 3) - ((hm[l+16] & m) ? 0 : 4)) * xb[xi++];
+            shift += 2; m <<= 1;
+        }
+    }
+    return acc;
+}
+
 int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
     if (!g_initialized && !ds4_gpu_init()) {
         if (errlen) snprintf(err, errlen, "Metal init failed (no GPU device?)");
@@ -4317,6 +4369,58 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         free(Wq4); free(x10); free(r10); free(g10);
         if (!ok) { if (errlen) snprintf(err, errlen, "q4_K GPU run failed"); goto free_gpu; }
         if (maxerr >= 1e-2f) { if (errlen) snprintf(err, errlen, "q4_K max err %.6g >= 1e-2", (double)maxerr); goto free_gpu; }
+    }
+
+    /* --- Case 11: Q5_K matvec --- */
+    {
+        const uint32_t in11=256u, out11=4u, nb11=in11/256u;
+        uint8_t *Wq5=malloc((size_t)out11*nb11*176u); float *x11=malloc((size_t)in11*4),*r11=malloc((size_t)out11*4),*g11=malloc((size_t)out11*4);
+        bool ok = Wq5&&x11&&r11&&g11;
+        if (ok) {
+            for(uint32_t i=0;i<in11;i++) x11[i]=0.011f*(float)i-0.9f;
+            for(uint32_t r=0;r<out11*nb11;r++){ uint8_t*blk=Wq5+(size_t)r*176u;
+                __fp16 dh=(__fp16)0.02f,dmh=(__fp16)0.04f; memcpy(blk,&dh,2); memcpy(blk+2,&dmh,2);
+                for(int i=0;i<12;i++) blk[4+i]=(uint8_t)((r*5+i*17)&0x3F);
+                for(int i=0;i<32;i++) blk[16+i]=(uint8_t)((r*3+i*11)&0xFF);
+                for(int i=0;i<128;i++) blk[48+i]=(uint8_t)((r*7+i*13)&0xFF); }
+            for(uint32_t r=0;r<out11;r++){ double acc=0; for(uint32_t b=0;b<nb11;b++) acc+=ds4_q5k_block_dot(Wq5+((size_t)r*nb11+b)*176u,x11+(size_t)b*256u); r11[r]=(float)acc; }
+            ds4_gpu_tensor *Wb=ds4_gpu_tensor_alloc((uint64_t)out11*nb11*176u),*xb11=ds4_gpu_tensor_alloc((uint64_t)in11*4),*ob11=ds4_gpu_tensor_alloc((uint64_t)out11*4);
+            ok=Wb&&xb11&&ob11;
+            if(ok){ ds4_gpu_tensor_write(Wb,0,Wq5,(uint64_t)out11*nb11*176u); ds4_gpu_tensor_write(xb11,0,x11,(uint64_t)in11*4);
+                struct __attribute__((packed)){uint32_t in_dim,out_dim;} qa={in11,out11}; ds4_gpu_tensor*bufs[3]={Wb,xb11,ob11};
+                ok=ds4_gpu_run_simple("kernel_dense_mul_mv_q5_K_f32",&qa,sizeof(qa),bufs,3,out11,"q5k"); if(ok) ds4_gpu_tensor_read(ob11,0,g11,(uint64_t)out11*4); }
+            ds4_gpu_tensor_free(Wb);ds4_gpu_tensor_free(xb11);ds4_gpu_tensor_free(ob11);
+        }
+        float maxerr=0.0f; if(ok) for(uint32_t r=0;r<out11;r++){float e=fabsf(g11[r]-r11[r]); if(e>maxerr)maxerr=e;}
+        free(Wq5);free(x11);free(r11);free(g11);
+        if(!ok){ if(errlen)snprintf(err,errlen,"q5_K GPU run failed"); goto free_gpu; }
+        if(maxerr>=1e-2f){ if(errlen)snprintf(err,errlen,"q5_K max err %.6g >= 1e-2",(double)maxerr); goto free_gpu; }
+    }
+
+    /* --- Case 12: Q3_K matvec --- */
+    {
+        const uint32_t in12=256u, out12=4u, nb12=in12/256u;
+        uint8_t *Wq3=malloc((size_t)out12*nb12*110u); float *x12=malloc((size_t)in12*4),*r12=malloc((size_t)out12*4),*g12=malloc((size_t)out12*4);
+        bool ok = Wq3&&x12&&r12&&g12;
+        if (ok) {
+            for(uint32_t i=0;i<in12;i++) x12[i]=0.009f*(float)i-0.8f;
+            for(uint32_t r=0;r<out12*nb12;r++){ uint8_t*blk=Wq3+(size_t)r*110u;
+                for(int i=0;i<32;i++) blk[i]=(uint8_t)((r*3+i*7)&0xFF);
+                for(int i=0;i<64;i++) blk[32+i]=(uint8_t)((r*5+i*11)&0xFF);
+                for(int i=0;i<12;i++) blk[96+i]=(uint8_t)((r*7+i*13)&0xFF);
+                __fp16 dh=(__fp16)0.03f; memcpy(blk+108,&dh,2); }
+            for(uint32_t r=0;r<out12;r++){ double acc=0; for(uint32_t b=0;b<nb12;b++) acc+=ds4_q3k_block_dot(Wq3+((size_t)r*nb12+b)*110u,x12+(size_t)b*256u); r12[r]=(float)acc; }
+            ds4_gpu_tensor *Wb=ds4_gpu_tensor_alloc((uint64_t)out12*nb12*110u),*xb12=ds4_gpu_tensor_alloc((uint64_t)in12*4),*ob12=ds4_gpu_tensor_alloc((uint64_t)out12*4);
+            ok=Wb&&xb12&&ob12;
+            if(ok){ ds4_gpu_tensor_write(Wb,0,Wq3,(uint64_t)out12*nb12*110u); ds4_gpu_tensor_write(xb12,0,x12,(uint64_t)in12*4);
+                struct __attribute__((packed)){uint32_t in_dim,out_dim;} qa={in12,out12}; ds4_gpu_tensor*bufs[3]={Wb,xb12,ob12};
+                ok=ds4_gpu_run_simple("kernel_dense_mul_mv_q3_K_f32",&qa,sizeof(qa),bufs,3,out12,"q3k"); if(ok) ds4_gpu_tensor_read(ob12,0,g12,(uint64_t)out12*4); }
+            ds4_gpu_tensor_free(Wb);ds4_gpu_tensor_free(xb12);ds4_gpu_tensor_free(ob12);
+        }
+        float maxerr=0.0f; if(ok) for(uint32_t r=0;r<out12;r++){float e=fabsf(g12[r]-r12[r]); if(e>maxerr)maxerr=e;}
+        free(Wq3);free(x12);free(r12);free(g12);
+        if(!ok){ if(errlen)snprintf(err,errlen,"q3_K GPU run failed"); goto free_gpu; }
+        if(maxerr>=1e-2f){ if(errlen)snprintf(err,errlen,"q3_K max err %.6g >= 1e-2",(double)maxerr); goto free_gpu; }
     }
 
     rc = 0;   /* all cases passed */

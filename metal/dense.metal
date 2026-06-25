@@ -1799,3 +1799,92 @@ kernel void kernel_dense_mul_mv_q4_K_f32(
     }
     out[row] = acc;
 }
+
+// ---- Dense Q5_K matvec ------------------------------------------------------
+// Block = 176 bytes: d(f16) dmin(f16) scales[12] qh[32] qs[128]. Reuses
+// ds4_get_scale_min_k4; high bit comes from qh. in_dim multiple of 256.
+kernel void kernel_dense_mul_mv_q5_K_f32(
+        constant ds4_dense_mvq_args & a [[buffer(0)]],
+        device const char  * W   [[buffer(1)]],
+        device const float * x   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= a.out_dim) return;
+    const uint nblk = a.in_dim / 256u;
+    const uint BLK = 176u;
+    float acc = 0.0f;
+    for (uint bi = 0; bi < nblk; bi++) {
+        device const char * blk = W + (ulong)(row * nblk + bi) * BLK;
+        const float d   = (float)(*(device const half *)(blk + 0));
+        const float dmn = (float)(*(device const half *)(blk + 2));
+        device const uchar * scales = (device const uchar *)(blk + 4);
+        device const uchar * qh = (device const uchar *)(blk + 16);
+        device const uchar * ql = (device const uchar *)(blk + 48);
+        device const float * xb = x + (ulong)bi * 256u;
+        uint xi = 0; int is = 0; uchar u1 = 1, u2 = 2;
+        for (uint j = 0; j < 256u; j += 64u) {
+            uchar sc, m;
+            ds4_get_scale_min_k4(is + 0, scales, sc, m);
+            const float d1 = d * (float)sc, m1 = dmn * (float)m;
+            ds4_get_scale_min_k4(is + 1, scales, sc, m);
+            const float d2 = d * (float)sc, m2 = dmn * (float)m;
+            for (uint l = 0; l < 32u; ++l) acc += (d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1) * xb[xi++];
+            for (uint l = 0; l < 32u; ++l) acc += (d2 * (float)((ql[l] >>  4) + ((qh[l] & u2) ? 16 : 0)) - m2) * xb[xi++];
+            ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+        }
+    }
+    out[row] = acc;
+}
+
+// ---- Dense Q3_K matvec ------------------------------------------------------
+// Block = 110 bytes: hmask[32] qs[64] scales[12] d(f16). Canonical GGML Q3_K
+// dequant with the packed 6-bit scale unpack. in_dim multiple of 256.
+kernel void kernel_dense_mul_mv_q3_K_f32(
+        constant ds4_dense_mvq_args & a [[buffer(0)]],
+        device const char  * W   [[buffer(1)]],
+        device const float * x   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= a.out_dim) return;
+    const uint nblk = a.in_dim / 256u;
+    const uint BLK = 110u;
+    const uint kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
+    float acc = 0.0f;
+    for (uint bi = 0; bi < nblk; bi++) {
+        device const char * blk = W + (ulong)(row * nblk + bi) * BLK;
+        device const uchar * hm = (device const uchar *)(blk + 0);
+        device const uchar * qbase = (device const uchar *)(blk + 32);
+        device const uchar * sb = (device const uchar *)(blk + 96);
+        const float d_all = (float)(*(device const half *)(blk + 108));
+        device const float * xb = x + (ulong)bi * 256u;
+
+        /* unpack 12 scale bytes -> 16 signed 6-bit scales */
+        uint a0 = (uint)sb[0] | ((uint)sb[1]<<8) | ((uint)sb[2]<<16) | ((uint)sb[3]<<24);
+        uint a1 = (uint)sb[4] | ((uint)sb[5]<<8) | ((uint)sb[6]<<16) | ((uint)sb[7]<<24);
+        uint a2 = (uint)sb[8] | ((uint)sb[9]<<8) | ((uint)sb[10]<<16) | ((uint)sb[11]<<24);
+        uint tmp = a2;
+        uint A2 = ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        uint A3 = ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        uint A0 = (a0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        uint A1 = (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        char sc8[16];
+        uint av[4] = { A0, A1, A2, A3 };
+        for (int k = 0; k < 16; k++) sc8[k] = (char)((av[k>>2] >> (8*(k&3))) & 0xFF);
+
+        uint xi = 0; int is = 0; uchar m = 1;
+        for (uint n = 0; n < 256u; n += 128u) {
+            device const uchar * q = qbase + (n/128u)*32u;
+            uint shift = 0;
+            for (int jj = 0; jj < 4; ++jj) {
+                float dl = d_all * (float)((int)sc8[is++] - 32);
+                for (uint l = 0; l < 16u; ++l)
+                    acc += dl * (float)((int)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)) * xb[xi++];
+                dl = d_all * (float)((int)sc8[is++] - 32);
+                for (uint l = 0; l < 16u; ++l)
+                    acc += dl * (float)((int)((q[l+16] >> shift) & 3) - ((hm[l+16] & m) ? 0 : 4)) * xb[xi++];
+                shift += 2; m <<= 1;
+            }
+        }
+    }
+    out[row] = acc;
+}
