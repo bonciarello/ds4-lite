@@ -25690,6 +25690,19 @@ int ds4_dense_weight_test(const char *model_path, char *err, size_t errlen) {
     return fail;
 }
 
+/* Lightweight check: does the GGUF at `path` use a dense architecture we support?
+ * Opens metadata only. Used to route `./ds4 -p` to the dense forward path. */
+int ds4_model_is_dense(const char *path) {
+    ds4_model m;
+    model_open(&m, path, false, false);
+    ds4_str arch = {0};
+    model_get_string(&m, "general.architecture", &arch);
+    const char *ns = NULL;
+    const int dense = ds4_dense_arch_supported(arch, &ns) ? 1 : 0;
+    model_close(&m);
+    return dense;
+}
+
 static ds4_dense_wdesc dense_wdesc_of(const ds4_model *m, const ds4_tensor *t) {
     ds4_dense_wdesc w = {0};
     if (!t) return w;

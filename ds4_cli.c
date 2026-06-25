@@ -1680,6 +1680,19 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
+    /* Dense models (Qwen2/Llama/...) run through the dense GPU forward path.
+     * One-shot prompt routing; chat/server for dense is a follow-up. */
+    if (!cfg.inspect && cfg.gen.prompt != NULL && cfg.engine.model_path &&
+        (!cfg.dist || cfg.dist->role == DS4_DISTRIBUTED_NONE) &&
+        ds4_model_is_dense(cfg.engine.model_path)) {
+        char dense_err[256] = {0};
+        int rc = ds4_dense_generate(cfg.engine.model_path, cfg.gen.prompt,
+                                    cfg.gen.n_predict, dense_err, sizeof(dense_err));
+        if (rc) fprintf(stderr, "ds4: %s\n", dense_err);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
     cfg.engine.inspect_only = cfg.inspect;
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {

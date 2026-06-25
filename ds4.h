@@ -198,6 +198,9 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
 /* Load a dense model and greedily generate n_predict tokens (self-contained). */
 int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict,
                        char *err, size_t errlen);
+
+/* 1 if the GGUF uses a supported dense architecture (qwen2/llama/...), else 0. */
+int ds4_model_is_dense(const char *path);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
