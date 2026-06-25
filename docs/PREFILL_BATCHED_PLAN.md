@@ -58,5 +58,17 @@ Benchmark prefill t/s before/after at several prompt lengths (57, ~200, ~500 tok
   **Correctness: greedy output identical** to the sequential path.
   **Prefill 36.7 -> 174 t/s (4.7x)**, TTFT 1.55s -> 0.33s (57-tok prompt). Gap to
   llama.cpp (411 t/s) cut from ~11x to ~2.4x.
-- [ ] Optimization: batch the prefill into one command buffer (remove per-op
-  commit+wait, like decode) to push prefill further toward llama.
+- [x] **Optimization: batch the prefill into one command buffer** (begin/end_commands
+  + MTLBarrierScopeBuffers, like decode; DS4_DENSE_NOPREFILL_BATCH disables). Removes
+  per-op commit+wait.
+
+## Result (batched prefill, this branch)
+| prompt | ds4 prefill before | ds4 prefill after | llama.cpp |
+|---|---:|---:|---:|
+| 57 tok  | 36.7 t/s | **256 t/s** (7.0x) | 411 (pp512) |
+| 205 tok | ~37 t/s  | **316 t/s** (8.5x) | 411 |
+
+TTFT (57-tok prompt) 1.55s -> 0.22s. Greedy output **identical** to the per-token
+path throughout. Gap to llama.cpp: ~11x -> ~1.3-1.6x (amortization improves with M).
+Decode is unchanged. A/B: DS4_DENSE_NOPREFILL (per-token path), DS4_DENSE_NOPREFILL_BATCH
+(no command-buffer batching).

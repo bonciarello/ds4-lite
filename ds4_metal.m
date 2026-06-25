@@ -4627,6 +4627,14 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
             ds4_gpu_tensor_write(Xb, (uint64_t)m*ne*4, emb, (uint64_t)ne*4);
         }
 
+        /* batch the whole prefill into one command buffer (single commit+wait,
+         * dependent dispatches serialized with buffer barriers) */
+        bool use_batch = ok && !getenv("DS4_DENSE_NOPREFILL_BATCH");
+        if (use_batch) {
+            g_batch_serialize = true;
+            if (!ds4_gpu_begin_commands()) { g_batch_serialize = false; use_batch = false; }
+        }
+
         for (uint32_t il=0; ok && il<d->n_layer; il++) {
             const ds4_dense_layer_desc *L=&d->layers[il];
             ds4_dense_kv_layer *kv=&g->kv[il];
@@ -4660,8 +4668,13 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
               && dense_rms(g, Hrow, xlast, &d->output_norm, ne, eps)
               && dense_matvec(g, &d->output, Hrow, logitsT);
             ds4_gpu_tensor_free(xlast);
-            if (ok) ds4_gpu_tensor_read(logitsT, 0, last_logits, (uint64_t)d->n_vocab*4);
         }
+        if (use_batch) {              /* commit + wait once for the whole prefill */
+            const int ended = ds4_gpu_end_commands();
+            g_batch_serialize = false;
+            if (!ended) ok = false;
+        }
+        if (ok) ds4_gpu_tensor_read(logitsT, 0, last_logits, (uint64_t)d->n_vocab*4);
 
         ds4_gpu_tensor_free(Xb); ds4_gpu_tensor_free(Hb); ds4_gpu_tensor_free(Ob);
         ds4_gpu_tensor_free(Qb); ds4_gpu_tensor_free(attb); ds4_gpu_tensor_free(gateb);
