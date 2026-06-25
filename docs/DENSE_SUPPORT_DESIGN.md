@@ -264,6 +264,33 @@ Validazione: stato nascosto layer-0 e poi greedy completo vs llama.cpp
 (`tests/bench_dense.sh`), **eseguibile su questo Mac**. Oracolo numerico: il
 CPU reference (Fase 3.4) una volta validato su Linux, o direttamente llama.cpp.
 
+## 4e. Fase 3.5 step 4 — piano d'integrazione (reconnato)
+
+Tutti i kernel densi + tipi quant (Q2/Q3/Q4/Q5/Q6_K, Q8_0, F16, F32) e i blocchi
+(attn, FFN) sono validati su GPU isolatamente. Lo step 4 li collega ai pesi reali.
+
+**Ponte pesi→GPU** (trovato): `ds4_gpu_wrap_model_range(model_map, model_size,
+tensor->abs_offset, tensor->bytes, &inner_offset)` → `MTLBuffer` (no-copy, memoria
+unificata). `ds4_tensor` ha `type / abs_offset / bytes / dim[] / ndim`.
+
+Sotto-step (ognuno validabile su questo Mac):
+1. **GPU model mapping per dense**: assicurare che `ds4_gpu_map_model_views` venga
+   chiamato anche sul path denso (oggi engine-open si ferma dopo `weights_bind`).
+2. **Matvec type-dispatch su tensore reale**: `ds4_gpu_dense_matvec_tensor(out, W, x,
+   in_dim, out_dim)` — wrappa `W` e sceglie il kernel da `W->type`
+   (`kernel_dense_mul_mv_{q2,q3,q4,q5,q6}_K_f32`, o f32/f16/q8_0 strided). Test:
+   matvec di un peso reale (es. `blk.0.attn_q`) vs CPU `vec_dot`/dequant.
+3. **Driver forward denso**: embedding (dequant riga `token_embd`) → N×(blocco attn +
+   blocco FFN coi pesi reali) → `output_norm` → `output` matvec → logit. Riusa i
+   blocchi già validati ma con `ds4_gpu_dense_matvec_tensor`.
+4. **KV cache dense GPU + session**: buffer K/V per layer nella `ds4_session`;
+   append a `pos`, attention su `0..pos`.
+5. **Wiring**: ramo denso in `ds4_session_eval_internal` / `metal_graph_eval_token_raw_swa`
+   dietro `ds4_arch_is_deepseek()`; rimuovere il guard "graph non implementato".
+6. **Validazione**: `tests/bench_dense.sh` — continuazione greedy vs llama.cpp
+   (oracolo indipendente: conferma dequant + forward end-to-end). Se diverge,
+   dump hidden-state layer-per-layer per localizzare.
+
 ## 5. Prossimo passo concreto (inizio Fase 1)
 
 1. Aggiungere `ds4_arch_family` e i campi `arch/n_ff/meta_ns` a `ds4_shape`
