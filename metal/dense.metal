@@ -1757,3 +1757,45 @@ kernel void kernel_dense_mul_mv_q6_K_f32(
     }
     out[row] = acc;
 }
+
+// ---- Dense Q4_K matvec (Fase: Q4_K dense support) --------------------------
+// Canonical GGML Q4_K dequant inline + matvec. Block = 144 bytes:
+// d(f16) dmin(f16) scales[12] qs[128]. in_dim must be a multiple of 256.
+static void ds4_get_scale_min_k4(int j, device const uchar * q, thread uchar & d, thread uchar & m) {
+    if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
+    else {
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4)  | ((q[j]     >> 6) << 4);
+    }
+}
+kernel void kernel_dense_mul_mv_q4_K_f32(
+        constant ds4_dense_mvq_args & a [[buffer(0)]],
+        device const char  * W   [[buffer(1)]],
+        device const float * x   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= a.out_dim) return;
+    const uint nblk = a.in_dim / 256u;
+    const uint BLK = 144u;
+    float acc = 0.0f;
+    for (uint bi = 0; bi < nblk; bi++) {
+        device const char * blk = W + (ulong)(row * nblk + bi) * BLK;
+        const float d   = (float)(*(device const half *)(blk + 0));
+        const float dmn = (float)(*(device const half *)(blk + 2));
+        device const uchar * scales = (device const uchar *)(blk + 4);
+        device const uchar * q = (device const uchar *)(blk + 16);
+        device const float * xb = x + (ulong)bi * 256u;
+        uint xi = 0; int is = 0;
+        for (uint j = 0; j < 256u; j += 64u) {
+            uchar sc, m;
+            ds4_get_scale_min_k4(is + 0, scales, sc, m);
+            const float d1 = d * (float)sc, m1 = dmn * (float)m;
+            ds4_get_scale_min_k4(is + 1, scales, sc, m);
+            const float d2 = d * (float)sc, m2 = dmn * (float)m;
+            for (uint l = 0; l < 32u; ++l) acc += (d1 * (float)(q[l] & 0xF) - m1) * xb[xi++];
+            for (uint l = 0; l < 32u; ++l) acc += (d2 * (float)(q[l] >>  4) - m2) * xb[xi++];
+            q += 32; is += 2;
+        }
+    }
+    out[row] = acc;
+}
