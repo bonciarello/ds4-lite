@@ -4039,6 +4039,54 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         if (maxerr >= 1e-4f) { if (errlen) snprintf(err, errlen, "FFN block max err %.6g >= 1e-4", (double)maxerr); goto free_gpu; }
     }
 
+    /* --- Case 7: GQA attention decode (kernel_dense_attn_decode_f32) --- */
+    {
+        const uint32_t nh = 4u, nkv = 2u, hd = 8u, nctx = 3u;
+        const uint32_t group = nh / nkv, kvdim = nkv * hd, qdim = nh * hd;
+        const float scale = 1.0f / sqrtf((float)hd);
+        float q[32], kc[48], vc[48], oref[32], ogot[32];
+        for (uint32_t i = 0; i < qdim; i++)  q[i]  = 0.05f*(float)i - 0.4f;
+        for (uint32_t i = 0; i < nctx*kvdim; i++) { kc[i] = 0.03f*(float)i - 0.3f; vc[i] = 0.02f*(float)i - 0.2f; }
+        /* CPU reference */
+        for (uint32_t hqi = 0; hqi < nh; hqi++) {
+            const uint32_t hkv = hqi / group;
+            const float *qh = q + (size_t)hqi*hd;
+            float sc[3]; float maxs = -1e30f;
+            for (uint32_t t = 0; t < nctx; t++) {
+                const float *kt = kc + (size_t)t*kvdim + (size_t)hkv*hd;
+                double dot = 0; for (uint32_t d = 0; d < hd; d++) dot += (double)qh[d]*kt[d];
+                sc[t] = (float)dot * scale; if (sc[t] > maxs) maxs = sc[t];
+            }
+            double sum = 0; for (uint32_t t = 0; t < nctx; t++) { sc[t] = expf(sc[t]-maxs); sum += sc[t]; }
+            float *oh = oref + (size_t)hqi*hd;
+            for (uint32_t d = 0; d < hd; d++) oh[d] = 0.0f;
+            for (uint32_t t = 0; t < nctx; t++) {
+                const float *vt = vc + (size_t)t*kvdim + (size_t)hkv*hd;
+                const float w = (float)(sc[t]/sum);
+                for (uint32_t d = 0; d < hd; d++) oh[d] += w*vt[d];
+            }
+        }
+        struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; }
+            aa = { nh, nkv, hd, nctx, scale };
+        ds4_gpu_tensor *qb = ds4_gpu_tensor_alloc(qdim*sizeof(float));
+        ds4_gpu_tensor *kb = ds4_gpu_tensor_alloc((uint64_t)nctx*kvdim*sizeof(float));
+        ds4_gpu_tensor *vb = ds4_gpu_tensor_alloc((uint64_t)nctx*kvdim*sizeof(float));
+        ds4_gpu_tensor *ob = ds4_gpu_tensor_alloc(qdim*sizeof(float));
+        bool ok = qb && kb && vb && ob;
+        if (ok) {
+            ds4_gpu_tensor_write(qb,0,q,qdim*sizeof(float));
+            ds4_gpu_tensor_write(kb,0,kc,(uint64_t)nctx*kvdim*sizeof(float));
+            ds4_gpu_tensor_write(vb,0,vc,(uint64_t)nctx*kvdim*sizeof(float));
+            ds4_gpu_tensor *bufs[4] = { qb, kb, vb, ob };
+            ok = ds4_gpu_run_simple("kernel_dense_attn_decode_f32", &aa, sizeof(aa), bufs, 4, nh, "attn decode");
+            if (ok) ds4_gpu_tensor_read(ob, 0, ogot, qdim*sizeof(float));
+        }
+        ds4_gpu_tensor_free(qb);ds4_gpu_tensor_free(kb);ds4_gpu_tensor_free(vb);ds4_gpu_tensor_free(ob);
+        if (!ok) { if (errlen) snprintf(err, errlen, "attn GPU run failed"); goto free_gpu; }
+        float maxerr=0.0f; for(uint32_t i=0;i<qdim;i++){ const float e=fabsf(ogot[i]-oref[i]); if(e>maxerr)maxerr=e; }
+        if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "attn max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
+    }
+
     rc = 0;   /* all cases passed */
 free_gpu:
     ds4_gpu_tensor_free(wf32);

@@ -1668,3 +1668,52 @@ kernel void kernel_dense_add_f32(
     if (gid >= n) return;
     a[gid] += b[gid];
 }
+
+// ---- Dense GQA attention (decode) (Fase 3.5) -------------------------------
+// One query token at position pos attends to cached positions 0..n_ctx-1.
+// GQA: query head hq reads kv head hq/(n_head/n_kv). K/V caches are laid out
+// [n_ctx][n_kv*head_dim]. One thread per query head. Online softmax.
+struct ds4_dense_attn_args {
+    uint  n_head;
+    uint  n_kv;
+    uint  head_dim;
+    uint  n_ctx;
+    float scale;
+};
+kernel void kernel_dense_attn_decode_f32(
+        constant ds4_dense_attn_args & a [[buffer(0)]],
+        device const float * q      [[buffer(1)]],
+        device const float * kcache [[buffer(2)]],
+        device const float * vcache [[buffer(3)]],
+        device       float * out    [[buffer(4)]],
+        uint hq [[thread_position_in_grid]]) {
+    if (hq >= a.n_head) return;
+    const uint group = a.n_head / a.n_kv;
+    const uint hkv = hq / group;
+    const uint hd = a.head_dim;
+    const uint kvdim = a.n_kv * hd;
+    device const float * qh = q + hq * hd;
+    device       float * oh = out + hq * hd;
+
+    float maxs = -1e30f;
+    for (uint t = 0; t < a.n_ctx; t++) {
+        device const float * kt = kcache + t * kvdim + hkv * hd;
+        float dot = 0.0f;
+        for (uint d = 0; d < hd; d++) dot += qh[d] * kt[d];
+        dot *= a.scale;
+        if (dot > maxs) maxs = dot;
+    }
+    for (uint d = 0; d < hd; d++) oh[d] = 0.0f;
+    float sum = 0.0f;
+    for (uint t = 0; t < a.n_ctx; t++) {
+        device const float * kt = kcache + t * kvdim + hkv * hd;
+        device const float * vt = vcache + t * kvdim + hkv * hd;
+        float dot = 0.0f;
+        for (uint d = 0; d < hd; d++) dot += qh[d] * kt[d];
+        const float w = exp(dot * a.scale - maxs);
+        sum += w;
+        for (uint d = 0; d < hd; d++) oh[d] += w * vt[d];
+    }
+    const float inv = 1.0f / sum;
+    for (uint d = 0; d < hd; d++) oh[d] *= inv;
+}
