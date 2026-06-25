@@ -25781,20 +25781,51 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     int rc = 0;
     uint32_t pos = 0;
-    /* prefill */
+    /* prefill (timed: prefill t/s and TTFT = prompt processing time) */
+    const double t_start = now_sec();
     for (uint32_t i = 0; i < (uint32_t)toks.len; i++) {
         if (ds4_dense_gpu_forward(g, &desc, toks.v[i], pos++, logits) != 0) { rc = 1; break; }
     }
-    /* greedy decode */
+    const double t_prefill = now_sec();
+    /* greedy decode (timed: decode t/s) */
     printf("=== ds4 dense greedy (%d tokens) ===\n", n_predict);
+    int n_gen = 0;
     for (int n = 0; rc == 0 && n < n_predict; n++) {
         int next = sample_argmax(logits, DS4_N_VOCAB);
         if (next == vocab.eos_id) break;
         dense_print_token(&vocab, next);
+        n_gen++;
         if (ds4_dense_gpu_forward(g, &desc, next, pos++, logits) != 0) { rc = 1; break; }
     }
+    const double t_end = now_sec();
     printf("\n");
     fflush(stdout);
+
+    if (rc == 0) {
+        const double prefill_dt = t_prefill - t_start;
+        const double decode_dt  = t_end - t_prefill;
+        const double prefill_tps = prefill_dt > 0 ? (double)toks.len / prefill_dt : 0.0;
+        const double gen_tps     = decode_dt  > 0 ? (double)n_gen / decode_dt : 0.0;
+        fprintf(stderr,
+                "ds4 dense metrics: prompt=%d tok, prefill %.2f t/s (TTFT %.3f s), "
+                "gen %.2f t/s (%d tok)\n",
+                (int)toks.len, prefill_tps, prefill_dt, gen_tps, n_gen);
+        /* Optional CSV row in the project's speed-bench format (DS4_BENCH_CSV=path). */
+        const char *csv = getenv("DS4_BENCH_CSV");
+        if (csv && csv[0]) {
+            FILE *cf = fopen(csv, "a");
+            if (cf) {
+                fseek(cf, 0, SEEK_END);
+                if (ftell(cf) == 0)
+                    fprintf(cf, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
+                const uint64_t kv_bytes = (uint64_t)DS4_N_LAYER * n_ctx * desc.n_kv * desc.head_dim * 4ull * 2ull;
+                fprintf(cf, "%d,%d,%.2f,%d,%.2f,%llu\n",
+                        (int)toks.len + n_gen, (int)toks.len, prefill_tps, n_gen, gen_tps,
+                        (unsigned long long)kv_bytes);
+                fclose(cf);
+            }
+        }
+    }
 
     free(logits);
     ds4_dense_gpu_free(g);
