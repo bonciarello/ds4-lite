@@ -48,5 +48,15 @@ Benchmark prefill t/s before/after at several prompt lengths (57, ~200, ~500 tok
   matmul is **18.1x** faster than 64 separate matvecs (1.07 ms vs 19.4 ms) — the
   weight-read amortization that will drive the prefill speedup. q6_K matmul
   (block_q6_K + dequantize_q6_K) still TODO for ffn_down/output.
-- [ ] Increment 1b: q6_K matmul.
-- [ ] Increments 2–5 (batched elementwise, causal attention, forward driver, wiring).
+- [x] Increment 1b: q6_K matmul (correctness PASS).
+- [x] **Increments 2–5: batched elementwise + causal attention + forward driver + wiring.**
+  Added batched kernels (`kernel_dense_rms_norm_f32_batch`, `..._rope_neox_f32_batch`,
+  `..._attn_prefill_f32`, `..._add_bias_batch`), the driver `ds4_dense_gpu_prefill`
+  (embeddings -> per-layer {rms, qkv matmul, bias, rope, KV write via cache view,
+  causal attn, o matmul, residual, ffn matmuls, residual} -> last-token norm+output),
+  and wired it into `ds4_dense_generate` (DS4_DENSE_NOPREFILL forces the old path).
+  **Correctness: greedy output identical** to the sequential path.
+  **Prefill 36.7 -> 174 t/s (4.7x)**, TTFT 1.55s -> 0.33s (57-tok prompt). Gap to
+  llama.cpp (411 t/s) cut from ~11x to ~2.4x.
+- [ ] Optimization: batch the prefill into one command buffer (remove per-op
+  commit+wait, like decode) to push prefill further toward llama.

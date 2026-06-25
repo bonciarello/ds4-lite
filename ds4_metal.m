@@ -4525,6 +4525,152 @@ int ds4_gpu_dense_matmul_test(int n_tok_in, char *err, size_t errlen) {
     return 0;
 }
 
+/* ---- Batched prefill driver (increments 2-4) ------------------------------ */
+
+static bool dense_rms_batch(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *x,
+                            const ds4_dense_wdesc *norm, uint32_t M, uint32_t n, float eps) {
+    ds4_gpu_tensor *wb = dense_cached_weight(g, norm->data, norm->bytes);
+    if (!wb) return false;
+    struct __attribute__((packed)) { uint32_t n; float eps; } a = { n, eps };
+    ds4_gpu_tensor *bufs[3] = { x, wb, out };
+    return ds4_gpu_run_grid("kernel_dense_rms_norm_f32_batch", &a, sizeof(a), bufs, 3,
+                            MTLSizeMake(M, 1, 1), MTLSizeMake(128, 1, 1), "pf rms");
+}
+
+static bool dense_matmul_w(ds4_dense_gpu *g, const ds4_dense_wdesc *W, ds4_gpu_tensor *x,
+                           ds4_gpu_tensor *out, uint32_t M) {
+    ds4_gpu_tensor *Wb = dense_cached_weight(g, W->data, W->bytes);
+    if (!Wb) return false;
+    return ds4_gpu_dense_matmul(out, Wb, x, W->dim0, W->dim1, M, W->type);
+}
+
+static bool dense_bias_batch(ds4_dense_gpu *g, ds4_gpu_tensor *buf, const ds4_dense_wdesc *bias,
+                             uint32_t n, uint32_t M) {
+    if (!bias->data) return true;
+    ds4_gpu_tensor *bb = dense_cached_weight(g, bias->data, bias->bytes);
+    if (!bb) return false;
+    uint32_t a[2] = { n, M * n };
+    ds4_gpu_tensor *bufs[2] = { buf, bb };
+    return ds4_gpu_run_simple("kernel_dense_add_bias_batch", a, sizeof(a), bufs, 2, M * n, "pf bias");
+}
+
+static bool dense_rope_batch(ds4_gpu_tensor *x, uint32_t nh, uint32_t hd, uint32_t nrot,
+                             uint32_t pos, float base, uint32_t M) {
+    id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dense_rope_neox_f32_batch");
+    if (!p) return false;
+    struct __attribute__((packed)) { uint32_t n_head, head_dim, n_rot, pos; float fb; } a = { nh, hd, nrot, pos, base };
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return false;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:p];
+    [enc setBytes:&a length:sizeof(a) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:1];
+    [enc setBytes:&M length:sizeof(M) atIndex:2];
+    const uint32_t total = M * nh * (nrot / 2u);
+    [enc dispatchThreadgroups:MTLSizeMake((total + 63u) / 64u, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "pf rope");
+}
+
+static bool dense_attn_prefill(ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_tensor *kc,
+                               ds4_gpu_tensor *vc, uint32_t nh, uint32_t nkv, uint32_t hd,
+                               float scale, uint32_t M, uint32_t start_pos) {
+    id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dense_attn_prefill_f32");
+    if (!p) return false;
+    struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; } a = { nh, nkv, hd, 0, scale };
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return false;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:p];
+    [enc setBytes:&a length:sizeof(a) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(q)   offset:ds4_gpu_tensor_offset(q)   atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(kc)  offset:ds4_gpu_tensor_offset(kc)  atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(vc)  offset:ds4_gpu_tensor_offset(vc)  atIndex:3];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:4];
+    [enc setBytes:&start_pos length:sizeof(start_pos) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(nh, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "pf attn");
+}
+
+/* Process M prompt tokens at positions [start_pos, start_pos+M) in one batched
+ * forward (matmuls via kernel_mul_mm). Writes the KV cache and returns the LAST
+ * token's logits (the only ones prefill needs). */
+int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
+                          const int *tokens, uint32_t M, uint32_t start_pos, float *last_logits) {
+    @autoreleasepool {
+        if (M == 0) return 1;
+        if (d->token_embd.type != 12) return 2;
+        const uint32_t ne=d->n_embd, nff=d->n_ff, nh=d->n_head, nkv=d->n_kv, hd=d->head_dim;
+        const uint32_t qd=g->qd, kvd=g->kvd, nrot=d->n_rot;
+        const float eps=d->rms_eps, base=d->rope_base, scale=1.0f/sqrtf((float)hd);
+        const uint32_t nblk = ne/256u;
+
+        ds4_gpu_tensor *Xb=ds4_gpu_tensor_alloc((uint64_t)M*ne*4);
+        ds4_gpu_tensor *Hb=ds4_gpu_tensor_alloc((uint64_t)M*ne*4);
+        ds4_gpu_tensor *Ob=ds4_gpu_tensor_alloc((uint64_t)M*ne*4);
+        ds4_gpu_tensor *Qb=ds4_gpu_tensor_alloc((uint64_t)M*qd*4);
+        ds4_gpu_tensor *attb=ds4_gpu_tensor_alloc((uint64_t)M*qd*4);
+        ds4_gpu_tensor *gateb=ds4_gpu_tensor_alloc((uint64_t)M*nff*4);
+        ds4_gpu_tensor *upb=ds4_gpu_tensor_alloc((uint64_t)M*nff*4);
+        ds4_gpu_tensor *actb=ds4_gpu_tensor_alloc((uint64_t)M*nff*4);
+        ds4_gpu_tensor *Hrow=ds4_gpu_tensor_alloc((uint64_t)ne*4);
+        ds4_gpu_tensor *logitsT=ds4_gpu_tensor_alloc((uint64_t)d->n_vocab*4);
+        float *emb = malloc((size_t)ne*sizeof(float));
+        bool ok = Xb&&Hb&&Ob&&Qb&&attb&&gateb&&upb&&actb&&Hrow&&logitsT&&emb;
+
+        for (uint32_t m=0; ok && m<M; m++) {
+            const uint8_t *row = (const uint8_t*)d->token_embd.data + (size_t)tokens[m]*nblk*144u;
+            for (uint32_t b=0;b<nblk;b++) ds4_q4k_dequant_block(row + (size_t)b*144u, emb + b*256);
+            ds4_gpu_tensor_write(Xb, (uint64_t)m*ne*4, emb, (uint64_t)ne*4);
+        }
+
+        for (uint32_t il=0; ok && il<d->n_layer; il++) {
+            const ds4_dense_layer_desc *L=&d->layers[il];
+            ds4_dense_kv_layer *kv=&g->kv[il];
+            ds4_gpu_tensor *kview=ds4_gpu_tensor_view(kv->k, (uint64_t)start_pos*kvd*4, (uint64_t)M*kvd*4);
+            ds4_gpu_tensor *vview=ds4_gpu_tensor_view(kv->v, (uint64_t)start_pos*kvd*4, (uint64_t)M*kvd*4);
+            ok = kview && vview
+              && dense_rms_batch(g, Hb, Xb, &L->attn_norm, M, ne, eps)
+              && dense_matmul_w(g, &L->attn_q, Hb, Qb, M)
+              && dense_matmul_w(g, &L->attn_k, Hb, kview, M)
+              && dense_matmul_w(g, &L->attn_v, Hb, vview, M)
+              && dense_bias_batch(g, Qb, &L->attn_q_bias, qd, M)
+              && dense_bias_batch(g, kview, &L->attn_k_bias, kvd, M)
+              && dense_bias_batch(g, vview, &L->attn_v_bias, kvd, M)
+              && dense_rope_batch(Qb, nh, hd, nrot, start_pos, base, M)
+              && dense_rope_batch(kview, nkv, hd, nrot, start_pos, base, M)
+              && dense_attn_prefill(attb, Qb, kv->k, kv->v, nh, nkv, hd, scale, M, start_pos)
+              && dense_matmul_w(g, &L->attn_out, attb, Ob, M)
+              && dense_add(Xb, Ob, M*ne)
+              && dense_rms_batch(g, Hb, Xb, &L->ffn_norm, M, ne, eps)
+              && dense_matmul_w(g, &L->ffn_gate, Hb, gateb, M)
+              && dense_matmul_w(g, &L->ffn_up, Hb, upb, M)
+              && dense_swiglu(actb, gateb, upb, M*nff)
+              && dense_matmul_w(g, &L->ffn_down, actb, Ob, M)
+              && dense_add(Xb, Ob, M*ne);
+            ds4_gpu_tensor_free(kview); ds4_gpu_tensor_free(vview);
+        }
+
+        if (ok) {   /* last token: final norm + output projection */
+            ds4_gpu_tensor *xlast = ds4_gpu_tensor_view(Xb, (uint64_t)(M-1)*ne*4, (uint64_t)ne*4);
+            ok = xlast
+              && dense_rms(g, Hrow, xlast, &d->output_norm, ne, eps)
+              && dense_matvec(g, &d->output, Hrow, logitsT);
+            ds4_gpu_tensor_free(xlast);
+            if (ok) ds4_gpu_tensor_read(logitsT, 0, last_logits, (uint64_t)d->n_vocab*4);
+        }
+
+        ds4_gpu_tensor_free(Xb); ds4_gpu_tensor_free(Hb); ds4_gpu_tensor_free(Ob);
+        ds4_gpu_tensor_free(Qb); ds4_gpu_tensor_free(attb); ds4_gpu_tensor_free(gateb);
+        ds4_gpu_tensor_free(upb); ds4_gpu_tensor_free(actb); ds4_gpu_tensor_free(Hrow);
+        ds4_gpu_tensor_free(logitsT); free(emb);
+        return ok ? 0 : 1;
+    }
+}
+
 int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
     if (!g_initialized && !ds4_gpu_init()) {
         if (errlen) snprintf(err, errlen, "Metal init failed (no GPU device?)");

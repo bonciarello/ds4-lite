@@ -1806,6 +1806,119 @@ kernel void kernel_dense_attn_decode_f32_sg(
     }
 }
 
+// ===========================================================================
+// Batched-prefill kernels (process M tokens at once). The matmuls use
+// kernel_mul_mm (q4_K/q6_K); these cover the elementwise + attention parts.
+// ===========================================================================
+
+// Batched RMSNorm over M rows. Dispatch grid=(M,1,1) tpg=(128,1,1).
+kernel void kernel_dense_rms_norm_f32_batch(
+        constant ds4_dense_rmsnorm_args & a [[buffer(0)]],
+        device const float * x   [[buffer(1)]],
+        device const float * w   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint   tgig  [[threadgroup_position_in_grid]],
+        uint   tid   [[thread_position_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint nt = 128u;
+    threadgroup float sdata[4];
+    device const float * xr   = x   + (ulong)tgig * a.n;
+    device       float * outr = out + (ulong)tgig * a.n;
+    float ss = 0.0f;
+    for (uint i = tid; i < a.n; i += nt) ss += xr[i]*xr[i];
+    ss = simd_sum(ss);
+    if (tiisg == 0) sdata[sgitg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { float tot = 0.0f; for (uint s = 0; s < nt/32u; s++) tot += sdata[s]; sdata[0] = tot; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float scale = 1.0f / sqrt(sdata[0] / (float)a.n + a.eps);
+    for (uint i = tid; i < a.n; i += nt) outr[i] = xr[i]*scale*w[i];
+}
+
+// Batched NEOX RoPE for M tokens. Token tok sits at position a.pos+tok; q is
+// [M, n_head*head_dim]. Dispatch n_tok*n_head*(n_rot/2) threads.
+kernel void kernel_dense_rope_neox_f32_batch(
+        constant ds4_dense_rope_args & a [[buffer(0)]],
+        device float * x [[buffer(1)]],
+        constant uint & n_tok [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    const uint rot_half = a.n_rot / 2u;
+    const uint per_tok = a.n_head * rot_half;
+    if (gid >= n_tok * per_tok) return;
+    const uint tok = gid / per_tok;
+    const uint rem = gid % per_tok;
+    const uint h = rem / rot_half;
+    const uint i = rem % rot_half;
+    const uint qd = a.n_head * a.head_dim;
+    device float * head = x + (ulong)tok*qd + h*a.head_dim;
+    const float freq  = pow(a.freq_base, -2.0f * (float)i / (float)a.n_rot);
+    const float theta = (float)(a.pos + tok) * freq;
+    const float c = cos(theta), s = sin(theta);
+    const float x0 = head[i], x1 = head[i + rot_half];
+    head[i]            = x0 * c - x1 * s;
+    head[i + rot_half] = x0 * s + x1 * c;
+}
+
+// Batched causal attention over M query tokens. Query token m (at absolute
+// position start_pos+m) attends keys [0, start_pos+m]. One simdgroup per
+// (head, token). Dispatch grid=(n_head, M, 1) tpg=(32,1,1). head_dim<=256.
+kernel void kernel_dense_attn_prefill_f32(
+        constant ds4_dense_attn_args & a [[buffer(0)]],
+        device const float * q      [[buffer(1)]],   // [M, n_head*head_dim]
+        device const float * kcache [[buffer(2)]],
+        device const float * vcache [[buffer(3)]],
+        device       float * out    [[buffer(4)]],   // [M, n_head*head_dim]
+        constant uint & start_pos   [[buffer(5)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]]) {
+    const uint hq = tgpig.x;
+    const uint m  = tgpig.y;
+    if (hq >= a.n_head) return;
+    const uint group = a.n_head / a.n_kv;
+    const uint hkv = hq / group;
+    const uint hd  = a.head_dim;
+    const uint kvdim = a.n_kv * hd;
+    const uint qd  = a.n_head * hd;
+    const uint n_causal = start_pos + m + 1u;
+    device const float * qh = q + (ulong)m*qd + hq*hd;
+    device       float * oh = out + (ulong)m*qd + hq*hd;
+
+    const uint ndl = (hd + 31u) / 32u;
+    float qreg[8], acc[8];
+    for (uint j = 0; j < ndl; j++) {
+        const uint d = lane + 32u*j;
+        qreg[j] = (d < hd) ? qh[d] : 0.0f;
+        acc[j]  = 0.0f;
+    }
+    float mx = -INFINITY, l = 0.0f;
+    for (uint t = 0; t < n_causal; t++) {
+        device const float * kt = kcache + (ulong)t*kvdim + hkv*hd;
+        float p = 0.0f;
+        for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) p += qreg[j]*kt[d]; }
+        const float s = simd_sum(p) * a.scale;
+        const float m_new = max(mx, s);
+        const float corr = exp(mx - m_new);
+        const float pe   = exp(s - m_new);
+        l = l*corr + pe;
+        device const float * vt = vcache + (ulong)t*kvdim + hkv*hd;
+        for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) acc[j] = acc[j]*corr + pe*vt[d]; }
+        mx = m_new;
+    }
+    const float inv = 1.0f / l;
+    for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) oh[d] = acc[j]*inv; }
+}
+
+// Broadcast bias add over M rows: x[m,i] += bias[i]. args = {row_width, M*row_width}.
+kernel void kernel_dense_add_bias_batch(
+        constant uint2 & a [[buffer(0)]],
+        device       float * x    [[buffer(1)]],
+        device const float * bias [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.y) return;
+    x[gid] += bias[gid % a.x];
+}
+
 // ---- Dense Q6_K matvec (Fase: Q6_K support) --------------------------------
 // out[row] = dot(dequant(W[row]), x). Canonical GGML Q6_K dequant inline. One
 // thread per output row (reference; optimize later). Block = 210 bytes:

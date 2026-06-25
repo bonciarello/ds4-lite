@@ -23770,6 +23770,11 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
     (void)g; (void)desc; (void)token; (void)pos; (void)logits; return 1;
 }
 
+int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
+                          const int *tokens, unsigned M, unsigned start_pos, float *last_logits) {
+    (void)g; (void)desc; (void)tokens; (void)M; (void)start_pos; (void)last_logits; return 1;
+}
+
 ds4_context_memory ds4_context_memory_estimate_with_prefill(
         ds4_backend backend,
         int         ctx_size,
@@ -25797,10 +25802,15 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     int rc = 0;
     uint32_t pos = 0;
-    /* prefill (timed: prefill t/s and TTFT = prompt processing time) */
+    /* prefill (timed: prefill t/s and TTFT = prompt processing time). Batched
+     * matmul prefill by default; DS4_DENSE_NOPREFILL forces the per-token path. */
     const double t_start = now_sec();
-    for (uint32_t i = 0; i < (uint32_t)toks.len; i++) {
-        if (ds4_dense_gpu_forward(g, &desc, toks.v[i], pos++, logits) != 0) { rc = 1; break; }
+    if (toks.len > 1 && !getenv("DS4_DENSE_NOPREFILL")) {
+        if (ds4_dense_gpu_prefill(g, &desc, toks.v, (unsigned)toks.len, 0, logits) != 0) rc = 1;
+        else pos = (uint32_t)toks.len;
+    } else {
+        for (uint32_t i = 0; i < (uint32_t)toks.len; i++)
+            if (ds4_dense_gpu_forward(g, &desc, toks.v[i], pos++, logits) != 0) { rc = 1; break; }
     }
     const double t_prefill = now_sec();
     /* greedy decode (timed: decode t/s) */
