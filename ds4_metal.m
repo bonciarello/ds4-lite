@@ -3991,6 +3991,9 @@ struct ds4_dense_gpu {
     float *embedscratch;             /* n_embd */
     float *hostscratch;              /* n_vocab (for f32 matvec readback path) */
     NSMutableDictionary<NSNumber *, NSValue *> *wcache;   /* mmap ptr -> ds4_gpu_tensor* */
+    bool   profile;                  /* DS4_DENSE_PROFILE: per-phase timing */
+    double t_attn, t_ffn, t_out;     /* accumulated ms per phase */
+    uint64_t n_fwd;
 };
 
 static ds4_gpu_tensor *dense_cached_weight(ds4_dense_gpu *g, const void *data, uint64_t bytes) {
@@ -4077,6 +4080,7 @@ ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
     g->qd = d->n_head*d->head_dim; g->kvd = d->n_kv*d->head_dim;
     g->n_vocab = d->n_vocab; g->n_ctx = d->n_ctx;
     g->wcache = [NSMutableDictionary dictionary];
+    g->profile = getenv("DS4_DENSE_PROFILE") != NULL;
     g->embedscratch = malloc((size_t)d->n_embd * sizeof(float));
     g->hostscratch = malloc((size_t)d->n_vocab * sizeof(float));
     g->x=ds4_gpu_tensor_alloc((uint64_t)g->n_embd*4); g->h=ds4_gpu_tensor_alloc((uint64_t)g->n_embd*4);
@@ -4096,6 +4100,15 @@ ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
 
 void ds4_dense_gpu_free(ds4_dense_gpu *g) {
     if (!g) return;
+    if (g->profile && g->n_fwd > 0) {
+        const double n = (double)g->n_fwd;
+        const double tot = g->t_attn + g->t_ffn + g->t_out;
+        fprintf(stderr,
+                "ds4 dense profile (%llu forwards, ms/token): attn=%.2f ffn=%.2f "
+                "output=%.2f total=%.2f  [attn %.0f%% ffn %.0f%% out %.0f%%]\n",
+                (unsigned long long)g->n_fwd, g->t_attn/n, g->t_ffn/n, g->t_out/n, tot/n,
+                100.0*g->t_attn/tot, 100.0*g->t_ffn/tot, 100.0*g->t_out/tot);
+    }
     ds4_gpu_tensor_free(g->x); ds4_gpu_tensor_free(g->h); ds4_gpu_tensor_free(g->h2);
     ds4_gpu_tensor_free(g->o); ds4_gpu_tensor_free(g->down); ds4_gpu_tensor_free(g->q);
     ds4_gpu_tensor_free(g->att); ds4_gpu_tensor_free(g->k); ds4_gpu_tensor_free(g->v);
@@ -4132,6 +4145,7 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
             ds4_dense_kv_layer *kv = &g->kv[il];
             ds4_gpu_tensor *kview = ds4_gpu_tensor_view(kv->k, (uint64_t)pos*kvd*4, (uint64_t)kvd*4);
             ds4_gpu_tensor *vview = ds4_gpu_tensor_view(kv->v, (uint64_t)pos*kvd*4, (uint64_t)kvd*4);
+            const double ta0 = g->profile ? ds4_gpu_now_ms() : 0.0;
             ok = kview && vview
               && dense_rms(g, g->h, g->x, &L->attn_norm, ne, eps)
               && dense_matvec(g, &L->attn_q, g->h, g->q)
@@ -4144,18 +4158,25 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
               && dense_rope(kview, nkv, hd, nrot, pos, base)
               && dense_attn(g->att, g->q, kv->k, kv->v, nh, nkv, hd, pos+1, scale)
               && dense_matvec(g, &L->attn_out, g->att, g->o)
-              && dense_add(g->x, g->o, ne)
+              && dense_add(g->x, g->o, ne);
+            const double ta1 = g->profile ? ds4_gpu_now_ms() : 0.0;
+            ok = ok
               && dense_rms(g, g->h2, g->x, &L->ffn_norm, ne, eps)
               && dense_matvec(g, &L->ffn_gate, g->h2, g->gate)
               && dense_matvec(g, &L->ffn_up, g->h2, g->up)
               && dense_swiglu(g->act, g->gate, g->up, nff)
               && dense_matvec(g, &L->ffn_down, g->act, g->down)
               && dense_add(g->x, g->down, ne);
+            const double ta2 = g->profile ? ds4_gpu_now_ms() : 0.0;
             ds4_gpu_tensor_free(kview);
             ds4_gpu_tensor_free(vview);
+            if (g->profile) { g->t_attn += ta1 - ta0; g->t_ffn += ta2 - ta1; }
         }
+        const double to0 = g->profile ? ds4_gpu_now_ms() : 0.0;
         ok = ok && dense_rms(g, g->h, g->x, &d->output_norm, ne, eps)
                 && dense_matvec(g, &d->output, g->h, g->logits);
+        const double to1 = g->profile ? ds4_gpu_now_ms() : 0.0;
+        if (g->profile) { g->t_out += to1 - to0; g->n_fwd++; }
         if (!ok) return 1;
         ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)d->n_vocab*4);
         return 0;
