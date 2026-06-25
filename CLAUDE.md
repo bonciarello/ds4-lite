@@ -86,13 +86,15 @@ Stato:
     completo (attn+FFN, banale) e fare il **wiring coi pesi reali** + KV cache dense
     nella session, dietro `ds4_arch_is_deepseek()` in `metal_graph_eval_token_raw_swa`
     → continuazione greedy vs llama.cpp.
-    **Supporto quant per il dense — COMPLETO e validato su GPU** (`--metal-dense-selftest`):
-    F32, **Q8_0**, **Q4_K**, **Q6_K** matvec densi (kernel `kernel_dense_mul_mv_{q4,q6}_K_f32`
-    in `metal/dense.metal`, dequant canonica GGML inline, vs CPU ref <1e-2).
-    Aggiunti `DS4_TENSOR_Q6_K=14` + `block_q6_K` (210B) in `ds4.c` (caricamento q6_k già
-    ok via gguf_types). Ora il Qwen2 Q4_K_M (169 Q4_K + 29 Q6_K + 141 F32) è interamente
-    calcolabile su GPU. NB: i kernel q4_K/q6_K dense sono "reference" (1 thread/riga),
-    correttezza-first; ottimizzazione dopo. Validazione indipendente finale = step 4 greedy.
+    **Supporto quant per il dense — COMPLETO e validato su GPU** (`--metal-dense-selftest`,
+    12 casi PASS <1e-2): F32, **Q8_0**, **Q3_K**, **Q4_K**, **Q5_K**, **Q6_K** matvec densi
+    (kernel `kernel_dense_mul_mv_{q3,q4,q5,q6}_K_f32` in `metal/dense.metal`, dequant
+    canonica GGML inline). Aggiunti in `ds4.c`: `DS4_TENSOR_Q3_K=11/Q5_K=13/Q6_K=14` +
+    `block_q3_K/q5_K/q6_K` (110/176/210B). Caricamento già ok via `gguf_types`.
+    Il Qwen2 Q4_K_M (169 Q4_K + 29 Q6_K + 141 F32) è interamente calcolabile su GPU; e
+    la copertura K-quant comune è completa (Q3/Q4/Q5/Q6_K). NB: kernel "reference"
+    (1 thread/riga), correttezza-first; ottimizzazione dopo. Validazione indipendente
+    finale = step 4 greedy vs llama.cpp.
     Nota: i kernel `.metal` sono caricati da disco a runtime (modifiche ai soli `.metal`
     non richiedono rebuild di ds4_metal.o); eseguire `./ds4` dalla root del repo.
   - 3.7 wiring eval dispatch + validazione greedy vs llama.cpp (su questo Mac).
