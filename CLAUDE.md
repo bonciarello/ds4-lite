@@ -99,9 +99,17 @@ Stato:
     Union and the second most"). Bug risolto: `ds4_gpu_tensor_copy` (blit async su
     g_batch_cb non committato) per l'append KV → sostituito con scrittura diretta nello
     slot via `ds4_gpu_tensor_view` (operazioni ordinate).
-    Resta (polish, non bloccante): ottimizzazione kernel (ora 1 thread/riga, reference);
-    wiring nella session-eval per far funzionare `./ds4 -p` diretto; zero-copy weight wrap
-    (ora copia ~4.7GB su GPU, ok su 32GB unified).
+    **Polish**:
+    - ✅ **Wiring `./ds4 -p`**: i modelli densi col prompt one-shot sono instradati a
+      `ds4_dense_generate` (helper `ds4_model_is_dense` in `ds4.c`, routing in `main()`
+      di `ds4_cli.c`). `./ds4 -m qwen2.gguf -p "..."` funziona. (Chat/server dense = follow-up.)
+    - ⏸️ **Velocità** (~4 tok/s, ~10x più lento di llama.cpp): **compute-bound** sui kernel
+      reference 1-thread/riga. Il batching dei command buffer (`begin/end_commands`) NON
+      aiuta (provato e revertito) — l'overhead di dispatch non è il collo di bottiglia. Il
+      vero lever è kernel matvec **simdgroup-cooperativi** (riscrittura, da validare passo-passo).
+    - ⏸️ **Zero-copy weight wrap**: `ds4_gpu_wrap_model_range` restituisce un `MTLBuffer`
+      grezzo, i miei helper usano `ds4_gpu_tensor` (mismatch astrazione) → più invasivo.
+      Ora copia ~4.7GB su GPU (ok su 32GB unified; `ds4_gpu_set_model_map_range` mappa le view).
     **Supporto quant per il dense — COMPLETO e validato su GPU** (`--metal-dense-selftest`,
     12 casi PASS <1e-2): F32, **Q8_0**, **Q3_K**, **Q4_K**, **Q5_K**, **Q6_K** matvec densi
     (kernel `kernel_dense_mul_mv_{q3,q4,q5,q6}_K_f32` in `metal/dense.metal`, dequant
