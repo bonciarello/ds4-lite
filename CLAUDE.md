@@ -87,9 +87,21 @@ Stato:
     `ds4_gpu_dense_matvec_verify`). Su Qwen2 reale: attn_q (Q4_K), attn_v/ffn_down/
     output (Q6_K) tutti PASS, rel_err ~1e-7 vs CPU. Copia il peso su GPU; lo zero-copy
     `ds4_gpu_wrap_model_range` è rinviato al driver (serve per non duplicare GB di pesi).
-  - **Prossimi step 4**: (3) driver forward denso coi pesi reali (type-dispatch +
-    zero-copy wrap) → (4) KV cache dense nella session → (5) wiring dietro
-    `ds4_arch_is_deepseek()` in `metal_graph_eval_token_raw_swa` → (6) greedy vs llama.cpp.
+  - **step 4 (3-6)** ✅✅ **FORWARD DENSO FUNZIONANTE** — `./ds4 --metal-dense-generate
+    MODEL PROMPT [N]`. Driver GPU completo in `ds4_metal.m` (`ds4_dense_gpu_create/
+    forward/free`): embedding (Q4_K dequant) → 28× [rmsnorm → attn GQA (q/k/v matvec+
+    bias, RoPE NEOX, KV cache via tensor-view, attention) → residuo → rmsnorm → FFN
+    SwiGLU → residuo] → output_norm → output matvec → logits. Pesi reali via cache GPU
+    per-tensore + matvec type-dispatch. Orchestrazione + generate greedy in `ds4.c`
+    (`ds4_dense_generate`).
+    **VALIDATO**: continuazione greedy **identica a llama-simple** su Qwen2-7B Q4_K_M
+    ("The capital of France is" → " Paris. It is the most populous city in the European
+    Union and the second most"). Bug risolto: `ds4_gpu_tensor_copy` (blit async su
+    g_batch_cb non committato) per l'append KV → sostituito con scrittura diretta nello
+    slot via `ds4_gpu_tensor_view` (operazioni ordinate).
+    Resta (polish, non bloccante): ottimizzazione kernel (ora 1 thread/riga, reference);
+    wiring nella session-eval per far funzionare `./ds4 -p` diretto; zero-copy weight wrap
+    (ora copia ~4.7GB su GPU, ok su 32GB unified).
     **Supporto quant per il dense — COMPLETO e validato su GPU** (`--metal-dense-selftest`,
     12 casi PASS <1e-2): F32, **Q8_0**, **Q3_K**, **Q4_K**, **Q5_K**, **Q6_K** matvec densi
     (kernel `kernel_dense_mul_mv_{q3,q4,q5,q6}_K_f32` in `metal/dense.metal`, dequant
