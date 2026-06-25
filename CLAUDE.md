@@ -103,15 +103,18 @@ Stato:
     - ✅ **Wiring `./ds4 -p`**: i modelli densi col prompt one-shot sono instradati a
       `ds4_dense_generate` (helper `ds4_model_is_dense` in `ds4.c`, routing in `main()`
       di `ds4_cli.c`). `./ds4 -m qwen2.gguf -p "..."` funziona. (Chat/server dense = follow-up.)
-    - ⏸️ **Velocità** (~4 tok/s, ~10x più lento di llama.cpp): **compute-bound** sui kernel
-      reference 1-thread/riga. Tentativi (entrambi corretti ma NON più veloci, revertiti):
-      (a) **batching** command buffer (`begin/end_commands`) — l'overhead dispatch non è il
-      collo di bottiglia; (b) **simdgroup-per-riga** (32 thread/riga, blocchi strided +
-      `simd_sum`) — **più lento**: con `n_embd=3584` ci sono solo 14 blocchi/riga (<32 lane)
-      → sotto-utilizzo + overhead simd_sum, e l'output matvec lancia 4.8M thread per lavoro
-      minimo. Il vero lever resta un matvec a **parallelismo per-elemento** (32 thread sui
-      ~3584 elementi della riga, non sui 14 blocchi) con dequant per-elemento — più complesso,
-      payoff incerto, follow-up dedicato.
+    - ⏸️ **Velocità** (~3-4 tok/s decode, ~14x più lento di llama.cpp). **Profilato**
+      (`DS4_DENSE_PROFILE=1`): ffn 51%, attn 41%, output 8% per token. 3 tentativi, tutti
+      corretti ma NON più veloci, revertiti: (a) batching command buffer — non dispatch-bound;
+      (b) simdgroup-per-riga uniforme — più lento sui matvec a basso nblk; (c) simdgroup solo
+      su alto nblk (ffn_down, 74 blocchi) — **anche più lento**. **Finding raffinato**: NON è
+      parallelism-bound — 3584 righe saturano già le ALU dell'M1 Max, quindi aggiungere
+      thread/simd_sum aggiunge solo overhead. Il gap 14x è il costo del **dequant scalare
+      ingenuo** vs i dot-product quantizzati **vettorizzati** di llama.cpp. Vero lever: dequant
+      vettorizzato (float4/simd-matrix). **Via più tractable**: ds4 ha GIÀ kernel matvec
+      ottimizzati per q8_0 (`kernel_mul_mv_q8_0_f32`, validato nel selftest, molto più veloce)
+      → un **GGUF denso Q8_0 + riuso di quel kernel** sarebbe una vittoria grossa e a basso
+      rischio. Dettagli in [[ds4-lite-dense-optimizations]].
     - ⏸️ **Zero-copy weight wrap**: `ds4_gpu_wrap_model_range` restituisce un `MTLBuffer`
       grezzo, i miei helper usano `ds4_gpu_tensor` (mismatch astrazione) → più invasivo.
       Ora copia ~4.7GB su GPU (ok su 32GB unified; `ds4_gpu_set_model_map_range` mappa le view).
