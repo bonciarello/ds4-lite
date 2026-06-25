@@ -23750,6 +23750,13 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
     return 1;
 }
 
+int ds4_gpu_dense_matvec_verify(int type, const void *wbytes, uint64_t wnbytes,
+                                const float *x, uint32_t in_dim, uint32_t out_dim,
+                                float *maxerr_out) {
+    (void)type; (void)wbytes; (void)wnbytes; (void)x; (void)in_dim; (void)out_dim; (void)maxerr_out;
+    return 1;
+}
+
 ds4_context_memory ds4_context_memory_estimate_with_prefill(
         ds4_backend backend,
         int         ctx_size,
@@ -25624,6 +25631,56 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     vocab_free(&vocab);
     model_close(&model);
     return 0;
+}
+
+/* Fase 3.5 step 4 (1+2): load a dense model and verify the type-dispatch matvec
+ * on REAL weight tensors (attn_q, ffn_down, attn_v, output) against the CPU
+ * dequant reference. Validates that real K-quant weights flow through the dense
+ * GPU kernels correctly. Returns 0 if all tested tensors PASS. */
+int ds4_dense_weight_test(const char *model_path, char *err, size_t errlen) {
+    ds4_model model;
+    ds4_weights weights;
+    model_open(&model, model_path, false, false);
+    config_validate_model(&model);
+    if (ds4_arch_is_deepseek()) {
+        if (errlen) snprintf(err, errlen, "not a dense model (this test is dense-only)");
+        model_close(&model);
+        return 1;
+    }
+    weights_bind(&weights, &model, false, 0, 0, true, false);
+
+    struct { const char *name; const ds4_tensor *t; } cases[] = {
+        { "blk.0.attn_q",   weights.layer[0].attn_q },
+        { "blk.0.attn_v",   weights.layer[0].attn_v },
+        { "blk.0.ffn_down", weights.layer[0].ffn_down },
+        { "output",         weights.output },
+    };
+    printf("dense weight matvec test: %s\n", DS4_MODEL_SHAPE_NAME);
+    float *x = NULL;
+    uint32_t x_cap = 0;
+    int fail = 0;
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        const ds4_tensor *t = cases[i].t;
+        if (!t) { printf("  %-14s : skipped (not bound)\n", cases[i].name); continue; }
+        const uint32_t in_dim = (uint32_t)t->dim[0];
+        const uint32_t out_dim = (uint32_t)t->dim[1];
+        if (in_dim % 256u != 0) { printf("  %-14s : skipped (in_dim %u not /256)\n", cases[i].name, in_dim); continue; }
+        if (in_dim > x_cap) { x = xrealloc(x, (size_t)in_dim * sizeof(float)); x_cap = in_dim; }
+        for (uint32_t k = 0; k < in_dim; k++) x[k] = 0.002f * (float)((int)(k % 31) - 15);
+        float maxerr = 0.0f;
+        const int rc = ds4_gpu_dense_matvec_verify((int)t->type, tensor_data(&model, t),
+                                                   t->bytes, x, in_dim, out_dim, &maxerr);
+        if (rc == 0 && maxerr < 1e-3f) {
+            printf("  %-14s : PASS  type=%u %ux%u rel_err=%.2e\n", cases[i].name, t->type, in_dim, out_dim, (double)maxerr);
+        } else {
+            printf("  %-14s : FAIL  type=%u %ux%u rc=%d rel_err=%.2e\n", cases[i].name, t->type, in_dim, out_dim, rc, (double)maxerr);
+            fail = 1;
+        }
+    }
+    free(x);
+    model_close(&model);
+    if (fail && errlen) snprintf(err, errlen, "one or more dense weight matvecs failed");
+    return fail;
 }
 
 #ifndef DS4_NO_GPU

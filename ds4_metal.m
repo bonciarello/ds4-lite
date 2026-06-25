@@ -3913,6 +3913,57 @@ static float ds4_q2k_block_dot(const uint8_t *blk, const float *xb) {
     return acc;
 }
 
+/* Fase 3.5 step 4.2: verify a dense matvec on REAL model weight bytes. Copies the
+ * (quantized) weight to a GPU buffer, dispatches the kernel for its GGML type, and
+ * compares against the CPU dequant reference. Returns 0 on success and writes the
+ * relative max error. type uses GGML ids (Q2_K=10..Q6_K=14). in_dim multiple of 256. */
+int ds4_gpu_dense_matvec_verify(int type, const void *wbytes, uint64_t wnbytes,
+                                const float *x, uint32_t in_dim, uint32_t out_dim,
+                                float *maxerr_out) {
+    if (!g_initialized && !ds4_gpu_init()) return 1;
+    const char *kernel = NULL; uint32_t blkbytes = 0;
+    float (*cpu_dot)(const uint8_t *, const float *) = NULL;
+    switch (type) {
+        case 10: kernel="kernel_dense_mul_mv_q2_K_f32"; blkbytes=84;  cpu_dot=ds4_q2k_block_dot; break;
+        case 11: kernel="kernel_dense_mul_mv_q3_K_f32"; blkbytes=110; cpu_dot=ds4_q3k_block_dot; break;
+        case 12: kernel="kernel_dense_mul_mv_q4_K_f32"; blkbytes=144; cpu_dot=ds4_q4k_block_dot; break;
+        case 13: kernel="kernel_dense_mul_mv_q5_K_f32"; blkbytes=176; cpu_dot=ds4_q5k_block_dot; break;
+        case 14: kernel="kernel_dense_mul_mv_q6_K_f32"; blkbytes=210; cpu_dot=ds4_q6k_block_dot; break;
+        default: return 2;
+    }
+    if (in_dim % 256u != 0) return 3;
+    const uint32_t nblk = in_dim / 256u;
+    ds4_gpu_tensor *Wb = ds4_gpu_tensor_alloc(wnbytes);
+    ds4_gpu_tensor *xb = ds4_gpu_tensor_alloc((uint64_t)in_dim * 4);
+    ds4_gpu_tensor *ob = ds4_gpu_tensor_alloc((uint64_t)out_dim * 4);
+    float *got = malloc((size_t)out_dim * 4), *ref = malloc((size_t)out_dim * 4);
+    int rc = 1;
+    if (Wb && xb && ob && got && ref) {
+        ds4_gpu_tensor_write(Wb, 0, wbytes, wnbytes);
+        ds4_gpu_tensor_write(xb, 0, x, (uint64_t)in_dim * 4);
+        struct __attribute__((packed)) { uint32_t in_dim, out_dim; } qa = { in_dim, out_dim };
+        ds4_gpu_tensor *bufs[3] = { Wb, xb, ob };
+        if (ds4_gpu_run_simple(kernel, &qa, sizeof(qa), bufs, 3, out_dim, "weight matvec")) {
+            ds4_gpu_tensor_read(ob, 0, got, (uint64_t)out_dim * 4);
+            const uint8_t *wb = (const uint8_t *)wbytes;
+            float maxerr = 0.0f, maxmag = 1.0f;
+            for (uint32_t r = 0; r < out_dim; r++) {
+                double acc = 0.0;
+                for (uint32_t b = 0; b < nblk; b++)
+                    acc += cpu_dot(wb + ((size_t)r*nblk + b)*blkbytes, x + (size_t)b*256);
+                ref[r] = (float)acc;
+                const float e = fabsf(got[r] - ref[r]); if (e > maxerr) maxerr = e;
+                const float m = fabsf(ref[r]); if (m > maxmag) maxmag = m;
+            }
+            *maxerr_out = maxerr / maxmag;
+            rc = 0;
+        }
+    }
+    ds4_gpu_tensor_free(Wb); ds4_gpu_tensor_free(xb); ds4_gpu_tensor_free(ob);
+    free(got); free(ref);
+    return rc;
+}
+
 int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
     if (!g_initialized && !ds4_gpu_init()) {
         if (errlen) snprintf(err, errlen, "Metal init failed (no GPU device?)");

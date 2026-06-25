@@ -1435,6 +1435,16 @@ static cli_config parse_options(int argc, char **argv) {
             fprintf(stderr, "dense matvec GPU selftest: FAIL (%s)\n", st_err);
             exit(1);
         }
+        if (!strcmp(arg, "--metal-dense-weight-test")) {
+            /* Fase 3.5 step 4: matvec on real model weights vs CPU. Pass MODEL as arg. */
+            const char *mp = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[++i] : NULL;
+            if (!mp || !mp[0]) { fprintf(stderr, "ds4: --metal-dense-weight-test needs a model path argument\n"); exit(1); }
+            char st_err[256] = {0};
+            const int rc = ds4_dense_weight_test(mp, st_err, sizeof(st_err));
+            if (rc == 0) { printf("dense weight matvec test: PASS\n"); exit(0); }
+            fprintf(stderr, "dense weight matvec test: FAIL (%s)\n", st_err);
+            exit(1);
+        }
         char dist_parse_err[256] = {0};
         ds4_dist_cli_parse_result dist_parse = ds4_dist_parse_cli_arg(arg,
                                                                       &i,

@@ -151,6 +151,16 @@ void ds4_engine_close(ds4_engine *e);
  * path on-device with no model. Returns 0 on PASS. Implemented on the GPU
  * backend; a CPU-only build returns an error. */
 int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen);
+
+/* Fase 3.5 step 4: verify the type-dispatch dense matvec on a real weight (copies
+ * the quantized weight to GPU, dispatches the kernel for its GGML type, compares
+ * to the CPU dequant). type = GGML id; in_dim multiple of 256. Returns 0 on ok. */
+int ds4_gpu_dense_matvec_verify(int type, const void *wbytes, uint64_t wnbytes,
+                                const float *x, uint32_t in_dim, uint32_t out_dim,
+                                float *maxerr_out);
+
+/* Load a dense model and verify the dense GPU matvec on real weight tensors. */
+int ds4_dense_weight_test(const char *model_path, char *err, size_t errlen);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
