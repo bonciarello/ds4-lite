@@ -41,21 +41,31 @@ echo "model:  $MODEL"
 echo "prompt: \"$PROMPT\"  n_predict: $NPREDICT"
 echo
 
-# ---- ds4 dense speed (warmup, then measured) -------------------------------
-echo "--- ds4 dense speed ---"
+# ---- collect ds4 dense speed (warmup, then measured) -----------------------
 "$DS4" --metal-dense-generate "$MODEL" "$PROMPT" "$NPREDICT" >/dev/null 2>"$OUTDIR/ds4_warm.txt" || true
 "$DS4" --metal-dense-generate "$MODEL" "$PROMPT" "$NPREDICT" >"$OUTDIR/ds4_out.txt" 2>"$OUTDIR/ds4_metrics.txt" || true
-DS4_METRICS=$(grep "dense metrics" "$OUTDIR/ds4_metrics.txt" | tail -1)
-echo "  ${DS4_METRICS:-(no metrics — run failed?)}"
-echo
+DS4_PREFILL=$(sed -nE 's/.*prefill ([0-9.]+) t\/s.*/\1/p' "$OUTDIR/ds4_metrics.txt" | tail -1)
+DS4_DECODE=$( sed -nE 's/.*gen ([0-9.]+) t\/s.*/\1/p'     "$OUTDIR/ds4_metrics.txt" | tail -1)
 
-# ---- llama.cpp speed reference (llama-bench) -------------------------------
-echo "--- llama.cpp speed (llama-bench pp512/tg128) ---"
-if command -v "$(basename "$LBENCH")" >/dev/null 2>&1 || [ -x "$LBENCH" ]; then
-    "$LBENCH" -m "$MODEL" -p 512 -n 128 2>/dev/null | grep -E "qwen|llama|model|t/s|pp512|tg128" | tail -4 || true
-else
-    echo "  llama-bench not found (brew install llama.cpp)"
+# ---- collect llama.cpp speed (llama-bench pp512/tg128) ---------------------
+LL_PREFILL=""; LL_DECODE=""
+if [ -x "$LBENCH" ] || command -v "$(basename "$LBENCH")" >/dev/null 2>&1; then
+    "$LBENCH" -m "$MODEL" -p 512 -n 128 2>/dev/null > "$OUTDIR/llama_bench.txt" || true
+    LL_PREFILL=$(grep -E "pp512" "$OUTDIR/llama_bench.txt" | sed -nE 's/.*\| *([0-9.]+) ±.*/\1/p' | tail -1)
+    LL_DECODE=$( grep -E "tg128" "$OUTDIR/llama_bench.txt" | sed -nE 's/.*\| *([0-9.]+) ±.*/\1/p' | tail -1)
 fi
+
+# ---- side-by-side speed table (t/s) ----------------------------------------
+fmt() { [ -n "$1" ] && printf '%s' "$1" || printf 'n/a'; }
+gap() { LC_ALL=C awk -v a="$1" -v b="$2" 'BEGIN{ if (a+0>0 && b+0>0) printf "%.1fx", b/a; else printf "-" }'; }
+echo "--- speed: t/s (higher is better) ---"
+printf "  %-14s | %12s | %12s | %8s\n" "metric" "ds4 dense" "llama.cpp" "gap"
+printf "  %-14s-+-%12s-+-%12s-+-%8s\n" "--------------" "------------" "------------" "--------"
+printf "  %-14s | %12s | %12s | %8s\n" "decode  (tg)" "$(fmt "$DS4_DECODE")"  "$(fmt "$LL_DECODE")"  "$(gap "$DS4_DECODE" "$LL_DECODE")"
+printf "  %-14s | %12s | %12s | %8s\n" "prefill (pp)" "$(fmt "$DS4_PREFILL")" "$(fmt "$LL_PREFILL")" "$(gap "$DS4_PREFILL" "$LL_PREFILL")"
+echo "  decode is the apples-to-apples gap (both generate 1 token/step)."
+echo "  prefill is NOT comparable: ds4 processes the prompt 1 token at a time and"
+echo "  the first forward uploads ~weights to the GPU; llama-bench pp512 is batched."
 echo
 
 # ---- correctness: greedy continuation must match llama-simple --------------
@@ -89,7 +99,13 @@ if [ "$SWEEP" -eq 1 ]; then
         echo "  n_predict=$N done"
     done
     echo "  CSV: $CSV"
-    cat "$CSV"
+    echo
+    printf "  %-12s | %14s | %14s | %8s\n" "ctx_tokens" "ds4 decode t/s" "llama tg128" "gap"
+    printf "  %-12s-+-%14s-+-%14s-+-%8s\n" "------------" "--------------" "--------------" "--------"
+    tail -n +2 "$CSV" | while IFS=, read -r ctx ptok ptps gtok gtps kv; do
+        printf "  %-12s | %14s | %14s | %8s\n" "$ctx" "$gtps" "$(fmt "$LL_DECODE")" "$(gap "$gtps" "$LL_DECODE")"
+    done
+    echo "  (llama tg128 is a single batched measurement, shown as a flat reference)"
     if python3 "$ROOT/speed-bench/plot_speed.py" "$CSV" --title "Qwen2 dense t/s (ds4)" -o "$OUTDIR/dense_sweep_ts.svg" 2>/dev/null; then
         echo "  SVG: $OUTDIR/dense_sweep_ts.svg"
     fi
