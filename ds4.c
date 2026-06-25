@@ -10168,6 +10168,227 @@ static void forward_token_raw_swa_cpu_decode_scratch(
     }
 }
 
+/* ==========================================================================
+ * Dense CPU reference forward (Fase 3.4) — standard Qwen2/Llama transformer.
+ *
+ * STATUS: correct-by-construction REFERENCE. It compiles, but is NOT yet wired
+ * into the eval dispatch and has NOT been runtime-validated: the CPU path
+ * crashes current macOS kernels, so validate on Linux (`make cpu`) against
+ * llama.cpp greedy output before trusting it. This is the precise spec for the
+ * Metal port (Fase 3.5+). See docs/DENSE_SUPPORT_DESIGN.md.
+ *
+ * Scope: pre-norm residual transformer with GQA attention, NEOX RoPE, and a
+ * SwiGLU FFN. Weights are dequantized to f32 on the fly; only F32/F16/Q8_0 are
+ * decoded here (trusted primitives). K-quants (Q4_K/Q6_K) are intentionally NOT
+ * decoded in the reference to avoid shipping untested quant code — validate with
+ * an F16 or Q8_0 Qwen2 GGUF. The capability helpers guarantee this code only
+ * ever runs for a dense model.
+ * ========================================================================== */
+
+#define DS4_QK8_0 32
+typedef struct { uint16_t d; int8_t qs[DS4_QK8_0]; } ds4_block_q8_0_ref;
+
+/* Dequantize one row (length n) of a 2D weight tensor to f32. GGUF weight layout
+ * is row-major with dim[0]=n (input/contraction) and dim[1]=#rows (output). */
+DS4_MAYBE_UNUSED static void dense_dequant_row(const ds4_model *m, const ds4_tensor *t,
+                                               uint64_t row, float *out, uint64_t n) {
+    const uint8_t *base = tensor_data(m, t);
+    switch (t->type) {
+    case DS4_TENSOR_F32: {
+        const float *r = (const float *)base + row * n;
+        for (uint64_t i = 0; i < n; i++) out[i] = r[i];
+        break;
+    }
+    case DS4_TENSOR_F16: {
+        const uint16_t *r = (const uint16_t *)base + row * n;
+        for (uint64_t i = 0; i < n; i++) out[i] = f16_to_f32(r[i]);
+        break;
+    }
+    case DS4_TENSOR_Q8_0: {
+        const uint64_t nblk = n / DS4_QK8_0;
+        const ds4_block_q8_0_ref *blocks =
+            (const ds4_block_q8_0_ref *)base + row * nblk;
+        for (uint64_t b = 0; b < nblk; b++) {
+            const float d = f16_to_f32(blocks[b].d);
+            for (uint32_t i = 0; i < DS4_QK8_0; i++)
+                out[b * DS4_QK8_0 + i] = d * (float)blocks[b].qs[i];
+        }
+        break;
+    }
+    default:
+        ds4_die("dense CPU reference decodes only F32/F16/Q8_0 weights; "
+                "re-quantize the GGUF to Q8_0 or F16 (K-quant decode is not "
+                "implemented in the reference path)");
+    }
+}
+
+/* out[r] = dot(W[r, :], x), r in [0, rows). rowbuf is scratch of length n_in. */
+DS4_MAYBE_UNUSED static void dense_matvec(const ds4_model *m, const ds4_tensor *W,
+                                          const float *x, float *out,
+                                          uint64_t n_in, uint64_t rows, float *rowbuf) {
+    for (uint64_t r = 0; r < rows; r++) {
+        dense_dequant_row(m, W, r, rowbuf, n_in);
+        double acc = 0.0;
+        for (uint64_t i = 0; i < n_in; i++) acc += (double)rowbuf[i] * (double)x[i];
+        out[r] = (float)acc;
+    }
+}
+
+/* NEOX RoPE (Qwen2/Llama GGUF convention): rotate dim i with i + n_rot/2. */
+DS4_MAYBE_UNUSED static void dense_rope_neox(float *x, uint32_t n_head, uint32_t head_dim,
+                                             uint32_t n_rot, uint32_t pos, float freq_base) {
+    const uint32_t half = n_rot / 2;
+    for (uint32_t h = 0; h < n_head; h++) {
+        float *head = x + (uint64_t)h * head_dim;
+        for (uint32_t i = 0; i < half; i++) {
+            const float freq = powf(freq_base, -2.0f * (float)i / (float)n_rot);
+            const float theta = (float)pos * freq;
+            const float c = cosf(theta), s = sinf(theta);
+            const float x0 = head[i];
+            const float x1 = head[i + half];
+            head[i]        = x0 * c - x1 * s;
+            head[i + half] = x0 * s + x1 * c;
+        }
+    }
+}
+
+/* Simple per-layer dense KV cache: full f32 K and V, one row of kv_dim per pos. */
+typedef struct {
+    float   *k;       /* [n_ctx * kv_dim] */
+    float   *v;       /* [n_ctx * kv_dim] */
+    uint32_t kv_dim;
+    uint32_t n_ctx;
+} dense_kv_layer;
+
+typedef struct {
+    dense_kv_layer *layer;   /* [n_layer] */
+    uint32_t        n_layer;
+} dense_kv_cache;
+
+DS4_MAYBE_UNUSED static void dense_kv_cache_init(dense_kv_cache *c, uint32_t n_layer,
+                                                 uint32_t kv_dim, uint32_t n_ctx) {
+    c->n_layer = n_layer;
+    c->layer = xcalloc(n_layer, sizeof(c->layer[0]));
+    for (uint32_t il = 0; il < n_layer; il++) {
+        c->layer[il].kv_dim = kv_dim;
+        c->layer[il].n_ctx = n_ctx;
+        c->layer[il].k = xcalloc((size_t)n_ctx * kv_dim, sizeof(float));
+        c->layer[il].v = xcalloc((size_t)n_ctx * kv_dim, sizeof(float));
+    }
+}
+
+DS4_MAYBE_UNUSED static void dense_kv_cache_free(dense_kv_cache *c) {
+    for (uint32_t il = 0; il < c->n_layer; il++) {
+        free(c->layer[il].k);
+        free(c->layer[il].v);
+    }
+    free(c->layer);
+    memset(c, 0, sizeof(*c));
+}
+
+static inline float dense_silu(float z) { return z / (1.0f + expf(-z)); }
+
+/* Single dense transformer layer, decode step at position `pos`. */
+DS4_MAYBE_UNUSED static void dense_layer_forward_cpu(
+        float *x, const ds4_model *m, const ds4_layer_weights *l,
+        dense_kv_layer *kv, uint32_t pos) {
+    const uint32_t n_embd   = DS4_N_EMBD;
+    const uint32_t n_head   = DS4_N_HEAD;
+    const uint32_t n_kv     = DS4_N_HEAD_KV;
+    const uint32_t hd       = DS4_N_HEAD_DIM;
+    const uint32_t q_dim    = n_head * hd;
+    const uint32_t kv_dim   = n_kv * hd;
+    const uint32_t group    = n_head / n_kv;     /* GQA query heads per kv head */
+    const float    eps      = DS4_RMS_EPS;
+    const float    scale    = 1.0f / sqrtf((float)hd);
+
+    float *h    = xcalloc(n_embd, sizeof(float));
+    float *q    = xcalloc(q_dim, sizeof(float));
+    float *k    = xcalloc(kv_dim, sizeof(float));
+    float *v    = xcalloc(kv_dim, sizeof(float));
+    float *att  = xcalloc(q_dim, sizeof(float));
+    float *o    = xcalloc(n_embd, sizeof(float));
+    float *rb   = xcalloc(n_embd > q_dim ? n_embd : q_dim, sizeof(float));
+    float *score = xcalloc((size_t)pos + 1, sizeof(float));
+
+    /* --- Attention --- */
+    rms_norm_weight(h, x, (const float *)tensor_data(m, l->attn_norm), n_embd, eps);
+    dense_matvec(m, l->attn_q, h, q, n_embd, q_dim, rb);
+    dense_matvec(m, l->attn_k, h, k, n_embd, kv_dim, rb);
+    dense_matvec(m, l->attn_v, h, v, n_embd, kv_dim, rb);
+    if (l->attn_q_bias) { const float *b = tensor_data(m, l->attn_q_bias); for (uint32_t i=0;i<q_dim;i++) q[i]+=b[i]; }
+    if (l->attn_k_bias) { const float *b = tensor_data(m, l->attn_k_bias); for (uint32_t i=0;i<kv_dim;i++) k[i]+=b[i]; }
+    if (l->attn_v_bias) { const float *b = tensor_data(m, l->attn_v_bias); for (uint32_t i=0;i<kv_dim;i++) v[i]+=b[i]; }
+
+    dense_rope_neox(q, n_head, hd, hd, pos, DS4_ROPE_FREQ_BASE);
+    dense_rope_neox(k, n_kv,   hd, hd, pos, DS4_ROPE_FREQ_BASE);
+
+    /* append k,v to cache at pos */
+    memcpy(kv->k + (size_t)pos * kv_dim, k, kv_dim * sizeof(float));
+    memcpy(kv->v + (size_t)pos * kv_dim, v, kv_dim * sizeof(float));
+
+    for (uint32_t hq = 0; hq < n_head; hq++) {
+        const uint32_t hkv = hq / group;
+        const float *qh = q + (size_t)hq * hd;
+        float maxs = -1e30f;   /* softmax is shift-invariant; avoid INFINITY under -ffast-math */
+        for (uint32_t t = 0; t <= pos; t++) {
+            const float *kt = kv->k + (size_t)t * kv_dim + (size_t)hkv * hd;
+            double dot = 0.0;
+            for (uint32_t d = 0; d < hd; d++) dot += (double)qh[d] * kt[d];
+            score[t] = (float)dot * scale;
+            if (score[t] > maxs) maxs = score[t];
+        }
+        double sum = 0.0;
+        for (uint32_t t = 0; t <= pos; t++) { score[t] = expf(score[t] - maxs); sum += score[t]; }
+        const float inv = (float)(1.0 / sum);
+        float *ah = att + (size_t)hq * hd;
+        for (uint32_t d = 0; d < hd; d++) ah[d] = 0.0f;
+        for (uint32_t t = 0; t <= pos; t++) {
+            const float w = score[t] * inv;
+            const float *vt = kv->v + (size_t)t * kv_dim + (size_t)hkv * hd;
+            for (uint32_t d = 0; d < hd; d++) ah[d] += w * vt[d];
+        }
+    }
+
+    dense_matvec(m, l->attn_out, att, o, q_dim, n_embd, rb);
+    for (uint32_t i = 0; i < n_embd; i++) x[i] += o[i];   /* residual */
+
+    /* --- FFN (SwiGLU) --- */
+    const uint32_t n_ff = DS4_N_FF;
+    float *h2   = xcalloc(n_embd, sizeof(float));
+    float *gate = xcalloc(n_ff, sizeof(float));
+    float *up   = xcalloc(n_ff, sizeof(float));
+    float *down = xcalloc(n_embd, sizeof(float));
+    rms_norm_weight(h2, x, (const float *)tensor_data(m, l->ffn_norm), n_embd, eps);
+    dense_matvec(m, l->ffn_gate, h2, gate, n_embd, n_ff, rb);
+    dense_matvec(m, l->ffn_up,   h2, up,   n_embd, n_ff, rb);
+    for (uint32_t i = 0; i < n_ff; i++) gate[i] = dense_silu(gate[i]) * up[i];
+    dense_matvec(m, l->ffn_down, gate, down, n_ff, n_embd, rb);
+    for (uint32_t i = 0; i < n_embd; i++) x[i] += down[i];   /* residual */
+
+    free(h); free(q); free(k); free(v); free(att); free(o); free(rb); free(score);
+    free(h2); free(gate); free(up); free(down);
+}
+
+/* Full dense forward for one token at position `pos`; writes n_vocab logits. */
+DS4_MAYBE_UNUSED static void forward_token_dense_cpu(
+        float *logits, const ds4_model *m, const ds4_weights *w,
+        dense_kv_cache *cache, int token, uint32_t pos) {
+    const uint32_t n_embd = DS4_N_EMBD;
+    float *x  = xcalloc(n_embd, sizeof(float));
+    float *rb = xcalloc(n_embd, sizeof(float));
+
+    dense_dequant_row(m, w->token_embd, (uint64_t)token, x, n_embd);   /* embedding */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        dense_layer_forward_cpu(x, m, &w->layer[il], &cache->layer[il], pos);
+
+    if (logits) {
+        rms_norm_weight(x, x, (const float *)tensor_data(m, w->output_norm), n_embd, DS4_RMS_EPS);
+        dense_matvec(m, w->output, x, logits, n_embd, DS4_N_VOCAB, rb);
+    }
+    free(x); free(rb);
+}
+
 #ifndef DS4_NO_GPU
 static void forward_token_raw_swa_cpu(
         float             * logits,

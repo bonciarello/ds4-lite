@@ -57,9 +57,19 @@ Stato:
     `dense_expect_dims` (type-agnostic, valida solo dim via `tensor_expect_layout`),
     chiamata in `weights_bind_dense`. **Validato** su Qwen2: ~300 controlli dim
     (28 layer) passano → q_dim=3584, kv_dim=512 (GQA), n_ff=18944 combaciano.
-  - **Prossimi**: 3.4+ grafo forward dense su Metal (embedding → attn GQA → FFN
-    SwiGLU → output), validazione stato nascosto layer-per-layer vs llama.cpp.
-    Da qui serve il grafo Metal vero (non più validabile senza esecuzione).
+  - **3.4** 🟡 **CPU reference forward** scritto in `ds4.c`: `forward_token_dense_cpu`
+    (+ `dense_layer_forward_cpu`, `dense_matvec`, `dense_dequant_row`,
+    `dense_rope_neox` NEOX, `dense_kv_cache`). Transformer pre-norm standard:
+    embedding → GQA attn + NEOX RoPE → SwiGLU FFN → output. Dequant F32/F16/Q8_0
+    (K-quant NON decodificati di proposito: il GGUF Q4_K_M ha Q6_K → serve un GGUF
+    F16/Q8_0 per validare). **Compila pulito**, funzioni `DS4_MAYBE_UNUSED`.
+    ⚠️ NON ancora wired nella eval dispatch e NON runtime-validato: il path CPU
+    crasha il kernel macOS → validare su **Linux** (`make cpu`) vs llama.cpp.
+    Non eseguire il path CPU su macOS.
+  - **Prossimi**: 3.5/3.6 port Metal (attn GQA + FFN SwiGLU), 3.7 wiring eval
+    dispatch (cache densa nella session) + validazione greedy vs llama.cpp.
+  - Nota quant: ds4 supporta F32/F16/Q8_0/Q4_K/Q2_K/IQ2_XXS ma **NON Q6_K**
+    (assente dall'enum). RoPE DeepSeek è GPT-J (coppie i,i+1); densi usano NEOX.
   - Baseline Qwen2 (llama.cpp, M-series): pp512≈413 t/s, tg128≈44 t/s.
     Riferimento greedy + harness: `tests/bench_dense.sh`.
   - GGUF reale in `gguf/qwen2-7b-instruct-q4_k_m.gguf` (4.68 GB, non committare).
