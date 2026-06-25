@@ -137,9 +137,21 @@ typedef enum {
     DS4_VARIANT_PRO   = 1,
 } ds4_variant;
 
+/* Architecture family. Generalizes the engine beyond the original DeepSeek V4
+ * target so that dense small models (Llama/Qwen/Mistral) can coexist with the
+ * MoE+MLA DeepSeek path. DS4_ARCH_DEEPSEEK is value 0 so existing shapes that do
+ * not set .arch keep the original behavior. See docs/DENSE_SUPPORT_DESIGN.md. */
+typedef enum {
+    DS4_ARCH_DEEPSEEK = 0,   /* MLA + MoE + indexer + hash-compression */
+    DS4_ARCH_DENSE    = 1,   /* standard attention + dense SwiGLU FFN  */
+} ds4_arch_family;
+
 typedef struct {
     const char *name;
     ds4_variant variant;
+    ds4_arch_family arch;    /* architecture family (default DEEPSEEK == 0) */
+    const char *meta_ns;     /* GGUF metadata namespace: "deepseek4"|"llama"... */
+    uint32_t n_ff;           /* dense FFN size; 0 when the model is MoE */
     uint32_t n_layer;
     uint32_t n_embd;
     uint32_t n_vocab;
@@ -177,6 +189,8 @@ typedef struct {
 static const ds4_shape DS4_SHAPE_FLASH = {
     .name = "DeepSeek V4 Flash",
     .variant = DS4_VARIANT_FLASH,
+    .arch = DS4_ARCH_DEEPSEEK,
+    .meta_ns = "deepseek4",
     .n_layer = 43,
     .n_embd = 4096,
     .n_vocab = 129280,
@@ -214,6 +228,8 @@ static const ds4_shape DS4_SHAPE_FLASH = {
 static const ds4_shape DS4_SHAPE_PRO = {
     .name = "DeepSeek V4 Pro",
     .variant = DS4_VARIANT_PRO,
+    .arch = DS4_ARCH_DEEPSEEK,
+    .meta_ns = "deepseek4",
     .n_layer = 61,
     .n_embd = 7168,
     .n_vocab = 129280,
@@ -251,6 +267,8 @@ static const ds4_shape DS4_SHAPE_PRO = {
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .variant = DS4_VARIANT_FLASH,
+    .arch = DS4_ARCH_DEEPSEEK,
+    .meta_ns = "deepseek4",
     .n_layer = 43,
     .n_embd = 4096,
     .n_vocab = 129280,
@@ -321,6 +339,9 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_ROPE_YARN_BETA_SLOW       (g_ds4_shape.rope_yarn_beta_slow)
 #define DS4_COMPRESS_ROPE_FREQ_BASE   (g_ds4_shape.compress_rope_freq_base)
 #define DS4_ROPE_ORIG_CTX             (g_ds4_shape.rope_orig_ctx)
+#define DS4_ARCH                      (g_ds4_shape.arch)
+#define DS4_META_NS                   (g_ds4_shape.meta_ns)
+#define DS4_N_FF                      (g_ds4_shape.n_ff)
 
 static int g_ds4_lock_fd = -1;
 
@@ -329,6 +350,17 @@ static int g_ds4_lock_fd = -1;
 #else
 #define DS4_MAYBE_UNUSED
 #endif
+
+/* Capability helpers. Code should branch on what the loaded model HAS rather than
+ * on its variant/arch tag, so adding a new family does not require touching every
+ * call site. For DeepSeek (Flash/PRO) all four return true; for a dense model they
+ * return false. See docs/DENSE_SUPPORT_DESIGN.md section 3.1. Marked maybe-unused
+ * because call sites are introduced incrementally (Fase 2+). */
+DS4_MAYBE_UNUSED static inline bool ds4_arch_is_deepseek(void) { return DS4_ARCH == DS4_ARCH_DEEPSEEK; }
+DS4_MAYBE_UNUSED static inline bool ds4_has_moe(void)     { return DS4_N_EXPERT != 0; }
+DS4_MAYBE_UNUSED static inline bool ds4_has_mla(void)     { return DS4_N_LORA_Q != 0; }
+DS4_MAYBE_UNUSED static inline bool ds4_has_indexer(void) { return DS4_N_INDEXER_HEAD != 0; }
+DS4_MAYBE_UNUSED static inline bool ds4_has_hc(void)      { return DS4_N_HC != 0; }
 
 /* =========================================================================
  * GGUF Quant Block Formats.
@@ -3049,6 +3081,19 @@ typedef struct {
     ds4_tensor *ffn_gate_shexp;
     ds4_tensor *ffn_up_shexp;
     ds4_tensor *ffn_down_shexp;
+    /* Dense (non-DeepSeek) path. Standard GQA attention + SwiGLU FFN; reuses
+     * attn_norm and ffn_norm above. Biases are optional (Qwen2 has QKV bias,
+     * Llama does not). Unused on the DeepSeek path. */
+    ds4_tensor *attn_q;
+    ds4_tensor *attn_q_bias;
+    ds4_tensor *attn_k;
+    ds4_tensor *attn_k_bias;
+    ds4_tensor *attn_v;
+    ds4_tensor *attn_v_bias;
+    ds4_tensor *attn_out;
+    ds4_tensor *ffn_gate;
+    ds4_tensor *ffn_up;
+    ds4_tensor *ffn_down;
 } ds4_layer_weights;
 
 typedef struct {
@@ -3883,9 +3928,145 @@ static void config_validate_fixed_shape(uint32_t n_layer) {
     config_expect_u32("block_count",                  n_layer,                 DS4_N_LAYER);
 }
 
+/* ---- Dense model loading (Fase 2) -----------------------------------------
+ *
+ * DeepSeek V4 (Flash/PRO) has a fixed, known shape validated against a constant.
+ * Dense models (Llama/Qwen/Mistral) vary in size, so the shape is BUILT from the
+ * GGUF metadata instead of matched. The architecture is taken from
+ * general.architecture, which also names the metadata key namespace
+ * (e.g. "qwen2.block_count"). MoE/MLA/indexer/hash-compression are all left at 0,
+ * which the capability helpers (ds4_has_moe() etc.) read as "disabled".
+ * See docs/DENSE_SUPPORT_DESIGN.md. */
+
+static bool ds4_str_eq_cstr(ds4_str a, const char *s) {
+    const size_t n = strlen(s);
+    return a.len == (uint64_t)n && memcmp(a.ptr, s, n) == 0;
+}
+
+/* GGUF general.architecture values that map to the dense execution path. The
+ * string doubles as the metadata key namespace. */
+static const char *const DS4_DENSE_ARCHS[] = { "qwen2", "qwen3", "llama", "mistral" };
+
+static bool ds4_dense_arch_supported(ds4_str arch, const char **ns_out) {
+    for (size_t i = 0; i < sizeof(DS4_DENSE_ARCHS) / sizeof(DS4_DENSE_ARCHS[0]); i++) {
+        if (ds4_str_eq_cstr(arch, DS4_DENSE_ARCHS[i])) {
+            if (ns_out) *ns_out = DS4_DENSE_ARCHS[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Namespaced metadata accessors: build "<ns>.<suffix>" and delegate. */
+static void ds4_ns_key(char *buf, size_t buflen, const char *ns, const char *suffix) {
+    snprintf(buf, buflen, "%s.%s", ns, suffix);
+}
+static uint32_t required_u32_ns(const ds4_model *m, const char *ns, const char *suffix) {
+    char key[128];
+    ds4_ns_key(key, sizeof(key), ns, suffix);
+    return required_u32(m, key);
+}
+static bool model_get_u32_ns(const ds4_model *m, const char *ns, const char *suffix, uint32_t *out) {
+    char key[128];
+    ds4_ns_key(key, sizeof(key), ns, suffix);
+    return model_get_u32(m, key, out);
+}
+static bool model_get_f32_ns(const ds4_model *m, const char *ns, const char *suffix, float *out) {
+    char key[128];
+    ds4_ns_key(key, sizeof(key), ns, suffix);
+    return model_get_f32_compat(m, key, out);
+}
+static bool model_get_u64_ns(const ds4_model *m, const char *ns, const char *suffix, uint64_t *out) {
+    char key[128];
+    ds4_ns_key(key, sizeof(key), ns, suffix);
+    return model_get_u64_compat(m, key, out);
+}
+
+/* Build g_ds4_shape for a dense model from GGUF metadata. Required keys abort via
+ * required_u32_ns() if missing; optional keys fall back to standard dense defaults. */
+static void config_build_dense_shape(const ds4_model *m, const char *ns) {
+    ds4_shape s;
+    memset(&s, 0, sizeof(s));
+    s.arch    = DS4_ARCH_DENSE;
+    s.variant = DS4_VARIANT_FLASH;   /* unused on the dense path; keep defined */
+    s.meta_ns = ns;
+    s.name    = ns;
+
+    /* Required core dimensions. */
+    s.n_layer   = required_u32_ns(m, ns, "block_count");
+    s.n_embd    = required_u32_ns(m, ns, "embedding_length");
+    s.n_head    = required_u32_ns(m, ns, "attention.head_count");
+    s.n_head_kv = required_u32_ns(m, ns, "attention.head_count_kv");
+    s.n_ff      = required_u32_ns(m, ns, "feed_forward_length");
+
+    /* head_dim is optional in GGUF; default to n_embd/n_head when absent. */
+    uint32_t head_dim = 0;
+    if (!model_get_u32_ns(m, ns, "attention.key_length", &head_dim) || head_dim == 0)
+        head_dim = (s.n_head ? s.n_embd / s.n_head : 0);
+    s.n_head_dim = head_dim;
+
+    uint32_t value_dim = 0;
+    if (!model_get_u32_ns(m, ns, "attention.value_length", &value_dim) || value_dim == 0)
+        value_dim = head_dim;
+    s.n_value_dim = value_dim;
+
+    /* RoPE rotary width defaults to the full head dimension for dense models. */
+    uint32_t n_rot = 0;
+    if (!model_get_u32_ns(m, ns, "rope.dimension_count", &n_rot) || n_rot == 0)
+        n_rot = head_dim;
+    s.n_rot = n_rot;
+
+    /* Vocab: prefer explicit metadata, else the tokenizer token count. */
+    uint32_t n_vocab = 0;
+    if (!model_get_u32_ns(m, ns, "vocab_size", &n_vocab) || n_vocab == 0) {
+        ds4_array_ref tokens;
+        if (model_get_array(m, "tokenizer.ggml.tokens", &tokens))
+            n_vocab = (uint32_t)tokens.len;
+    }
+    s.n_vocab = n_vocab;
+
+    /* Training context length for RoPE original-context scaling. */
+    uint64_t ctx_train = 0;
+    if (!model_get_u64_ns(m, ns, "context_length", &ctx_train) || ctx_train == 0)
+        ctx_train = DS4_DEFAULT_ROPE_ORIG_CTX;
+    s.rope_orig_ctx = ctx_train;
+
+    /* RMSNorm epsilon and RoPE base, with standard dense defaults. */
+    float rms_eps = 0.0f;
+    if (!model_get_f32_ns(m, ns, "attention.layer_norm_rms_epsilon", &rms_eps) || rms_eps == 0.0f)
+        rms_eps = 1e-6f;
+    s.rms_eps = rms_eps;
+
+    float rope_base = 0.0f;
+    if (!model_get_f32_ns(m, ns, "rope.freq_base", &rope_base) || rope_base == 0.0f)
+        rope_base = 10000.0f;
+    s.rope_freq_base    = rope_base;
+    s.rope_scale_factor = 1.0f;
+
+    /* Everything DeepSeek-specific stays at 0 (disabled) via memset:
+     * n_expert*, n_lora_*, n_indexer_*, n_hc*, n_hash_layer, n_swa, n_out_group,
+     * swiglu_clamp_exp, hc_eps, compress_rope_freq_base, yarn betas. */
+
+    g_ds4_shape = s;
+}
+
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
 static void config_validate_model(const ds4_model *m) {
+    /* Architecture dispatch: dense models are built from metadata; DeepSeek keeps
+     * the original fixed-shape validation below. */
+    ds4_str arch = {0};
+    model_get_string(m, "general.architecture", &arch);
+    const char *dense_ns = NULL;
+    if (ds4_dense_arch_supported(arch, &dense_ns)) {
+        /* Build the dense shape from metadata and return. Weight binding (Fase 3.2)
+         * runs next; the dense execution graph (Fase 3.4+) is guarded at engine
+         * open. config_validate_model does NOT validate dense tensor layout here —
+         * that is the dense binding's job. */
+        config_build_dense_shape(m, dense_ns);
+        return;
+    }
+
     const uint32_t n_layer = required_u32(m, "deepseek4.block_count");
     const uint32_t n_embd = required_u32(m, "deepseek4.embedding_length");
     const uint32_t n_vocab = required_u32(m, "deepseek4.vocab_size");
@@ -4065,6 +4246,102 @@ static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_
     }
 }
 
+/* ---- Dense layout validation (Fase 3.3) -----------------------------------
+ * Checks that each bound dense tensor has the dimensions implied by the shape.
+ * Type-agnostic (the dense quant mix varies: q4_k/q6_k/f32), so we validate dims
+ * only by passing the tensor's own type through tensor_expect_layout. GGUF dim[0]
+ * is the contraction/input dimension. */
+static void dense_expect_dims(const ds4_tensor *t, uint32_t ndim, uint64_t d0, uint64_t d1) {
+    if (!t) ds4_die("internal error: missing dense tensor while validating layout");
+    tensor_expect_layout(t, t->type, ndim, d0, d1, 0);
+}
+static void dense_expect_dims_opt(const ds4_tensor *t, uint32_t ndim, uint64_t d0, uint64_t d1) {
+    if (t) dense_expect_dims(t, ndim, d0, d1);
+}
+
+static void weights_validate_layout_dense(const ds4_weights *w, uint32_t start,
+                                          uint32_t end, bool require_token_embd,
+                                          bool require_output) {
+    const uint64_t n_embd  = DS4_N_EMBD;
+    const uint64_t n_vocab = DS4_N_VOCAB;
+    const uint64_t n_ff    = DS4_N_FF;
+    const uint64_t q_dim   = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim  = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+
+    if (require_token_embd) dense_expect_dims(w->token_embd, 2, n_embd, n_vocab);
+    if (require_output && w->output && w->output != w->token_embd)
+        dense_expect_dims(w->output, 2, n_embd, n_vocab);
+    if (w->output_norm) dense_expect_dims(w->output_norm, 1, n_embd, 0);
+
+    for (uint32_t il = start; il <= end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        dense_expect_dims(l->attn_norm, 1, n_embd, 0);
+        dense_expect_dims(l->attn_q,    2, n_embd, q_dim);
+        dense_expect_dims(l->attn_k,    2, n_embd, kv_dim);
+        dense_expect_dims(l->attn_v,    2, n_embd, kv_dim);
+        dense_expect_dims(l->attn_out,  2, q_dim,  n_embd);
+        dense_expect_dims_opt(l->attn_q_bias, 1, q_dim,  0);
+        dense_expect_dims_opt(l->attn_k_bias, 1, kv_dim, 0);
+        dense_expect_dims_opt(l->attn_v_bias, 1, kv_dim, 0);
+        dense_expect_dims(l->ffn_norm, 1, n_embd, 0);
+        dense_expect_dims(l->ffn_gate, 2, n_embd, n_ff);
+        dense_expect_dims(l->ffn_up,   2, n_embd, n_ff);
+        dense_expect_dims(l->ffn_down, 2, n_ff,   n_embd);
+    }
+}
+
+/* ---- Dense weight binding (Fase 3.2) --------------------------------------
+ * Dense models (Qwen2/Llama/...) use standard GGUF tensor names: token_embd,
+ * output_norm, output, and per-layer attn_{norm,q,k,v,output} + ffn_{norm,gate,
+ * up,down}. No MLA/MoE/indexer tensors. */
+static void weights_bind_output_dense(ds4_weights *w, const ds4_model *m,
+                                      bool require_token_embd, bool require_output) {
+    w->token_embd = require_token_embd ? required_tensor(m, "token_embd.weight")
+                                       : model_find_tensor(m, "token_embd.weight");
+    w->output_norm = required_tensor(m, "output_norm.weight");
+    /* Some dense models tie embeddings: no separate output.weight, reuse embd. */
+    w->output = model_find_tensor(m, "output.weight");
+    if (!w->output && require_output) w->output = w->token_embd;
+}
+
+static void weights_bind_layer_dense(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm   = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->attn_q      = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->attn_k      = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->attn_v      = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->attn_out    = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    /* QKV biases: present in Qwen2, absent in Llama -> optional. */
+    l->attn_q_bias = tensor_by_namef(m, "blk.%u.attn_q.bias", il);
+    l->attn_k_bias = tensor_by_namef(m, "blk.%u.attn_k.bias", il);
+    l->attn_v_bias = tensor_by_namef(m, "blk.%u.attn_v.bias", il);
+    l->ffn_norm    = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+    l->ffn_gate    = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+    l->ffn_up      = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+    l->ffn_down    = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+}
+
+static void weights_bind_dense(ds4_weights *w, const ds4_model *m, bool load_slice,
+                               uint32_t load_layer_start, uint32_t load_layer_end,
+                               bool require_output) {
+    memset(w, 0, sizeof(*w));
+    uint32_t start = 0, end = DS4_N_LAYER - 1u;
+    bool require_token_embd = true;
+    if (load_slice) {
+        if (load_layer_start >= DS4_N_LAYER) ds4_die("invalid model load layer slice");
+        start = load_layer_start;
+        end = load_layer_end == UINT32_MAX ? DS4_N_LAYER - 1u : load_layer_end;
+        if (end >= DS4_N_LAYER || end < start) ds4_die("invalid model load layer slice");
+        require_token_embd = start == 0;
+    } else {
+        require_output = true;
+    }
+    weights_bind_output_dense(w, m, require_token_embd, require_output);
+    for (uint32_t il = start; il <= end; il++)
+        weights_bind_layer_dense(&w->layer[il], m, il);
+
+    weights_validate_layout_dense(w, start, end, require_token_embd, require_output);
+}
+
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
  * where stringly GGUF metadata becomes direct model-specific pointers. */
 static void weights_bind(
@@ -4075,6 +4352,11 @@ static void weights_bind(
         uint32_t         load_layer_end,
         bool             require_output,
         bool             optional_output) {
+    if (!ds4_arch_is_deepseek()) {
+        weights_bind_dense(w, m, load_slice, load_layer_start, load_layer_end,
+                           require_output);
+        return;
+    }
     memset(w, 0, sizeof(*w));
 
     uint32_t start = 0;
@@ -11572,8 +11854,7 @@ static uint32_t metal_graph_stream_prefill_batch_selected_addr_auto_max(void) {
         }
     }
 #ifdef DS4_ROCM_BUILD
-    if (DS4_MODEL_VARIANT == DS4_VARIANT_PRO ||
-        DS4_MODEL_VARIANT == DS4_VARIANT_FLASH) return UINT32_MAX;
+    if (ds4_arch_is_deepseek()) return UINT32_MAX;
 #endif
     if (DS4_MODEL_VARIANT == DS4_VARIANT_PRO) return 800u;
     if (DS4_MODEL_VARIANT == DS4_VARIANT_FLASH) return 760u;
@@ -11591,8 +11872,7 @@ static uint32_t metal_graph_stream_prefill_batch_selected_addr_auto_min(void) {
             return (uint32_t)v;
         }
     }
-    if (DS4_MODEL_VARIANT == DS4_VARIANT_PRO ||
-        DS4_MODEL_VARIANT == DS4_VARIANT_FLASH) return 2u;
+    if (ds4_arch_is_deepseek()) return 2u;
     return 0;
 }
 
@@ -19529,8 +19809,7 @@ static uint32_t metal_graph_streaming_decode_prefill_max_tokens(
         }
     }
 
-    if (DS4_MODEL_VARIANT != DS4_VARIANT_PRO &&
-        DS4_MODEL_VARIANT != DS4_VARIANT_FLASH) {
+    if (!ds4_arch_is_deepseek()) {
         return 0u;
     }
     return metal_graph_streaming_decode_prefill_wide_default(weights) ? 64u : 18u;
@@ -21791,6 +22070,14 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
     return true;
 }
 
+/* Pre-tokenizer family. The core byte-level BPE is shared; only the regex-style
+ * piece splitting differs. JOYAI is DeepSeek V4's; QWEN2 is the GPT-2/Qwen2 split
+ * used by dense models. Selected from tokenizer.ggml.pre at load. */
+typedef enum {
+    DS4_PRETOK_JOYAI = 0,   /* DeepSeek V4 ("joyai-llm") */
+    DS4_PRETOK_QWEN2 = 1,   /* Qwen2/GPT-2 byte-level split */
+} ds4_pretok;
+
 struct ds4_vocab {
     ds4_str *token;
     int n_vocab;
@@ -21801,6 +22088,7 @@ struct ds4_vocab {
     int think_start_id;
     int think_end_id;
     int dsml_id;
+    ds4_pretok pre_type;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
 };
@@ -22148,9 +22436,112 @@ static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
  * word (for example ">;\n").  Splitting those newlines separately changes the
  * token stream for code prompts and produces wrong long-context logits.
  */
+/* Qwen2 / GPT-2 byte-level pre-tokenization. Mirrors llama.cpp's QWEN2 split:
+ *
+ *   (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])  contractions
+ *   | [^\r\n\p{L}\p{N}]?\p{L}+        optional lead char + letters
+ *   | \p{N}                          one number character at a time
+ *   |  ?[^\s\p{L}\p{N}]+[\r\n]*       optional space + symbols + trailing newlines
+ *   | \s*[\r\n]+                      whitespace ending in newlines
+ *   | \s+(?!\S)                       trailing whitespace (leaves one for next word)
+ *   | \s+                             whitespace
+ *
+ * \p{L} is approximated as ASCII letters plus any non-ASCII non-control byte
+ * (same pragmatic level as the JoyAI path); \p{N} as ASCII digits. Good for the
+ * ASCII/accented text and code prompts we target; exotic Unicode classes may
+ * differ. Validated against `llama-tokenize` on the Qwen2 GGUF. */
+static void qwen2_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    const uint64_t len = strlen(text);
+    uint64_t pos = 0;
+
+    while (pos < len) {
+        const uint64_t start = pos;
+        const uint8_t c = (uint8_t)text[pos];
+
+        /* 1. Contractions after an apostrophe (case-insensitive). */
+        if (c == '\'' && pos + 1 < len) {
+            const uint8_t a = (uint8_t)text[pos + 1] | 0x20;
+            const uint8_t b = (pos + 2 < len) ? ((uint8_t)text[pos + 2] | 0x20) : 0;
+            if (a == 's' || a == 't' || a == 'm' || a == 'd') {
+                pos += 2;
+            } else if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') ||
+                       (a == 'l' && b == 'l')) {
+                pos += 3;
+            }
+        }
+
+        /* 2. [^\r\n\p{L}\p{N}]? \p{L}+ : optional single lead, then letters. */
+        if (pos == start) {
+            uint64_t p = pos;
+            if (!ascii_newline(c) && !ascii_digit(c) && !joyai_letter_like_at(text, len, p)) {
+                const uint64_t after = next_utf8_char(text, len, p);
+                if (after < len && joyai_letter_like_at(text, len, after)) p = after;
+            }
+            if (joyai_letter_like_at(text, len, p)) {
+                while (p < len && joyai_letter_like_at(text, len, p))
+                    p = next_utf8_char(text, len, p);
+                pos = p;
+            }
+        }
+
+        /* 3. \p{N} : a single number character. */
+        if (pos == start && ascii_digit(c)) {
+            pos = next_utf8_char(text, len, pos);
+        }
+
+        /* 4.  ?[^\s\p{L}\p{N}]+[\r\n]* : optional space, symbols, trailing newlines. */
+        if (pos == start) {
+            uint64_t p = pos;
+            if (c == ' ') {
+                const uint64_t after = p + 1;
+                if (after < len && !ascii_space((uint8_t)text[after]) &&
+                    !ascii_digit((uint8_t)text[after]) &&
+                    !joyai_letter_like_at(text, len, after)) {
+                    p = after;
+                }
+            }
+            if (p < len && !ascii_space((uint8_t)text[p]) &&
+                !ascii_digit((uint8_t)text[p]) && !joyai_letter_like_at(text, len, p)) {
+                while (p < len && !ascii_space((uint8_t)text[p]) &&
+                       !ascii_digit((uint8_t)text[p]) &&
+                       !joyai_letter_like_at(text, len, p)) {
+                    p = next_utf8_char(text, len, p);
+                }
+                while (p < len && ascii_newline((uint8_t)text[p])) p++;
+                pos = p;
+            }
+        }
+
+        /* 5/6/7. Whitespace: a run ending in newlines is kept together; otherwise
+         * a trailing single space is left to lead the next word (rule 6 (?!\S)). */
+        if (pos == start && ascii_space(c)) {
+            uint64_t p = pos;
+            uint64_t last_nl_end = 0;
+            while (p < len && ascii_space((uint8_t)text[p])) {
+                if (ascii_newline((uint8_t)text[p])) last_nl_end = p + 1;
+                p++;
+            }
+            if (last_nl_end) {
+                pos = last_nl_end;
+            } else if (p < len && p > pos + 1) {
+                pos = p - 1;
+            } else {
+                pos = p;
+            }
+        }
+
+        if (pos == start) pos = next_utf8_char(text, len, pos);
+        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+    }
+}
+
 /* JoyAI/DeepSeek pre-tokenization.  The split shape matters: different pieces
  * lead to different BPE merges even when the final text bytes are identical. */
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    if (vocab->pre_type == DS4_PRETOK_QWEN2) {
+        qwen2_tokenize_text(vocab, text, out);
+        return;
+    }
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
@@ -22229,6 +22620,15 @@ static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
     return token;
 }
 
+/* Like vocab_lookup but returns -1 instead of aborting when the token is absent.
+ * Used for special tokens that exist only in some vocab families (e.g. DeepSeek's
+ * chat markers are not present in Qwen2). */
+static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
+    int token = -1;
+    if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) return -1;
+    return token;
+}
+
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
@@ -22263,13 +22663,36 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
-    vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
-    vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
-    vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
-    vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
-    vocab->think_start_id = vocab_lookup(vocab, "<think>");
-    vocab->think_end_id = vocab_lookup(vocab, "</think>");
-    vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
+    /* Pre-tokenizer family from GGUF. Dense models (Qwen2) declare "qwen2";
+     * DeepSeek V4 declares "joyai-llm". Default to JOYAI for back-compat. */
+    ds4_str pre = {0};
+    vocab->pre_type = DS4_PRETOK_JOYAI;
+    if (model_get_string(model, "tokenizer.ggml.pre", &pre) &&
+        ds4_str_eq_cstr(pre, "qwen2")) {
+        vocab->pre_type = DS4_PRETOK_QWEN2;
+    }
+
+    if (vocab->pre_type == DS4_PRETOK_JOYAI) {
+        /* DeepSeek V4: these chat markers are mandatory. */
+        vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
+        vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
+        vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
+        vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
+        vocab->think_start_id = vocab_lookup(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup(vocab, "</think>");
+        vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
+    } else {
+        /* Qwen2 (and other dense families): take bos/eos from metadata ids; the
+         * DeepSeek-specific markers do not exist, so leave them at -1. */
+        uint32_t bos = 0, eos = 0;
+        vocab->bos_id = model_get_u32(model, "tokenizer.ggml.bos_token_id", &bos) ? (int)bos : -1;
+        vocab->eos_id = model_get_u32(model, "tokenizer.ggml.eos_token_id", &eos) ? (int)eos : -1;
+        vocab->user_id        = vocab_lookup_optional(vocab, "<|im_start|>");
+        vocab->assistant_id   = vocab_lookup_optional(vocab, "<|im_end|>");
+        vocab->think_start_id = -1;
+        vocab->think_end_id   = -1;
+        vocab->dsml_id        = -1;
+    }
 }
 
 static void vocab_free(ds4_vocab *vocab) {
@@ -25673,6 +26096,20 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->inspect_only) {
         *out = e;
         return 0;
+    }
+    /* Dense models: shape, tokenizer and weights are bound (Fase 3.1/3.2), but the
+     * dense execution graph (Fase 3.4+) is not implemented yet. Stop here with an
+     * honest message rather than entering the DeepSeek-only graph path. --inspect
+     * above still works and exercises dense weight binding. */
+    if (!ds4_arch_is_deepseek()) {
+        fprintf(stderr,
+                "ds4: dense model '%s' loaded: shape + tokenizer + %u layers of "
+                "weights bound OK. The dense execution graph is not yet implemented "
+                "(Fase 3.4+, vedi docs/DENSE_SUPPORT_DESIGN.md).\n",
+                DS4_MODEL_SHAPE_NAME, DS4_N_LAYER);
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
     }
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
