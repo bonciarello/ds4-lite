@@ -3695,80 +3695,142 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_plain_mv_dispatch(
     };
 }
 
-/* ---- Dense matvec GPU smoke test (Fase 3.5, first validatable step) --------
- * Runs kernel_mul_mv_f32_f32 on a small known input and checks the GPU result
- * against a CPU dot product. Validates the dense matvec dispatch path end to end
- * (buffers, args, pipeline lookup, encode, readback) on-device, independent of
- * any model. Returns 0 on PASS, nonzero on failure (message in err). */
+/* ---- Dense matvec GPU smoke test (Fase 3.5, first validatable steps) --------
+ * Runs the dense matvec GPU kernels (F32 and Q8_0) on a small known input and
+ * checks the GPU result against a CPU reference. Validates the dense matvec
+ * dispatch path end to end (buffers, args, pipeline lookup, encode, readback)
+ * on-device, independent of any model. Returns 0 on PASS. */
+
+/* Encode + run one matvec; reads out_dim floats into `out`. Returns false on
+ * any GPU failure. */
+static bool ds4_gpu_matvec_run_once(id<MTLComputePipelineState> pipe,
+                                    const void *args, size_t args_len,
+                                    ds4_gpu_tensor *wbuf, ds4_gpu_tensor *xbuf,
+                                    ds4_gpu_tensor *obuf, uint32_t out_dim,
+                                    int nr0, int nsg, NSUInteger smem,
+                                    float *out, const char *label) {
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return false;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipe];
+    [enc setBytes:args length:args_len atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(wbuf) offset:ds4_gpu_tensor_offset(wbuf) atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(xbuf) offset:ds4_gpu_tensor_offset(xbuf) atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(obuf) offset:ds4_gpu_tensor_offset(obuf) atIndex:3];
+    if (smem) [enc setThreadgroupMemoryLength:smem atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((out_dim + (uint32_t)nr0 - 1u) / (uint32_t)nr0, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    if (!ds4_gpu_finish_command_buffer(cb, owned, label)) return false;
+    ds4_gpu_tensor_read(obuf, 0, out, (uint64_t)out_dim * sizeof(float));
+    return true;
+}
+
+/* Quantize one row of n f32 values into Q8_0 blocks (34 bytes: f16 scale + 32 int8). */
+static void ds4_q8_0_quantize_row(const float *src, uint8_t *dst, uint32_t n) {
+    const uint32_t nb = n / 32u;
+    for (uint32_t b = 0; b < nb; b++) {
+        const float *v = src + (size_t)b * 32u;
+        float amax = 0.0f;
+        for (int i = 0; i < 32; i++) { const float a = fabsf(v[i]); if (a > amax) amax = a; }
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        uint8_t *blk = dst + (size_t)b * 34u;
+        __fp16 dh = (__fp16)d;
+        memcpy(blk, &dh, 2);
+        int8_t *qs = (int8_t *)(blk + 2);
+        for (int i = 0; i < 32; i++) {
+            int q = (int)lroundf(v[i] * id);
+            if (q > 127) q = 127; else if (q < -127) q = -127;
+            qs[i] = (int8_t)q;
+        }
+    }
+}
+
 int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
     if (!g_initialized && !ds4_gpu_init()) {
         if (errlen) snprintf(err, errlen, "Metal init failed (no GPU device?)");
         return 1;
     }
-    const uint32_t in_dim = 256, out_dim = 8;   /* in_dim multiple of 128 and 4 */
-    float *W   = malloc((size_t)out_dim * in_dim * sizeof(float));
-    float *x   = malloc((size_t)in_dim * sizeof(float));
-    float *got = malloc((size_t)out_dim * sizeof(float));
-    float *ref = malloc((size_t)out_dim * sizeof(float));
+    const uint32_t in_dim = 256, out_dim = 8;   /* multiple of 128 and 32 */
+    const uint32_t nblk = in_dim / 32u;
+    float   *W   = malloc((size_t)out_dim * in_dim * sizeof(float));
+    float   *x   = malloc((size_t)in_dim * sizeof(float));
+    float   *got = malloc((size_t)out_dim * sizeof(float));
+    float   *ref = malloc((size_t)out_dim * sizeof(float));
+    uint8_t *Wq8 = malloc((size_t)out_dim * nblk * 34u);   /* Q8_0 weight */
+    float   *refq8 = malloc((size_t)out_dim * sizeof(float));
     int rc = 1;
-    if (!W || !x || !got || !ref) { if (errlen) snprintf(err, errlen, "oom"); goto done; }
+    if (!W || !x || !got || !ref || !Wq8 || !refq8) { if (errlen) snprintf(err, errlen, "oom"); goto done; }
 
     for (uint32_t i = 0; i < in_dim; i++) x[i] = 0.01f * (float)(i + 1);
     for (uint32_t r = 0; r < out_dim; r++)
         for (uint32_t i = 0; i < in_dim; i++)
             W[(size_t)r * in_dim + i] = 0.001f * (float)(((r + 1) * (i + 1)) % 17);
+
+    /* F32 reference (exact) and Q8_0 reference (CPU dequant of the same blocks). */
     for (uint32_t r = 0; r < out_dim; r++) {
         double acc = 0.0;
         for (uint32_t i = 0; i < in_dim; i++) acc += (double)W[(size_t)r*in_dim+i] * x[i];
         ref[r] = (float)acc;
+        ds4_q8_0_quantize_row(W + (size_t)r*in_dim, Wq8 + (size_t)r*nblk*34u, in_dim);
+        double accq = 0.0;
+        const uint8_t *rowq = Wq8 + (size_t)r*nblk*34u;
+        for (uint32_t b = 0; b < nblk; b++) {
+            __fp16 dh; memcpy(&dh, rowq + (size_t)b*34u, 2);
+            const float d = (float)dh;
+            const int8_t *qs = (const int8_t *)(rowq + (size_t)b*34u + 2);
+            for (int i = 0; i < 32; i++) accq += (double)(d * (float)qs[i]) * x[(size_t)b*32 + i];
+        }
+        refq8[r] = (float)accq;
     }
 
-    ds4_gpu_tensor *wbuf = ds4_gpu_tensor_alloc((uint64_t)out_dim * in_dim * sizeof(float));
+    ds4_gpu_tensor *wf32 = ds4_gpu_tensor_alloc((uint64_t)out_dim * in_dim * sizeof(float));
+    ds4_gpu_tensor *wq8  = ds4_gpu_tensor_alloc((uint64_t)out_dim * nblk * 34u);
     ds4_gpu_tensor *xbuf = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
     ds4_gpu_tensor *obuf = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
-    if (wbuf && xbuf && obuf) {
-        ds4_gpu_tensor_write(wbuf, 0, W, (uint64_t)out_dim * in_dim * sizeof(float));
-        ds4_gpu_tensor_write(xbuf, 0, x, (uint64_t)in_dim * sizeof(float));
+    if (!wf32 || !wq8 || !xbuf || !obuf) { if (errlen) snprintf(err, errlen, "GPU buffer alloc failed"); goto free_gpu; }
+    ds4_gpu_tensor_write(wf32, 0, W,   (uint64_t)out_dim * in_dim * sizeof(float));
+    ds4_gpu_tensor_write(wq8,  0, Wq8, (uint64_t)out_dim * nblk * 34u);
+    ds4_gpu_tensor_write(xbuf, 0, x,   (uint64_t)in_dim * sizeof(float));
 
-        ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, 1);
-        ds4_gpu_mv_dispatch disp = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
-        args.nr0 = disp.nr0;
-        id<MTLComputePipelineState> pipe =
-            ds4_gpu_get_mul_mv_pipeline(disp.function_name, disp.nsg);
-        if (!pipe) {
-            if (errlen) snprintf(err, errlen, "pipeline %s not found", disp.function_name);
-        } else {
-            int owned = 0;
-            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
-            if (cb) {
-                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-                [enc setComputePipelineState:pipe];
-                [enc setBytes:&args length:sizeof(args) atIndex:0];
-                [enc setBuffer:ds4_gpu_tensor_buffer(wbuf) offset:ds4_gpu_tensor_offset(wbuf) atIndex:1];
-                [enc setBuffer:ds4_gpu_tensor_buffer(xbuf) offset:ds4_gpu_tensor_offset(xbuf) atIndex:2];
-                [enc setBuffer:ds4_gpu_tensor_buffer(obuf) offset:ds4_gpu_tensor_offset(obuf) atIndex:3];
-                if (disp.smem) [enc setThreadgroupMemoryLength:disp.smem atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake((out_dim + (uint32_t)disp.nr0 - 1u) / (uint32_t)disp.nr0, 1, 1)
-                     threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)disp.nsg, 1)];
-                ds4_gpu_end_compute_encoder(cb, enc);
-                if (ds4_gpu_finish_command_buffer(cb, owned, "dense matvec selftest")) {
-                    ds4_gpu_tensor_read(obuf, 0, got, (uint64_t)out_dim * sizeof(float));
-                    float maxerr = 0.0f;
-                    for (uint32_t r = 0; r < out_dim; r++) {
-                        const float e = fabsf(got[r] - ref[r]);
-                        if (e > maxerr) maxerr = e;
-                    }
-                    if (maxerr < 1e-4f) rc = 0;
-                    else if (errlen) snprintf(err, errlen, "max abs error %.6g exceeds 1e-4", (double)maxerr);
-                } else if (errlen) snprintf(err, errlen, "command buffer execution failed");
-            } else if (errlen) snprintf(err, errlen, "could not get command buffer");
-        }
-    } else if (errlen) snprintf(err, errlen, "GPU buffer allocation failed");
-    ds4_gpu_tensor_free(wbuf);
+    /* --- Case 1: F32 matvec --- */
+    {
+        ds4_gpu_q8_0_matvec_args a = ds4_gpu_make_f32_mv_args(in_dim, out_dim, 1);
+        ds4_gpu_mv_dispatch d = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
+        a.nr0 = d.nr0;
+        id<MTLComputePipelineState> p = ds4_gpu_get_mul_mv_pipeline(d.function_name, d.nsg);
+        if (!p) { if (errlen) snprintf(err, errlen, "pipeline %s missing", d.function_name); goto free_gpu; }
+        if (!ds4_gpu_matvec_run_once(p, &a, sizeof(a), wf32, xbuf, obuf, out_dim, d.nr0, d.nsg, d.smem, got, "selftest f32"))
+            { if (errlen) snprintf(err, errlen, "f32 GPU run failed"); goto free_gpu; }
+        float maxerr = 0.0f;
+        for (uint32_t r = 0; r < out_dim; r++) { const float e = fabsf(got[r]-ref[r]); if (e>maxerr) maxerr=e; }
+        if (maxerr >= 1e-4f) { if (errlen) snprintf(err, errlen, "f32 max err %.6g >= 1e-4", (double)maxerr); goto free_gpu; }
+    }
+
+    /* --- Case 2: Q8_0 matvec (vs CPU Q8_0 dequant) --- */
+    {
+        ds4_gpu_q8_0_matvec_args a = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+        ds4_gpu_mv_dispatch d = ds4_gpu_make_q8_0_mv_dispatch();
+        a.nr0 = d.nr0;
+        id<MTLComputePipelineState> p = ds4_gpu_get_mul_mv_pipeline(d.function_name, d.nsg);
+        if (!p) { if (errlen) snprintf(err, errlen, "pipeline %s missing", d.function_name); goto free_gpu; }
+        if (!ds4_gpu_matvec_run_once(p, &a, sizeof(a), wq8, xbuf, obuf, out_dim, d.nr0, d.nsg, d.smem, got, "selftest q8_0"))
+            { if (errlen) snprintf(err, errlen, "q8_0 GPU run failed"); goto free_gpu; }
+        float maxerr = 0.0f;
+        for (uint32_t r = 0; r < out_dim; r++) { const float e = fabsf(got[r]-refq8[r]); if (e>maxerr) maxerr=e; }
+        if (maxerr >= 1e-4f) { if (errlen) snprintf(err, errlen, "q8_0 max err %.6g >= 1e-4", (double)maxerr); goto free_gpu; }
+    }
+
+    rc = 0;   /* both cases passed */
+free_gpu:
+    ds4_gpu_tensor_free(wf32);
+    ds4_gpu_tensor_free(wq8);
     ds4_gpu_tensor_free(xbuf);
     ds4_gpu_tensor_free(obuf);
 done:
-    free(W); free(x); free(got); free(ref);
+    free(W); free(x); free(got); free(ref); free(Wq8); free(refq8);
     return rc;
 }
 
