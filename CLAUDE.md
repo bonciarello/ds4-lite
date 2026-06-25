@@ -129,6 +129,12 @@ Stato:
   - 3.7 wiring eval dispatch + validazione greedy vs llama.cpp (su questo Mac).
   - Nota quant: ds4 supporta F32/F16/Q8_0/Q4_K/Q2_K/IQ2_XXS ma **NON Q6_K**
     (assente dall'enum). RoPE DeepSeek è GPT-J (coppie i,i+1); densi usano NEOX.
-  - Baseline Qwen2 (llama.cpp, M-series): pp512≈413 t/s, tg128≈44 t/s.
-    Riferimento greedy + harness: `tests/bench_dense.sh`.
+  - Baseline Qwen2 (llama.cpp, M1 Max): pp512≈413 t/s, tg128≈44 t/s.
+  - **Benchmark denso** `tests/bench_dense.sh` (metodologia standard prefill/decode):
+    misura ds4 dense prefill/decode t/s (warmup + measured) vs `llama-bench` pp512/tg128
+    e verifica la correttezza greedy vs `llama-simple`. `--sweep` produce CSV
+    (formato speed-bench del progetto) + SVG via `speed-bench/plot_speed.py`.
+    `ds4_dense_generate` stampa "dense metrics: prefill X t/s (TTFT Ys), gen Z t/s";
+    con `DS4_BENCH_CSV=path` appende una riga CSV. Misura M1 Max: ds4 ~3.2 t/s decode
+    vs llama.cpp ~44 (~14x), greedy identico. (Le 2 ottimizzazioni in [[ds4-lite-dense-optimizations]].)
   - GGUF reale in `gguf/qwen2-7b-instruct-q4_k_m.gguf` (4.68 GB, non committare).
