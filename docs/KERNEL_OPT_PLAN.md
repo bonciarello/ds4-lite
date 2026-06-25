@@ -40,3 +40,21 @@ ds4 already has the CPU reference: `ds4_vec_dot_q4_K_q8_K` (ds4.c ~2786) and
 Measurement: `DS4_DENSE_PROFILE=1 ./ds4 --metal-dense-generate ...` for per-phase ms,
 `tests/bench_dense.sh` for the two-column ds4-vs-llama.cpp table, and the greedy match
 as the correctness gate. Run 3x and take the median (thermal throttling).
+
+## UPDATE: integer-dot (scalar) attempted on this branch — SLOWER, reverted
+Implemented `kernel_dense_quantize_q8_K` + `kernel_dense_mul_mv_q4_K_q8_K` (port of
+ds4_vec_dot_q4_K_q8_K) and wired q4_K through it. Result: **2.5 t/s vs 3.2 baseline
+(slower)** and a small numerical drift (greedy diverged after ~10 tokens). Reverted.
+
+**Why**: the CPU win comes from NEON `vdotq_s32` (a 4-wide int8 dot in one
+instruction). Apple GPUs have no equivalent gain for a **scalar** int MAC — integer
+and float FMA run at the same rate — so the int path is no faster, and the per-matvec
+q8_K quantization adds overhead → net slower.
+
+**Refined conclusion**: the real lever on Metal is the GPU **simdgroup-matrix units**
+(`simdgroup_float8x8` / `simdgroup_multiply_accumulate`), which is how ggml/llama.cpp's
+Metal kernels accelerate. ds4 already uses them in `kernel_mul_mm` (dense.metal). The
+next attempt should adapt that matrix-multiply structure to the dense decode matvec
+(or batch tokens to make it a matmul). This is a substantial, careful rewrite — best
+in a fresh session with a cool machine for reliable measurement. Baseline to beat:
+**~3.2 t/s decode**, correctness gate = greedy match vs llama-simple.
