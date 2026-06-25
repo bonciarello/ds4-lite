@@ -4087,6 +4087,99 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "attn max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
     }
 
+    /* --- Case 8: full dense attention block (rmsnorm->qkv+bias->rope->attn->out->residual) --- */
+    {
+        const uint32_t ne = 64u, nh = 4u, nkv = 2u, hd = 16u, pos = 2u, nctx = 3u;
+        const uint32_t qd = nh*hd, kvd = nkv*hd, group = nh/nkv;   /* qd=64, kvd=32 */
+        const float eps = 1e-6f, fb = 10000.0f, scale = 1.0f/sqrtf((float)hd);
+        float xv[64], wn[64], bq[64], bk[32], bv[32];
+        float *Wq=malloc((size_t)qd*ne*sizeof(float)), *Wk=malloc((size_t)kvd*ne*sizeof(float)),
+              *Wv=malloc((size_t)kvd*ne*sizeof(float)), *Wo=malloc((size_t)ne*qd*sizeof(float)),
+              *sc=malloc((size_t)qd*sizeof(float));
+        float kcache[3*32], vcache[3*32], aref[64], agot[64];
+        bool ok = Wq&&Wk&&Wv&&Wo&&sc;
+        ds4_gpu_tensor *xb=0,*wnb=0,*Wqb=0,*Wkb=0,*Wvb=0,*Wob=0,*hb=0,*qb=0,*kb=0,*vb=0,
+                       *bqb=0,*bkb=0,*bvb=0,*kcb=0,*vcb=0,*atb=0,*ob=0;
+        if (ok) {
+            for(uint32_t i=0;i<ne;i++){ xv[i]=0.04f*(float)i-1.0f; wn[i]=0.6f+0.004f*(float)i; }
+            for(uint32_t i=0;i<qd;i++) bq[i]=0.01f*(float)i-0.2f;
+            for(uint32_t i=0;i<kvd;i++){ bk[i]=0.008f*(float)i-0.1f; bv[i]=0.006f*(float)i-0.05f; }
+            for(uint32_t r=0;r<qd;r++)for(uint32_t i=0;i<ne;i++)Wq[(size_t)r*ne+i]=0.002f*(float)(((r+1)*(i+2))%13)-0.01f;
+            for(uint32_t r=0;r<kvd;r++)for(uint32_t i=0;i<ne;i++){Wk[(size_t)r*ne+i]=0.003f*(float)(((r+2)*(i+1))%11)-0.012f;Wv[(size_t)r*ne+i]=0.0025f*(float)(((r+3)*(i+4))%7)-0.008f;}
+            for(uint32_t r=0;r<ne;r++)for(uint32_t i=0;i<qd;i++)Wo[(size_t)r*qd+i]=0.0015f*(float)(((r+1)*(i+5))%17)-0.006f;
+            /* prefill KV positions 0,1 with synthetic values (same on CPU and GPU) */
+            for(uint32_t i=0;i<2*kvd;i++){ kcache[i]=0.02f*(float)i-0.3f; vcache[i]=0.015f*(float)i-0.2f; }
+
+            /* CPU reference */
+            double ss=0; for(uint32_t i=0;i<ne;i++) ss+=(double)xv[i]*xv[i];
+            float scn=1.0f/sqrtf((float)(ss/(double)ne)+eps), h[64];
+            for(uint32_t i=0;i<ne;i++) h[i]=xv[i]*scn*wn[i];
+            float q[64],k[32],v[32];
+            for(uint32_t r=0;r<qd;r++){double a=0;for(uint32_t i=0;i<ne;i++)a+=(double)Wq[(size_t)r*ne+i]*h[i];q[r]=(float)a+bq[r];}
+            for(uint32_t r=0;r<kvd;r++){double ak=0,av=0;for(uint32_t i=0;i<ne;i++){ak+=(double)Wk[(size_t)r*ne+i]*h[i];av+=(double)Wv[(size_t)r*ne+i]*h[i];}k[r]=(float)ak+bk[r];v[r]=(float)av+bv[r];}
+            const uint32_t rh=hd/2;
+            for(uint32_t hh=0;hh<nh;hh++){float*hp=q+(size_t)hh*hd;for(uint32_t i=0;i<rh;i++){float fr=powf(fb,-2.0f*(float)i/(float)hd),th=(float)pos*fr,c=cosf(th),s=sinf(th),x0=hp[i],x1=hp[i+rh];hp[i]=x0*c-x1*s;hp[i+rh]=x0*s+x1*c;}}
+            for(uint32_t hh=0;hh<nkv;hh++){float*hp=k+(size_t)hh*hd;for(uint32_t i=0;i<rh;i++){float fr=powf(fb,-2.0f*(float)i/(float)hd),th=(float)pos*fr,c=cosf(th),s=sinf(th),x0=hp[i],x1=hp[i+rh];hp[i]=x0*c-x1*s;hp[i+rh]=x0*s+x1*c;}}
+            for(uint32_t i=0;i<kvd;i++){ kcache[(size_t)pos*kvd+i]=k[i]; vcache[(size_t)pos*kvd+i]=v[i]; }
+            float att[64];
+            for(uint32_t hqi=0;hqi<nh;hqi++){uint32_t hkv=hqi/group;float*qh=q+(size_t)hqi*hd;float s3[3],mx=-1e30f;
+                for(uint32_t t=0;t<nctx;t++){const float*kt=kcache+(size_t)t*kvd+(size_t)hkv*hd;double d=0;for(uint32_t dd=0;dd<hd;dd++)d+=(double)qh[dd]*kt[dd];s3[t]=(float)d*scale;if(s3[t]>mx)mx=s3[t];}
+                double su=0;for(uint32_t t=0;t<nctx;t++){s3[t]=expf(s3[t]-mx);su+=s3[t];}
+                float*ah=att+(size_t)hqi*hd;for(uint32_t dd=0;dd<hd;dd++)ah[dd]=0;
+                for(uint32_t t=0;t<nctx;t++){const float*vt=vcache+(size_t)t*kvd+(size_t)hkv*hd;float w=(float)(s3[t]/su);for(uint32_t dd=0;dd<hd;dd++)ah[dd]+=w*vt[dd];}}
+            for(uint32_t r=0;r<ne;r++){double a=0;for(uint32_t i=0;i<qd;i++)a+=(double)Wo[(size_t)r*qd+i]*att[i];aref[r]=xv[r]+(float)a;}
+
+            /* GPU */
+            xb=ds4_gpu_tensor_alloc(ne*4);wnb=ds4_gpu_tensor_alloc(ne*4);hb=ds4_gpu_tensor_alloc(ne*4);
+            Wqb=ds4_gpu_tensor_alloc((uint64_t)qd*ne*4);Wkb=ds4_gpu_tensor_alloc((uint64_t)kvd*ne*4);Wvb=ds4_gpu_tensor_alloc((uint64_t)kvd*ne*4);Wob=ds4_gpu_tensor_alloc((uint64_t)ne*qd*4);
+            qb=ds4_gpu_tensor_alloc(qd*4);kb=ds4_gpu_tensor_alloc(kvd*4);vb=ds4_gpu_tensor_alloc(kvd*4);
+            bqb=ds4_gpu_tensor_alloc(qd*4);bkb=ds4_gpu_tensor_alloc(kvd*4);bvb=ds4_gpu_tensor_alloc(kvd*4);
+            kcb=ds4_gpu_tensor_alloc((uint64_t)nctx*kvd*4);vcb=ds4_gpu_tensor_alloc((uint64_t)nctx*kvd*4);
+            atb=ds4_gpu_tensor_alloc(qd*4);ob=ds4_gpu_tensor_alloc(ne*4);
+            ok = xb&&wnb&&hb&&Wqb&&Wkb&&Wvb&&Wob&&qb&&kb&&vb&&bqb&&bkb&&bvb&&kcb&&vcb&&atb&&ob;
+        }
+        if (ok) {
+            ds4_gpu_tensor_write(xb,0,xv,ne*4);ds4_gpu_tensor_write(wnb,0,wn,ne*4);
+            ds4_gpu_tensor_write(Wqb,0,Wq,(uint64_t)qd*ne*4);ds4_gpu_tensor_write(Wkb,0,Wk,(uint64_t)kvd*ne*4);
+            ds4_gpu_tensor_write(Wvb,0,Wv,(uint64_t)kvd*ne*4);ds4_gpu_tensor_write(Wob,0,Wo,(uint64_t)ne*qd*4);
+            ds4_gpu_tensor_write(bqb,0,bq,qd*4);ds4_gpu_tensor_write(bkb,0,bk,kvd*4);ds4_gpu_tensor_write(bvb,0,bv,kvd*4);
+            struct __attribute__((packed)){uint32_t n;float eps;} rn={ne,eps};
+            struct __attribute__((packed)){uint32_t n_head,head_dim,n_rot,pos;float fb;} rpq={nh,hd,hd,pos,fb}, rpk={nkv,hd,hd,pos,fb};
+            struct __attribute__((packed)){uint32_t n_head,n_kv,head_dim,n_ctx;float scale;} aa={nh,nkv,hd,nctx,scale};
+            ds4_gpu_tensor *nb[3]={xb,wnb,hb}, *qbias[2]={qb,bqb}, *kbias[2]={kb,bkb}, *vbias[2]={vb,bvb}, *rq[1]={qb}, *rk[1]={kb}, *atbufs[4]={qb,kcb,vcb,atb};
+            float khost[32], vhost[32];
+            ok = ds4_gpu_run_simple("kernel_dense_rms_norm_f32",&rn,sizeof(rn),nb,3,1u,"a rms")
+              && ds4_gpu_dense_matvec_f32(qb,Wqb,hb,ne,qd,sc,"a q")
+              && ds4_gpu_dense_matvec_f32(kb,Wkb,hb,ne,kvd,sc,"a k")
+              && ds4_gpu_dense_matvec_f32(vb,Wvb,hb,ne,kvd,sc,"a v")
+              && ds4_gpu_run_simple("kernel_dense_add_f32",&qd,sizeof(qd),qbias,2,qd,"a bq")
+              && ds4_gpu_run_simple("kernel_dense_add_f32",&kvd,sizeof(kvd),kbias,2,kvd,"a bk")
+              && ds4_gpu_run_simple("kernel_dense_add_f32",&kvd,sizeof(kvd),vbias,2,kvd,"a bv")
+              && ds4_gpu_run_simple("kernel_dense_rope_neox_f32",&rpq,sizeof(rpq),rq,1,nh*(hd/2),"a ropeq")
+              && ds4_gpu_run_simple("kernel_dense_rope_neox_f32",&rpk,sizeof(rpk),rk,1,nkv*(hd/2),"a ropek");
+            if (ok) {
+                /* append new k,v to the prefilled cache (round-trip host) */
+                ds4_gpu_tensor_read(kb,0,khost,kvd*4); ds4_gpu_tensor_read(vb,0,vhost,kvd*4);
+                for(uint32_t i=0;i<kvd;i++){ kcache[(size_t)pos*kvd+i]=khost[i]; vcache[(size_t)pos*kvd+i]=vhost[i]; }
+                ds4_gpu_tensor_write(kcb,0,kcache,(uint64_t)nctx*kvd*4);
+                ds4_gpu_tensor_write(vcb,0,vcache,(uint64_t)nctx*kvd*4);
+                ds4_gpu_tensor *resb[2]={xb,ob};
+                ok = ds4_gpu_run_simple("kernel_dense_attn_decode_f32",&aa,sizeof(aa),atbufs,4,nh,"a attn")
+                  && ds4_gpu_dense_matvec_f32(ob,Wob,atb,qd,ne,sc,"a out")
+                  && ds4_gpu_run_simple("kernel_dense_add_f32",&ne,sizeof(ne),resb,2,ne,"a res");
+                if (ok) ds4_gpu_tensor_read(xb,0,agot,ne*4);
+            }
+        }
+        ds4_gpu_tensor_free(xb);ds4_gpu_tensor_free(wnb);ds4_gpu_tensor_free(hb);ds4_gpu_tensor_free(Wqb);ds4_gpu_tensor_free(Wkb);
+        ds4_gpu_tensor_free(Wvb);ds4_gpu_tensor_free(Wob);ds4_gpu_tensor_free(qb);ds4_gpu_tensor_free(kb);ds4_gpu_tensor_free(vb);
+        ds4_gpu_tensor_free(bqb);ds4_gpu_tensor_free(bkb);ds4_gpu_tensor_free(bvb);ds4_gpu_tensor_free(kcb);ds4_gpu_tensor_free(vcb);
+        ds4_gpu_tensor_free(atb);ds4_gpu_tensor_free(ob);
+        free(Wq);free(Wk);free(Wv);free(Wo);free(sc);
+        if (!ok) { if (errlen) snprintf(err, errlen, "attention block GPU run failed"); goto free_gpu; }
+        float maxerr=0.0f; for(uint32_t i=0;i<ne;i++){const float e=fabsf(agot[i]-aref[i]);if(e>maxerr)maxerr=e;}
+        if (maxerr >= 1e-4f) { if (errlen) snprintf(err, errlen, "attention block max err %.6g >= 1e-4", (double)maxerr); goto free_gpu; }
+    }
+
     rc = 0;   /* all cases passed */
 free_gpu:
     ds4_gpu_tensor_free(wf32);
