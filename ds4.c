@@ -23757,6 +23757,13 @@ int ds4_gpu_dense_matvec_verify(int type, const void *wbytes, uint64_t wnbytes,
     return 1;
 }
 
+ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *desc) { (void)desc; return NULL; }
+void ds4_dense_gpu_free(ds4_dense_gpu *g) { (void)g; }
+int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
+                          int token, unsigned pos, float *logits) {
+    (void)g; (void)desc; (void)token; (void)pos; (void)logits; return 1;
+}
+
 ds4_context_memory ds4_context_memory_estimate_with_prefill(
         ds4_backend backend,
         int         ctx_size,
@@ -25681,6 +25688,109 @@ int ds4_dense_weight_test(const char *model_path, char *err, size_t errlen) {
     model_close(&model);
     if (fail && errlen) snprintf(err, errlen, "one or more dense weight matvecs failed");
     return fail;
+}
+
+static ds4_dense_wdesc dense_wdesc_of(const ds4_model *m, const ds4_tensor *t) {
+    ds4_dense_wdesc w = {0};
+    if (!t) return w;
+    w.type = (int)t->type;
+    w.data = tensor_data(m, t);
+    w.bytes = t->bytes;
+    w.dim0 = (unsigned)t->dim[0];
+    w.dim1 = t->ndim >= 2 ? (unsigned)t->dim[1] : 0;
+    return w;
+}
+
+static void dense_print_token(const ds4_vocab *vocab, int token) {
+    if (token < 0 || token >= vocab->n_vocab) return;
+    ds4_str s = vocab->token[token];
+    uint64_t pos = 0;
+    while (pos < s.len) {
+        uint32_t cp = utf8_decode_one(s.ptr, s.len, &pos);
+        const int b = gpt2_codepoint_to_byte(cp);
+        if (b >= 0) putchar(b);
+    }
+}
+
+/* Fase 3.5 step 3-6: greedy dense generation on the GPU forward driver. Loads a
+ * dense model, tokenizes the raw prompt, prefills, then greedily decodes
+ * n_predict tokens. Self-contained (no session). Validate vs llama.cpp greedy. */
+int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict,
+                       char *err, size_t errlen) {
+    ds4_model model;
+    ds4_vocab vocab;
+    ds4_weights weights;
+    model_open(&model, model_path, false, true);
+    config_validate_model(&model);
+    if (ds4_arch_is_deepseek()) {
+        if (errlen) snprintf(err, errlen, "not a dense model");
+        model_close(&model);
+        return 1;
+    }
+    vocab_load(&vocab, &model);
+    weights_bind(&weights, &model, false, 0, 0, true, false);
+
+    token_vec toks = {0};
+    bpe_tokenize_text(&vocab, prompt ? prompt : "", &toks);
+    if (toks.len == 0) { if (errlen) snprintf(err, errlen, "empty prompt"); vocab_free(&vocab); model_close(&model); return 1; }
+
+    const uint32_t n_ctx = (uint32_t)toks.len + (uint32_t)(n_predict > 0 ? n_predict : 0) + 8u;
+
+    ds4_dense_model_desc desc = {0};
+    desc.n_layer = DS4_N_LAYER; desc.n_embd = DS4_N_EMBD; desc.n_ff = DS4_N_FF;
+    desc.n_head = DS4_N_HEAD; desc.n_kv = DS4_N_HEAD_KV; desc.head_dim = DS4_N_HEAD_DIM;
+    desc.n_vocab = DS4_N_VOCAB; desc.n_rot = DS4_N_ROT; desc.n_ctx = n_ctx;
+    desc.rms_eps = DS4_RMS_EPS; desc.rope_base = DS4_ROPE_FREQ_BASE;
+    desc.token_embd  = dense_wdesc_of(&model, weights.token_embd);
+    desc.output_norm = dense_wdesc_of(&model, weights.output_norm);
+    desc.output      = dense_wdesc_of(&model, weights.output);
+    desc.layers = xcalloc(DS4_N_LAYER, sizeof(desc.layers[0]));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *lw = &weights.layer[il];
+        ds4_dense_layer_desc *L = &desc.layers[il];
+        L->attn_norm   = dense_wdesc_of(&model, lw->attn_norm);
+        L->attn_q      = dense_wdesc_of(&model, lw->attn_q);
+        L->attn_q_bias = dense_wdesc_of(&model, lw->attn_q_bias);
+        L->attn_k      = dense_wdesc_of(&model, lw->attn_k);
+        L->attn_k_bias = dense_wdesc_of(&model, lw->attn_k_bias);
+        L->attn_v      = dense_wdesc_of(&model, lw->attn_v);
+        L->attn_v_bias = dense_wdesc_of(&model, lw->attn_v_bias);
+        L->attn_out    = dense_wdesc_of(&model, lw->attn_out);
+        L->ffn_norm    = dense_wdesc_of(&model, lw->ffn_norm);
+        L->ffn_gate    = dense_wdesc_of(&model, lw->ffn_gate);
+        L->ffn_up      = dense_wdesc_of(&model, lw->ffn_up);
+        L->ffn_down    = dense_wdesc_of(&model, lw->ffn_down);
+    }
+
+    ds4_dense_gpu *g = ds4_dense_gpu_create(&desc);
+    if (!g) { if (errlen) snprintf(err, errlen, "dense GPU create failed"); free(desc.layers); token_vec_free(&toks); vocab_free(&vocab); model_close(&model); return 1; }
+
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    int rc = 0;
+    uint32_t pos = 0;
+    /* prefill */
+    for (uint32_t i = 0; i < (uint32_t)toks.len; i++) {
+        if (ds4_dense_gpu_forward(g, &desc, toks.v[i], pos++, logits) != 0) { rc = 1; break; }
+    }
+    /* greedy decode */
+    printf("=== ds4 dense greedy (%d tokens) ===\n", n_predict);
+    for (int n = 0; rc == 0 && n < n_predict; n++) {
+        int next = sample_argmax(logits, DS4_N_VOCAB);
+        if (next == vocab.eos_id) break;
+        dense_print_token(&vocab, next);
+        if (ds4_dense_gpu_forward(g, &desc, next, pos++, logits) != 0) { rc = 1; break; }
+    }
+    printf("\n");
+    fflush(stdout);
+
+    free(logits);
+    ds4_dense_gpu_free(g);
+    free(desc.layers);
+    token_vec_free(&toks);
+    vocab_free(&vocab);
+    model_close(&model);
+    if (rc && errlen) snprintf(err, errlen, "dense forward failed");
+    return rc;
 }
 
 #ifndef DS4_NO_GPU

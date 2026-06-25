@@ -161,6 +161,43 @@ int ds4_gpu_dense_matvec_verify(int type, const void *wbytes, uint64_t wnbytes,
 
 /* Load a dense model and verify the dense GPU matvec on real weight tensors. */
 int ds4_dense_weight_test(const char *model_path, char *err, size_t errlen);
+
+/* ---- Dense GPU forward (Fase 3.5 step 4) -----------------------------------
+ * Plain-old-data descriptors so the Metal forward (which cannot see the ds4.c
+ * model/weights structs) gets the weight bytes (mmap pointers), GGML types and
+ * dims it needs. data==NULL means the weight is absent (e.g. optional bias). */
+typedef struct {
+    int          type;   /* GGML type id (0=f32, 12=q4_k, 14=q6_k, ...) */
+    const void  *data;   /* pointer into the mmapped model (tensor_data) */
+    unsigned long long bytes;
+    unsigned     dim0;   /* in_dim for matvec, or length for 1D */
+    unsigned     dim1;   /* out_dim for matvec, 0 for 1D */
+} ds4_dense_wdesc;
+
+typedef struct {
+    ds4_dense_wdesc attn_norm, attn_q, attn_q_bias, attn_k, attn_k_bias,
+                    attn_v, attn_v_bias, attn_out;
+    ds4_dense_wdesc ffn_norm, ffn_gate, ffn_up, ffn_down;
+} ds4_dense_layer_desc;
+
+typedef struct {
+    unsigned n_layer, n_embd, n_ff, n_head, n_kv, head_dim, n_vocab, n_rot, n_ctx;
+    float    rms_eps, rope_base;
+    ds4_dense_wdesc       token_embd, output_norm, output;
+    ds4_dense_layer_desc *layers;   /* [n_layer] */
+} ds4_dense_model_desc;
+
+typedef struct ds4_dense_gpu ds4_dense_gpu;
+/* Allocate scratch buffers + dense GPU KV cache for the given shape. */
+ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *desc);
+void ds4_dense_gpu_free(ds4_dense_gpu *g);
+/* One-token forward at position pos; writes desc->n_vocab logits. 0 on success. */
+int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
+                          int token, unsigned pos, float *logits);
+
+/* Load a dense model and greedily generate n_predict tokens (self-contained). */
+int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict,
+                       char *err, size_t errlen);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);

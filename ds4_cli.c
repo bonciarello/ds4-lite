@@ -1445,6 +1445,17 @@ static cli_config parse_options(int argc, char **argv) {
             fprintf(stderr, "dense weight matvec test: FAIL (%s)\n", st_err);
             exit(1);
         }
+        if (!strcmp(arg, "--metal-dense-generate")) {
+            /* Fase 3.5 step 3-6: greedy dense generation. Args: MODEL PROMPT [NPRED]. */
+            const char *mp = (i + 1 < argc) ? argv[++i] : NULL;
+            const char *pr = (i + 1 < argc) ? argv[++i] : NULL;
+            const int np = (i + 1 < argc) ? atoi(argv[++i]) : 48;
+            if (!mp || !pr) { fprintf(stderr, "ds4: --metal-dense-generate needs MODEL PROMPT [N]\n"); exit(1); }
+            char st_err[256] = {0};
+            const int rc = ds4_dense_generate(mp, pr, np, st_err, sizeof(st_err));
+            if (rc != 0) fprintf(stderr, "ds4: dense generate failed: %s\n", st_err);
+            exit(rc == 0 ? 0 : 1);
+        }
         char dist_parse_err[256] = {0};
         ds4_dist_cli_parse_result dist_parse = ds4_dist_parse_cli_arg(arg,
                                                                       &i,
