@@ -66,8 +66,15 @@ Stato:
     ⚠️ NON ancora wired nella eval dispatch e NON runtime-validato: il path CPU
     crasha il kernel macOS → validare su **Linux** (`make cpu`) vs llama.cpp.
     Non eseguire il path CPU su macOS.
-  - **Prossimi**: 3.5/3.6 port Metal (attn GQA + FFN SwiGLU), 3.7 wiring eval
-    dispatch (cache densa nella session) + validazione greedy vs llama.cpp.
+  - **3.5** 🟡 port Metal avviato. **1° step validato su questo Mac (M1 Max)**:
+    `ds4_gpu_dense_matvec_selftest` (in `ds4_metal.m`, flag `./ds4 --metal-dense-selftest`)
+    esegue `kernel_mul_mv_f32_f32` su GPU e confronta col dot product CPU → **PASS**
+    (<1e-4). Valida il path di dispatch denso (buffer/args/pipeline/encode/readback)
+    end-to-end, senza modello. Kernel densi confermati in `metal/dense.metal`.
+  - **Prossimi 3.5**: matvec q8_0/q4_K, kernel RoPE NEOX, encode layer denso
+    (attn GQA + FFN SwiGLU), KV cache dense GPU, wiring in
+    `metal_graph_eval_token_raw_swa` dietro `ds4_arch_is_deepseek()`.
+  - 3.7 wiring eval dispatch + validazione greedy vs llama.cpp (su questo Mac).
   - Nota quant: ds4 supporta F32/F16/Q8_0/Q4_K/Q2_K/IQ2_XXS ma **NON Q6_K**
     (assente dall'enum). RoPE DeepSeek è GPT-J (coppie i,i+1); densi usano NEOX.
   - Baseline Qwen2 (llama.cpp, M-series): pp512≈413 t/s, tg128≈44 t/s.

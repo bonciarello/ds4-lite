@@ -146,6 +146,11 @@ typedef struct {
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
+
+/* Fase 3.5: GPU dense matvec smoke test. Validates the dense matvec dispatch
+ * path on-device with no model. Returns 0 on PASS. Implemented on the GPU
+ * backend; a CPU-only build returns an error. */
+int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);

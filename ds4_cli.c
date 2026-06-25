@@ -1425,6 +1425,16 @@ static cli_config parse_options(int argc, char **argv) {
             usage(stdout, topic);
             exit(0);
         }
+        if (!strcmp(arg, "--metal-dense-selftest")) {
+            /* Fase 3.5: validate the dense matvec GPU path on-device, no model. */
+            char st_err[256] = {0};
+            if (ds4_gpu_dense_matvec_selftest(st_err, sizeof(st_err)) == 0) {
+                printf("dense matvec GPU selftest: PASS\n");
+                exit(0);
+            }
+            fprintf(stderr, "dense matvec GPU selftest: FAIL (%s)\n", st_err);
+            exit(1);
+        }
         char dist_parse_err[256] = {0};
         ds4_dist_cli_parse_result dist_parse = ds4_dist_parse_cli_arg(arg,
                                                                       &i,

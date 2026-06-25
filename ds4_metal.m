@@ -3695,6 +3695,83 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_plain_mv_dispatch(
     };
 }
 
+/* ---- Dense matvec GPU smoke test (Fase 3.5, first validatable step) --------
+ * Runs kernel_mul_mv_f32_f32 on a small known input and checks the GPU result
+ * against a CPU dot product. Validates the dense matvec dispatch path end to end
+ * (buffers, args, pipeline lookup, encode, readback) on-device, independent of
+ * any model. Returns 0 on PASS, nonzero on failure (message in err). */
+int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
+    if (!g_initialized && !ds4_gpu_init()) {
+        if (errlen) snprintf(err, errlen, "Metal init failed (no GPU device?)");
+        return 1;
+    }
+    const uint32_t in_dim = 256, out_dim = 8;   /* in_dim multiple of 128 and 4 */
+    float *W   = malloc((size_t)out_dim * in_dim * sizeof(float));
+    float *x   = malloc((size_t)in_dim * sizeof(float));
+    float *got = malloc((size_t)out_dim * sizeof(float));
+    float *ref = malloc((size_t)out_dim * sizeof(float));
+    int rc = 1;
+    if (!W || !x || !got || !ref) { if (errlen) snprintf(err, errlen, "oom"); goto done; }
+
+    for (uint32_t i = 0; i < in_dim; i++) x[i] = 0.01f * (float)(i + 1);
+    for (uint32_t r = 0; r < out_dim; r++)
+        for (uint32_t i = 0; i < in_dim; i++)
+            W[(size_t)r * in_dim + i] = 0.001f * (float)(((r + 1) * (i + 1)) % 17);
+    for (uint32_t r = 0; r < out_dim; r++) {
+        double acc = 0.0;
+        for (uint32_t i = 0; i < in_dim; i++) acc += (double)W[(size_t)r*in_dim+i] * x[i];
+        ref[r] = (float)acc;
+    }
+
+    ds4_gpu_tensor *wbuf = ds4_gpu_tensor_alloc((uint64_t)out_dim * in_dim * sizeof(float));
+    ds4_gpu_tensor *xbuf = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
+    ds4_gpu_tensor *obuf = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+    if (wbuf && xbuf && obuf) {
+        ds4_gpu_tensor_write(wbuf, 0, W, (uint64_t)out_dim * in_dim * sizeof(float));
+        ds4_gpu_tensor_write(xbuf, 0, x, (uint64_t)in_dim * sizeof(float));
+
+        ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, 1);
+        ds4_gpu_mv_dispatch disp = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
+        args.nr0 = disp.nr0;
+        id<MTLComputePipelineState> pipe =
+            ds4_gpu_get_mul_mv_pipeline(disp.function_name, disp.nsg);
+        if (!pipe) {
+            if (errlen) snprintf(err, errlen, "pipeline %s not found", disp.function_name);
+        } else {
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            if (cb) {
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:pipe];
+                [enc setBytes:&args length:sizeof(args) atIndex:0];
+                [enc setBuffer:ds4_gpu_tensor_buffer(wbuf) offset:ds4_gpu_tensor_offset(wbuf) atIndex:1];
+                [enc setBuffer:ds4_gpu_tensor_buffer(xbuf) offset:ds4_gpu_tensor_offset(xbuf) atIndex:2];
+                [enc setBuffer:ds4_gpu_tensor_buffer(obuf) offset:ds4_gpu_tensor_offset(obuf) atIndex:3];
+                if (disp.smem) [enc setThreadgroupMemoryLength:disp.smem atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake((out_dim + (uint32_t)disp.nr0 - 1u) / (uint32_t)disp.nr0, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)disp.nsg, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                if (ds4_gpu_finish_command_buffer(cb, owned, "dense matvec selftest")) {
+                    ds4_gpu_tensor_read(obuf, 0, got, (uint64_t)out_dim * sizeof(float));
+                    float maxerr = 0.0f;
+                    for (uint32_t r = 0; r < out_dim; r++) {
+                        const float e = fabsf(got[r] - ref[r]);
+                        if (e > maxerr) maxerr = e;
+                    }
+                    if (maxerr < 1e-4f) rc = 0;
+                    else if (errlen) snprintf(err, errlen, "max abs error %.6g exceeds 1e-4", (double)maxerr);
+                } else if (errlen) snprintf(err, errlen, "command buffer execution failed");
+            } else if (errlen) snprintf(err, errlen, "could not get command buffer");
+        }
+    } else if (errlen) snprintf(err, errlen, "GPU buffer allocation failed");
+    ds4_gpu_tensor_free(wbuf);
+    ds4_gpu_tensor_free(xbuf);
+    ds4_gpu_tensor_free(obuf);
+done:
+    free(W); free(x); free(got); free(ref);
+    return rc;
+}
+
 static ds4_gpu_mul_mm_args ds4_gpu_make_mm_args(
         uint64_t in_dim,
         uint64_t out_dim,

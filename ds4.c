@@ -23711,6 +23711,11 @@ static int generate_metal_graph_raw_swa(
 #endif
 
 #ifdef DS4_NO_GPU
+int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
+    if (errlen) snprintf(err, errlen, "dense matvec selftest requires a GPU build");
+    return 1;
+}
+
 ds4_context_memory ds4_context_memory_estimate_with_prefill(
         ds4_backend backend,
         int         ctx_size,

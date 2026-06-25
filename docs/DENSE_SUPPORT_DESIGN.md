@@ -228,7 +228,7 @@ ognuno **validabile in isolamento contro llama.cpp** (oracolo). Ordine consiglia
 | 3.2 ✅ | **Bind pesi densi** | `weights_bind_{layer,output,}_dense`, campi densi in `ds4_layer_weights`, dispatch in `weights_bind`; biases QKV opzionali | **Validato** su Qwen2: `--inspect` lega 28 layer senza `ds4_die`; run → "weights bound OK" | No |
 | 3.3 ✅ | **Layout validation dense** | `weights_validate_layout_dense` + `dense_expect_dims` (type-agnostic) | **Validato**: ~300 controlli dim su Qwen2 (28 layer) passano | No |
 | 3.4 🟡 | **CPU reference forward** | `forward_token_dense_cpu` in `ds4.c`: embedding, GQA attn + NEOX RoPE, SwiGLU FFN, output; dense KV cache; dequant F32/F16/Q8_0 | **Scritto, compila**; NON wired né runtime-validato (CPU crasha macOS → validare su Linux `make cpu` vs llama.cpp). Serve GGUF F16/Q8_0 (no Q6_K) | Sì (CPU) |
-| 3.5 | **Port Metal: attention GQA** | attention standard (no MLA) su Metal, riuso kernel base | hidden state dopo layer 0 vs CPU-ref/llama.cpp | Sì (Metal) |
+| 3.5 🟡 | **Port Metal** | 1° step: `ds4_gpu_dense_matvec_selftest` (`--metal-dense-selftest`) — matvec denso su GPU. Poi: q8_0/q4_K, RoPE NEOX, encode layer GQA, KV dense | **1° step PASS su M1 Max** (<1e-4 vs CPU); resto: hidden state layer-0 vs CPU-ref/llama.cpp | Sì (Metal) |
 | 3.6 | **Port Metal: FFN SwiGLU** | `gate/up` → SiLU·mul → `down` (riuso `kernel_swiglu_f32`) | hidden state dopo FFN layer 0 | Sì (Metal) |
 | 3.7 | **Forward completo + wiring** | Wire CPU-ref nella eval dispatch (cache densa nella session) + Metal completo | continuazione greedy token-by-token identica a llama.cpp (`bench_dense.sh`) | Sì |
 | 3.8 | **Speed bench** | `ds4-bench` sul path dense | t/s comparabili con `llama-bench` | Sì |
