@@ -1888,3 +1888,41 @@ kernel void kernel_dense_mul_mv_q3_K_f32(
     }
     out[row] = acc;
 }
+
+// ---- Dense Q2_K matvec ------------------------------------------------------
+// Block = 84 bytes: scales[16] qs[64] d(f16) dmin(f16). Canonical GGML Q2_K
+// dequant inline. in_dim multiple of 256.
+kernel void kernel_dense_mul_mv_q2_K_f32(
+        constant ds4_dense_mvq_args & a [[buffer(0)]],
+        device const char  * W   [[buffer(1)]],
+        device const float * x   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= a.out_dim) return;
+    const uint nblk = a.in_dim / 256u;
+    const uint BLK = 84u;
+    float acc = 0.0f;
+    for (uint bi = 0; bi < nblk; bi++) {
+        device const char * blk = W + (ulong)(row * nblk + bi) * BLK;
+        device const uchar * scales = (device const uchar *)(blk + 0);
+        device const uchar * qbase = (device const uchar *)(blk + 16);
+        const float d   = (float)(*(device const half *)(blk + 80));
+        const float dmn = (float)(*(device const half *)(blk + 82));
+        device const float * xb = x + (ulong)bi * 256u;
+        uint xi = 0; int is = 0;
+        for (uint n = 0; n < 256u; n += 128u) {
+            device const uchar * q = qbase + (n/128u)*32u;
+            uint shift = 0;
+            for (int jj = 0; jj < 4; ++jj) {
+                uchar sc = scales[is++];
+                float dl = d * (float)(sc & 0xF), ml = dmn * (float)(sc >> 4);
+                for (uint l = 0; l < 16u; ++l) acc += (dl * (float)((q[l] >> shift) & 3) - ml) * xb[xi++];
+                sc = scales[is++];
+                dl = d * (float)(sc & 0xF); ml = dmn * (float)(sc >> 4);
+                for (uint l = 0; l < 16u; ++l) acc += (dl * (float)((q[l+16] >> shift) & 3) - ml) * xb[xi++];
+                shift += 2;
+            }
+        }
+    }
+    out[row] = acc;
+}
