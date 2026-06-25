@@ -1598,3 +1598,34 @@ typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, 
 // Host-visible prefill matmul variants for F16 and Q8_0 weights.
 template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 1, dequantize_f16,  half,  half4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
+
+// ---- Dense NEOX RoPE (Fase 3.5) --------------------------------------------
+// Qwen2/Llama convention: rotate dim i with i + n_rot/2, per head. One thread
+// per (head, i) pair, i in [0, n_rot/2). In-place on an f32 [n_head*head_dim].
+struct ds4_dense_rope_args {
+    uint  n_head;
+    uint  head_dim;
+    uint  n_rot;
+    uint  pos;
+    float freq_base;
+};
+
+kernel void kernel_dense_rope_neox_f32(
+        constant ds4_dense_rope_args & a [[buffer(0)]],
+        device float * x [[buffer(1)]],
+        uint gid [[thread_position_in_grid]]) {
+    const uint rot_half = a.n_rot / 2u;
+    const uint total = a.n_head * rot_half;
+    if (gid >= total) return;
+    const uint h = gid / rot_half;
+    const uint i = gid % rot_half;
+    device float * head = x + h * a.head_dim;
+    const float freq  = pow(a.freq_base, -2.0f * (float)i / (float)a.n_rot);
+    const float theta = (float)a.pos * freq;
+    const float c = cos(theta);
+    const float s = sin(theta);
+    const float x0 = head[i];
+    const float x1 = head[i + rot_half];
+    head[i]          = x0 * c - x1 * s;
+    head[i + rot_half] = x0 * s + x1 * c;
+}

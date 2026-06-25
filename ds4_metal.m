@@ -3823,7 +3823,54 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         if (maxerr >= 1e-4f) { if (errlen) snprintf(err, errlen, "q8_0 max err %.6g >= 1e-4", (double)maxerr); goto free_gpu; }
     }
 
-    rc = 0;   /* both cases passed */
+    /* --- Case 3: NEOX RoPE (kernel_dense_rope_neox_f32) --- */
+    {
+        const uint32_t nh = 2u, hd = 8u, n_rot = 8u, pos = 5u;
+        const float fb = 10000.0f;
+        const uint32_t rh = n_rot / 2u;
+        float qin[16], qref[16], qgot[16];
+        for (uint32_t i = 0; i < nh*hd; i++) qin[i] = 0.1f * (float)(i + 1);
+        memcpy(qref, qin, nh*hd*sizeof(float));
+        for (uint32_t h = 0; h < nh; h++) {
+            float *hp = qref + (size_t)h*hd;
+            for (uint32_t i = 0; i < rh; i++) {
+                const float freq = powf(fb, -2.0f*(float)i/(float)n_rot);
+                const float theta = (float)pos * freq;
+                const float c = cosf(theta), s = sinf(theta);
+                const float x0 = hp[i], x1 = hp[i+rh];
+                hp[i] = x0*c - x1*s; hp[i+rh] = x0*s + x1*c;
+            }
+        }
+        struct __attribute__((packed)) { uint32_t n_head, head_dim, n_rot, pos; float freq_base; }
+            ra = { nh, hd, n_rot, pos, fb };
+        ds4_gpu_tensor *qb = ds4_gpu_tensor_alloc((uint64_t)nh*hd*sizeof(float));
+        id<MTLComputePipelineState> rp = ds4_gpu_get_pipeline("kernel_dense_rope_neox_f32");
+        if (!qb || !rp) { if (errlen) snprintf(err, errlen, "rope pipeline/buffer missing"); ds4_gpu_tensor_free(qb); goto free_gpu; }
+        ds4_gpu_tensor_write(qb, 0, qin, (uint64_t)nh*hd*sizeof(float));
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        bool ok = cb != nil;
+        if (ok) {
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:rp];
+            [enc setBytes:&ra length:sizeof(ra) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(qb) offset:ds4_gpu_tensor_offset(qb) atIndex:1];
+            const NSUInteger total = (NSUInteger)nh * rh;
+            const NSUInteger tg = 64;
+            [enc dispatchThreadgroups:MTLSizeMake((total + tg - 1)/tg, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            ok = ds4_gpu_finish_command_buffer(cb, owned, "selftest rope");
+        }
+        if (ok) ds4_gpu_tensor_read(qb, 0, qgot, (uint64_t)nh*hd*sizeof(float));
+        ds4_gpu_tensor_free(qb);
+        if (!ok) { if (errlen) snprintf(err, errlen, "rope GPU run failed"); goto free_gpu; }
+        float maxerr = 0.0f;
+        for (uint32_t i = 0; i < nh*hd; i++) { const float e = fabsf(qgot[i]-qref[i]); if (e>maxerr) maxerr=e; }
+        if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "rope max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
+    }
+
+    rc = 0;   /* all cases passed */
 free_gpu:
     ds4_gpu_tensor_free(wf32);
     ds4_gpu_tensor_free(wq8);
