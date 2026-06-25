@@ -76,12 +76,20 @@ Stato:
     - step 2 ✅ kernel **RoPE NEOX** (`kernel_dense_rope_neox_f32`) (<1e-5)
     - step 3a ✅ kernel **SwiGLU + RMSNorm** densi (<1e-5)
     - step 3b ✅ **blocco FFN completo** (rmsnorm→gate/up→swiglu→down→residuo) chainato (<1e-4)
+    - step 3c ✅ **blocco ATTENTION completo** (rmsnorm→q/k/v matvec+bias→RoPE→append KV→
+      GQA attention→out matvec→residuo) chainato, KV pre-riempita 3 pos (<1e-4).
+      Kernel: `kernel_dense_attn_decode_f32` (un thread/query head, online softmax).
+    **Entrambi i sub-blocchi transformer (attn + FFN) girano end-to-end su GPU.**
     Kernel densi in `metal/dense.metal`; helper host riusabili `ds4_gpu_run_simple`,
     `ds4_gpu_dense_matvec_f32`, `ds4_gpu_matvec_run_once`.
-  - **Prossimi 3.5**: step 3c = **blocco attention GQA** (q/k/v matvec+bias → RoPE →
-    softmax su KV → out matvec → residuo) — serve kernel softmax/attention + KV.
-    step 4 = layer denso completo + KV cache dense GPU + wiring in
-    `metal_graph_eval_token_raw_swa` dietro `ds4_arch_is_deepseek()` → greedy vs llama.cpp.
+  - **Prossimo 3.5 step 4 (integrazione, il blocco grosso)**: comporre il layer denso
+    completo (attn+FFN, banale) e fare il **wiring coi pesi reali** + KV cache dense
+    nella session, dietro `ds4_arch_is_deepseek()` in `metal_graph_eval_token_raw_swa`
+    → continuazione greedy vs llama.cpp.
+    ⚠️ **Blocco quant per il wiring**: il GGUF Qwen2 **Q4_K_M usa Q6_K** (output/ffn_down/
+    attn_v) e ds4 NON ha Q6_K. Il matvec GPU validato è F32+Q8_0; q4_K esiste come kernel
+    ma non validato qui. → per il wiring/validazione serve un **GGUF Qwen2 Q8_0** (~8GB,
+    tutto q8_0, già validato) oppure aggiungere Q6_K.
     Nota: i kernel `.metal` sono caricati da disco a runtime (modifiche ai soli `.metal`
     non richiedono rebuild di ds4_metal.o); eseguire `./ds4` dalla root del repo.
   - 3.7 wiring eval dispatch + validazione greedy vs llama.cpp (su questo Mac).
