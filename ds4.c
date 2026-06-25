@@ -23750,6 +23750,12 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
     return 1;
 }
 
+int ds4_gpu_dense_matmul_test(int n_tok, char *err, size_t errlen) {
+    (void)n_tok;
+    if (errlen) snprintf(err, errlen, "dense matmul test requires a GPU build");
+    return 1;
+}
+
 int ds4_gpu_dense_matvec_verify(int type, const void *wbytes, uint64_t wnbytes,
                                 const float *x, uint32_t in_dim, uint32_t out_dim,
                                 float *maxerr_out) {

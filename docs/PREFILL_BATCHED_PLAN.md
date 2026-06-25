@@ -41,5 +41,12 @@ Benchmark prefill t/s before/after at several prompt lengths (57, ~200, ~500 tok
 
 ## Status
 - [x] Baseline recorded.
-- [ ] Increment 1 (matmul kernels) — next.
-- [ ] Increments 2–5.
+- [x] **Increment 1 — q4_K matmul kernel.** Instantiated `kernel_mul_mm_q4_K_f32`
+  (reuses the proven simdgroup template + `dequantize_q4_K`), host wrapper
+  `ds4_gpu_dense_matmul_q4k`, and `--metal-dense-matmul-test [M]` (correctness vs
+  CPU + amortization bench). Result: correctness PASS; at M=64, K=N=3584 the
+  matmul is **18.1x** faster than 64 separate matvecs (1.07 ms vs 19.4 ms) — the
+  weight-read amortization that will drive the prefill speedup. q6_K matmul
+  (block_q6_K + dequantize_q6_K) still TODO for ffn_down/output.
+- [ ] Increment 1b: q6_K matmul.
+- [ ] Increments 2–5 (batched elementwise, causal attention, forward driver, wiring).

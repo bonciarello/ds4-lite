@@ -4343,6 +4343,139 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
     }
 }
 
+static ds4_gpu_mul_mm_args ds4_gpu_make_mm_args(uint64_t in_dim, uint64_t out_dim,
+                                                uint64_t n_tok, uint64_t row_bytes);
+
+/* Batched prefill matmul: out[n_tok, out_dim] = x[n_tok, in_dim] . dequant(W[out_dim,
+ * in_dim]) for q4_K weights, via the proven simdgroup kernel_mul_mm. */
+static bool ds4_gpu_dense_matmul_q4k(ds4_gpu_tensor *out, ds4_gpu_tensor *W, ds4_gpu_tensor *x,
+                                     uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    const uint64_t row_bytes = (uint64_t)(in_dim / 256u) * 144u;
+    const bool bc_inp = (in_dim % 32u) != 0;
+    const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+    id<MTLComputePipelineState> p = ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_q4_K_f32", bc_inp, bc_out);
+    if (!p) return false;
+    ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return false;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:p];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(W)   offset:ds4_gpu_tensor_offset(W)   atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(x)   offset:ds4_gpu_tensor_offset(x)   atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:3];
+    [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((n_tok + 31u) / 32u, (out_dim + 63u) / 64u, 1)
+         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "dense q4_K matmul");
+}
+
+/* Increment 1 validation: q4_K batched matmul correctness (vs CPU dequant) + a
+ * micro-benchmark showing weight-read amortization (matmul over M tokens vs M
+ * separate matvecs that each re-read the weights). Returns 0 on PASS. */
+int ds4_gpu_dense_matmul_test(int n_tok_in, char *err, size_t errlen) {
+    if (!g_initialized && !ds4_gpu_init()) { if (errlen) snprintf(err, errlen, "no GPU"); return 1; }
+    const uint32_t M = n_tok_in > 0 ? (uint32_t)n_tok_in : 32u;
+
+    /* --- correctness: small K=512, N=64 --- */
+    {
+        const uint32_t K = 512u, N = 64u, nb = K / 256u;
+        uint8_t *W = malloc((size_t)N * nb * 144u);
+        float *X = malloc((size_t)M * K * 4);
+        float *ref = malloc((size_t)M * N * 4), *got = malloc((size_t)M * N * 4);
+        int rc = 1;
+        if (W && X && ref && got) {
+            for (uint32_t r = 0; r < N * nb; r++) {
+                uint8_t *blk = W + (size_t)r * 144u;
+                __fp16 d = (__fp16)0.02f, dm = (__fp16)0.05f;
+                memcpy(blk, &d, 2); memcpy(blk + 2, &dm, 2);
+                for (uint32_t i = 0; i < 12; i++) blk[4 + i] = (uint8_t)((r * 5 + i * 17) & 0x3F);
+                for (uint32_t i = 0; i < 128; i++) blk[16 + i] = (uint8_t)((r * 11 + i * 7) & 0xFF);
+            }
+            for (uint32_t i = 0; i < M * K; i++) X[i] = 0.01f * (float)((i % 53) - 26);
+            double maxmag = 1e-9;
+            for (uint32_t m = 0; m < M; m++)
+                for (uint32_t n = 0; n < N; n++) {
+                    double acc = 0;
+                    for (uint32_t b = 0; b < nb; b++)
+                        acc += ds4_q4k_block_dot(W + ((size_t)n * nb + b) * 144u, X + (size_t)m * K + b * 256);
+                    ref[m * N + n] = (float)acc;
+                    if (fabs(acc) > maxmag) maxmag = fabs(acc);
+                }
+            ds4_gpu_tensor *Wt = ds4_gpu_tensor_alloc((uint64_t)N * nb * 144u);
+            ds4_gpu_tensor *Xt = ds4_gpu_tensor_alloc((uint64_t)M * K * 4);
+            ds4_gpu_tensor *Ct = ds4_gpu_tensor_alloc((uint64_t)M * N * 4);
+            if (Wt && Xt && Ct) {
+                ds4_gpu_tensor_write(Wt, 0, W, (uint64_t)N * nb * 144u);
+                ds4_gpu_tensor_write(Xt, 0, X, (uint64_t)M * K * 4);
+                if (ds4_gpu_dense_matmul_q4k(Ct, Wt, Xt, K, N, M)) {
+                    ds4_gpu_tensor_read(Ct, 0, got, (uint64_t)M * N * 4);
+                    float me = 0;
+                    for (uint32_t i = 0; i < M * N; i++) { float e = fabsf(got[i] - ref[i]); if (e > me) me = e; }
+                    const double rel = (double)me / maxmag;
+                    if (rel < 1e-2) rc = 0;
+                    else if (errlen) snprintf(err, errlen, "q4_K matmul rel err %.4g >= 1e-2", rel);
+                }
+            }
+            ds4_gpu_tensor_free(Wt); ds4_gpu_tensor_free(Xt); ds4_gpu_tensor_free(Ct);
+        }
+        free(W); free(X); free(ref); free(got);
+        if (rc) return rc;
+        printf("dense matmul q4_K: correctness PASS (M=%u, K=512, N=64)\n", M);
+    }
+
+    /* --- micro-benchmark: realistic K=3584, N=3584; matmul(M) vs M x matvec --- */
+    {
+        const uint32_t K = 3584u, N = 3584u, nb = K / 256u;
+        uint8_t *W = malloc((size_t)N * nb * 144u);
+        float *X = malloc((size_t)M * K * 4);
+        if (W && X) {
+            for (uint32_t r = 0; r < N * nb; r++) {
+                uint8_t *blk = W + (size_t)r * 144u;
+                __fp16 d = (__fp16)0.02f, dm = (__fp16)0.05f;
+                memcpy(blk, &d, 2); memcpy(blk + 2, &dm, 2);
+                for (uint32_t i = 0; i < 12; i++) blk[4 + i] = (uint8_t)((r + i) & 0x3F);
+                for (uint32_t i = 0; i < 128; i++) blk[16 + i] = (uint8_t)((r * 3 + i) & 0xFF);
+            }
+            for (uint32_t i = 0; i < M * K; i++) X[i] = 0.01f;
+            ds4_gpu_tensor *Wt = ds4_gpu_tensor_alloc((uint64_t)N * nb * 144u);
+            ds4_gpu_tensor *Xt = ds4_gpu_tensor_alloc((uint64_t)M * K * 4);
+            ds4_gpu_tensor *Ct = ds4_gpu_tensor_alloc((uint64_t)M * N * 4);
+            ds4_gpu_tensor *xrow = ds4_gpu_tensor_alloc((uint64_t)K * 4);
+            ds4_gpu_tensor *orow = ds4_gpu_tensor_alloc((uint64_t)N * 4);
+            if (Wt && Xt && Ct && xrow && orow) {
+                ds4_gpu_tensor_write(Wt, 0, W, (uint64_t)N * nb * 144u);
+                ds4_gpu_tensor_write(Xt, 0, X, (uint64_t)M * K * 4);
+                ds4_gpu_tensor_write(xrow, 0, X, (uint64_t)K * 4);
+                /* warmup */
+                ds4_gpu_dense_matmul_q4k(Ct, Wt, Xt, K, N, M);
+                struct __attribute__((packed)) { uint32_t in_dim, out_dim; } qa = { K, N };
+                ds4_gpu_tensor *mvb[3] = { Wt, xrow, orow };
+                ds4_gpu_run_kquant_sg("kernel_dense_mul_mv_q4_K_f32_sg", &qa, sizeof(qa), mvb, N, 2u, 2u, "warm");
+                /* time matmul (M tokens, weights read once) */
+                const double t0 = ds4_gpu_now_ms();
+                ds4_gpu_dense_matmul_q4k(Ct, Wt, Xt, K, N, M);
+                const double t1 = ds4_gpu_now_ms();
+                /* time M separate matvecs (weights read M times) */
+                for (uint32_t m = 0; m < M; m++)
+                    ds4_gpu_run_kquant_sg("kernel_dense_mul_mv_q4_K_f32_sg", &qa, sizeof(qa), mvb, N, 2u, 2u, "mv");
+                const double t2 = ds4_gpu_now_ms();
+                const double mm = t1 - t0, mv = t2 - t1;
+                printf("dense matmul q4_K bench (M=%u, K=N=3584):\n", M);
+                printf("  matmul   %u tokens : %.2f ms  (%.1f tok/s)\n", M, mm, mm > 0 ? 1000.0 * M / mm : 0);
+                printf("  %u x matvec        : %.2f ms  (%.1f tok/s)\n", M, mv, mv > 0 ? 1000.0 * M / mv : 0);
+                printf("  speedup            : %.1fx\n", mm > 0 ? mv / mm : 0);
+            }
+            ds4_gpu_tensor_free(Wt); ds4_gpu_tensor_free(Xt); ds4_gpu_tensor_free(Ct);
+            ds4_gpu_tensor_free(xrow); ds4_gpu_tensor_free(orow);
+        }
+        free(W); free(X);
+    }
+    return 0;
+}
+
 int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
     if (!g_initialized && !ds4_gpu_init()) {
         if (errlen) snprintf(err, errlen, "Metal init failed (no GPU device?)");

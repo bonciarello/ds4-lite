@@ -152,6 +152,10 @@ void ds4_engine_close(ds4_engine *e);
  * backend; a CPU-only build returns an error. */
 int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen);
 
+/* Batched-prefill q4_K matmul: correctness (vs CPU) + amortization micro-benchmark.
+ * n_tok is the batch size M (default 32). Returns 0 on PASS. */
+int ds4_gpu_dense_matmul_test(int n_tok, char *err, size_t errlen);
+
 /* Fase 3.5 step 4: verify the type-dispatch dense matvec on a real weight (copies
  * the quantized weight to GPU, dispatches the kernel for its GGML type, compares
  * to the CPU dequant). type = GGML id; in_dim multiple of 256. Returns 0 on ok. */

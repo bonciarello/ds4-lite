@@ -1435,6 +1435,14 @@ static cli_config parse_options(int argc, char **argv) {
             fprintf(stderr, "dense matvec GPU selftest: FAIL (%s)\n", st_err);
             exit(1);
         }
+        if (!strcmp(arg, "--metal-dense-matmul-test")) {
+            /* Batched-prefill q4_K matmul: correctness + amortization benchmark. */
+            const int mtok = (i + 1 < argc && argv[i + 1][0] != '-') ? atoi(argv[++i]) : 32;
+            char st_err[256] = {0};
+            const int rc = ds4_gpu_dense_matmul_test(mtok, st_err, sizeof(st_err));
+            if (rc != 0) fprintf(stderr, "dense matmul test: FAIL (%s)\n", st_err);
+            exit(rc == 0 ? 0 : 1);
+        }
         if (!strcmp(arg, "--metal-dense-weight-test")) {
             /* Fase 3.5 step 4: matvec on real model weights vs CPU. Pass MODEL as arg. */
             const char *mp = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[++i] : NULL;
