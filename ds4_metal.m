@@ -3784,6 +3784,32 @@ static bool ds4_gpu_dense_matvec_f32(ds4_gpu_tensor *obuf, ds4_gpu_tensor *W,
     return ds4_gpu_matvec_run_once(p, &a, sizeof(a), W, x, obuf, out_dim, d.nr0, d.nsg, d.smem, scratch, label);
 }
 
+/* CPU reference: dot of a dequantized Q6_K block (210 bytes) with 256 floats.
+ * Canonical GGML Q6_K layout: ql[128] qh[64] scales[16](int8) d(f16). */
+static float ds4_q6k_block_dot(const uint8_t *blk, const float *xb) {
+    const uint8_t *ql = blk;
+    const uint8_t *qh = blk + 128;
+    const int8_t  *sc = (const int8_t *)(blk + 192);
+    __fp16 dh; memcpy(&dh, blk + 208, 2);
+    const float d = (float)dh;
+    float acc = 0.0f;
+    for (int n = 0; n < 256; n += 128) {
+        for (int l = 0; l < 32; l++) {
+            const int is = l / 16;
+            const int q1 = (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            const int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            const int q3 = (int)((ql[l]      >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            const int q4 = (int)((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            acc += d * (float)sc[is + 0] * (float)q1 * xb[n + l +  0];
+            acc += d * (float)sc[is + 2] * (float)q2 * xb[n + l + 32];
+            acc += d * (float)sc[is + 4] * (float)q3 * xb[n + l + 64];
+            acc += d * (float)sc[is + 6] * (float)q4 * xb[n + l + 96];
+        }
+        ql += 64; qh += 32; sc += 8;
+    }
+    return acc;
+}
+
 int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
     if (!g_initialized && !ds4_gpu_init()) {
         if (errlen) snprintf(err, errlen, "Metal init failed (no GPU device?)");
@@ -4178,6 +4204,49 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         if (!ok) { if (errlen) snprintf(err, errlen, "attention block GPU run failed"); goto free_gpu; }
         float maxerr=0.0f; for(uint32_t i=0;i<ne;i++){const float e=fabsf(agot[i]-aref[i]);if(e>maxerr)maxerr=e;}
         if (maxerr >= 1e-4f) { if (errlen) snprintf(err, errlen, "attention block max err %.6g >= 1e-4", (double)maxerr); goto free_gpu; }
+    }
+
+    /* --- Case 9: Q6_K matvec (kernel_dense_mul_mv_q6_K_f32 vs CPU dequant) --- */
+    {
+        const uint32_t in9 = 256u, out9 = 4u, nb9 = in9/256u;
+        uint8_t *Wq6 = malloc((size_t)out9 * nb9 * 210u);
+        float *x9 = malloc((size_t)in9*sizeof(float));
+        float *r9 = malloc((size_t)out9*sizeof(float));
+        float *g9 = malloc((size_t)out9*sizeof(float));
+        bool ok = Wq6 && x9 && r9 && g9;
+        if (ok) {
+            for (uint32_t i=0;i<in9;i++) x9[i] = 0.01f*(float)i - 1.2f;
+            for (uint32_t r=0;r<out9*nb9;r++) {
+                uint8_t *blk = Wq6 + (size_t)r*210u;
+                for (int i=0;i<128;i++) blk[i]      = (uint8_t)((r*7 + i*13) & 0xFF);   /* ql */
+                for (int i=0;i<64;i++)  blk[128+i]  = (uint8_t)((r*3 + i*5)  & 0xFF);   /* qh */
+                for (int i=0;i<16;i++)  ((int8_t*)(blk+192))[i] = (int8_t)((i % 8) + 1);/* scales 1..8 */
+                __fp16 dh = (__fp16)0.012f; memcpy(blk+208, &dh, 2);                    /* d */
+            }
+            for (uint32_t r=0;r<out9;r++) {
+                double acc = 0.0;
+                for (uint32_t b=0;b<nb9;b++) acc += ds4_q6k_block_dot(Wq6 + ((size_t)r*nb9+b)*210u, x9 + (size_t)b*256u);
+                r9[r] = (float)acc;
+            }
+            ds4_gpu_tensor *Wb = ds4_gpu_tensor_alloc((uint64_t)out9*nb9*210u);
+            ds4_gpu_tensor *xb9 = ds4_gpu_tensor_alloc((uint64_t)in9*sizeof(float));
+            ds4_gpu_tensor *ob9 = ds4_gpu_tensor_alloc((uint64_t)out9*sizeof(float));
+            ok = Wb && xb9 && ob9;
+            if (ok) {
+                ds4_gpu_tensor_write(Wb,0,Wq6,(uint64_t)out9*nb9*210u);
+                ds4_gpu_tensor_write(xb9,0,x9,(uint64_t)in9*sizeof(float));
+                struct __attribute__((packed)) { uint32_t in_dim, out_dim; } qa = { in9, out9 };
+                ds4_gpu_tensor *bufs[3] = { Wb, xb9, ob9 };
+                ok = ds4_gpu_run_simple("kernel_dense_mul_mv_q6_K_f32", &qa, sizeof(qa), bufs, 3, out9, "q6k matvec");
+                if (ok) ds4_gpu_tensor_read(ob9, 0, g9, (uint64_t)out9*sizeof(float));
+            }
+            ds4_gpu_tensor_free(Wb); ds4_gpu_tensor_free(xb9); ds4_gpu_tensor_free(ob9);
+        }
+        float maxerr = 0.0f;
+        if (ok) for (uint32_t r=0;r<out9;r++) { const float e = fabsf(g9[r]-r9[r]); if (e>maxerr) maxerr=e; }
+        free(Wq6); free(x9); free(r9); free(g9);
+        if (!ok) { if (errlen) snprintf(err, errlen, "q6_K GPU run failed"); goto free_gpu; }
+        if (maxerr >= 1e-2f) { if (errlen) snprintf(err, errlen, "q6_K max err %.6g >= 1e-2", (double)maxerr); goto free_gpu; }
     }
 
     rc = 0;   /* all cases passed */

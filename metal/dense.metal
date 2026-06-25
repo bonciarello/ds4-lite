@@ -1717,3 +1717,43 @@ kernel void kernel_dense_attn_decode_f32(
     const float inv = 1.0f / sum;
     for (uint d = 0; d < hd; d++) oh[d] *= inv;
 }
+
+// ---- Dense Q6_K matvec (Fase: Q6_K support) --------------------------------
+// out[row] = dot(dequant(W[row]), x). Canonical GGML Q6_K dequant inline. One
+// thread per output row (reference; optimize later). Block = 210 bytes:
+// ql[128] qh[64] scales[16](int8) d(f16). in_dim must be a multiple of 256.
+struct ds4_dense_mvq_args { uint in_dim; uint out_dim; };
+kernel void kernel_dense_mul_mv_q6_K_f32(
+        constant ds4_dense_mvq_args & a [[buffer(0)]],
+        device const char  * W   [[buffer(1)]],
+        device const float * x   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= a.out_dim) return;
+    const uint nblk = a.in_dim / 256u;
+    const uint BLK = 210u;
+    float acc = 0.0f;
+    for (uint bi = 0; bi < nblk; bi++) {
+        device const char * blk = W + (ulong)(row * nblk + bi) * BLK;
+        device const uchar * ql = (device const uchar *)(blk);
+        device const uchar * qh = (device const uchar *)(blk + 128);
+        device const char  * sc = (device const char  *)(blk + 192);
+        const float d = (float)(*(device const half *)(blk + 208));
+        device const float * xb = x + (ulong)bi * 256u;
+        for (uint n = 0; n < 256u; n += 128u) {
+            for (uint l = 0; l < 32u; ++l) {
+                const uint is = l / 16u;
+                const int q1 = (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int q3 = (int)((ql[l]      >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int q4 = (int)((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                acc += d * (float)sc[is + 0] * (float)q1 * xb[n + l +  0];
+                acc += d * (float)sc[is + 2] * (float)q2 * xb[n + l + 32];
+                acc += d * (float)sc[is + 4] * (float)q3 * xb[n + l + 64];
+                acc += d * (float)sc[is + 6] * (float)q4 * xb[n + l + 96];
+            }
+            ql += 64; qh += 32; sc += 8;
+        }
+    }
+    out[row] = acc;
+}

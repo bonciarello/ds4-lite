@@ -400,11 +400,21 @@ typedef struct {
     uint16_t qs[QK_K / 8];
 } block_iq2_xxs;
 
+/* GGML Q6_K super-block (256 values): 6-bit quants split into low 4 bits (ql)
+ * and high 2 bits (qh), 8-bit per-16 group scales, one f16 super-block scale. */
+typedef struct {
+    uint8_t  ql[QK_K / 2];     /* lower 4 bits, 128 bytes */
+    uint8_t  qh[QK_K / 4];     /* upper 2 bits, 64 bytes  */
+    int8_t   scales[QK_K / 16];/* per-group scales, 16 bytes */
+    uint16_t d;                /* f16 super-block scale */
+} block_q6_K;
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
+DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
 
 typedef struct {
     uint32_t ctx_size;
@@ -1624,6 +1634,7 @@ enum {
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
     DS4_TENSOR_Q4_K     = 12,
+    DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
 };
