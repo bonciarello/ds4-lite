@@ -109,12 +109,16 @@ Stato:
       (b) simdgroup-per-riga uniforme — più lento sui matvec a basso nblk; (c) simdgroup solo
       su alto nblk (ffn_down, 74 blocchi) — **anche più lento**. **Finding raffinato**: NON è
       parallelism-bound — 3584 righe saturano già le ALU dell'M1 Max, quindi aggiungere
-      thread/simd_sum aggiunge solo overhead. Il gap 14x è il costo del **dequant scalare
-      ingenuo** vs i dot-product quantizzati **vettorizzati** di llama.cpp. Vero lever: dequant
-      vettorizzato (float4/simd-matrix). **Via più tractable**: ds4 ha GIÀ kernel matvec
-      ottimizzati per q8_0 (`kernel_mul_mv_q8_0_f32`, validato nel selftest, molto più veloce)
-      → un **GGUF denso Q8_0 + riuso di quel kernel** sarebbe una vittoria grossa e a basso
-      rischio. Dettagli in [[ds4-lite-dense-optimizations]].
+      thread/simd_sum aggiunge solo overhead. **Analisi memory-bound (target preciso)**:
+      decode legge tutti i pesi 1 volta/token → 4.7GB/400GB·s = ~12 ms/token (floor memoria).
+      llama.cpp ≈22 ms/token (44 t/s) = **memory-bound** (ottimale, dequant nascosto dietro le
+      letture). ds4 ≈312 ms/token (3.2 t/s) = **compute-bound** sul dequant scalare → serve
+      **~27x** di speedup compute per toccare il floor. float4 sul kernel q4_K provato: corretto
+      ma **0 speedup misurabile** (la GPU Apple gestisce già bene lo scalare), revertito. Via B
+      (K-quant generale) richiede l'INTERO kernel ottimizzato llama.cpp-style (dequant vettoriale
+      + tiling con x condiviso in threadgroup memory + simdgroup-matrix), non una singola tecnica
+      → lavoro pluri-sessione dedicato. Profila con `DS4_DENSE_PROFILE=1`, valida con
+      `tests/bench_dense.sh`. Dettagli in [[ds4-lite-dense-optimizations]].
     - ⏸️ **Zero-copy weight wrap**: `ds4_gpu_wrap_model_range` restituisce un `MTLBuffer`
       grezzo, i miei helper usano `ds4_gpu_tensor` (mismatch astrazione) → più invasivo.
       Ora copia ~4.7GB su GPU (ok su 32GB unified; `ds4_gpu_set_model_map_range` mappa le view).
