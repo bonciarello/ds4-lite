@@ -185,6 +185,8 @@ typedef struct {
     float    rms_eps, rope_base;
     ds4_dense_wdesc       token_embd, output_norm, output;
     ds4_dense_layer_desc *layers;   /* [n_layer] */
+    const void         *model_base; /* mmap base (for zero-copy weight wrapping) */
+    unsigned long long  model_size; /* mmapped model size in bytes */
 } ds4_dense_model_desc;
 
 typedef struct ds4_dense_gpu ds4_dense_gpu;
@@ -198,6 +200,12 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
 /* Load a dense model and greedily generate n_predict tokens (self-contained). */
 int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict,
                        char *err, size_t errlen);
+
+/* Interactive multi-turn ChatML chat REPL for dense models. Keeps the KV cache
+ * across turns and generates until <|im_end|>/EOS (no token limit). ctx_size<=0
+ * defaults to 4096; system may be NULL. Reads stdin until "/exit" or EOF. */
+int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
+                   char *err, size_t errlen);
 
 /* 1 if the GGUF uses a supported dense architecture (qwen2/llama/...), else 0. */
 int ds4_model_is_dense(const char *path);

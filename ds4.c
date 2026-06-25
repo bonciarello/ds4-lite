@@ -25725,6 +25725,39 @@ static void dense_print_token(const ds4_vocab *vocab, int token) {
     }
 }
 
+/* Populate a dense model descriptor from an open model + bound weights. The
+ * caller owns desc->layers (xcalloc'd here; free after use). Shared by the
+ * one-shot generate path and the interactive chat REPL. */
+static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
+                             const ds4_weights *weights, uint32_t n_ctx) {
+    memset(desc, 0, sizeof(*desc));
+    desc->n_layer = DS4_N_LAYER; desc->n_embd = DS4_N_EMBD; desc->n_ff = DS4_N_FF;
+    desc->n_head = DS4_N_HEAD; desc->n_kv = DS4_N_HEAD_KV; desc->head_dim = DS4_N_HEAD_DIM;
+    desc->n_vocab = DS4_N_VOCAB; desc->n_rot = DS4_N_ROT; desc->n_ctx = n_ctx;
+    desc->rms_eps = DS4_RMS_EPS; desc->rope_base = DS4_ROPE_FREQ_BASE;
+    desc->model_base = model->map; desc->model_size = model->size;
+    desc->token_embd  = dense_wdesc_of(model, weights->token_embd);
+    desc->output_norm = dense_wdesc_of(model, weights->output_norm);
+    desc->output      = dense_wdesc_of(model, weights->output);
+    desc->layers = xcalloc(DS4_N_LAYER, sizeof(desc->layers[0]));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *lw = &weights->layer[il];
+        ds4_dense_layer_desc *L = &desc->layers[il];
+        L->attn_norm   = dense_wdesc_of(model, lw->attn_norm);
+        L->attn_q      = dense_wdesc_of(model, lw->attn_q);
+        L->attn_q_bias = dense_wdesc_of(model, lw->attn_q_bias);
+        L->attn_k      = dense_wdesc_of(model, lw->attn_k);
+        L->attn_k_bias = dense_wdesc_of(model, lw->attn_k_bias);
+        L->attn_v      = dense_wdesc_of(model, lw->attn_v);
+        L->attn_v_bias = dense_wdesc_of(model, lw->attn_v_bias);
+        L->attn_out    = dense_wdesc_of(model, lw->attn_out);
+        L->ffn_norm    = dense_wdesc_of(model, lw->ffn_norm);
+        L->ffn_gate    = dense_wdesc_of(model, lw->ffn_gate);
+        L->ffn_up      = dense_wdesc_of(model, lw->ffn_up);
+        L->ffn_down    = dense_wdesc_of(model, lw->ffn_down);
+    }
+}
+
 /* Fase 3.5 step 3-6: greedy dense generation on the GPU forward driver. Loads a
  * dense model, tokenizes the raw prompt, prefills, then greedily decodes
  * n_predict tokens. Self-contained (no session). Validate vs llama.cpp greedy. */
@@ -25749,31 +25782,8 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
 
     const uint32_t n_ctx = (uint32_t)toks.len + (uint32_t)(n_predict > 0 ? n_predict : 0) + 8u;
 
-    ds4_dense_model_desc desc = {0};
-    desc.n_layer = DS4_N_LAYER; desc.n_embd = DS4_N_EMBD; desc.n_ff = DS4_N_FF;
-    desc.n_head = DS4_N_HEAD; desc.n_kv = DS4_N_HEAD_KV; desc.head_dim = DS4_N_HEAD_DIM;
-    desc.n_vocab = DS4_N_VOCAB; desc.n_rot = DS4_N_ROT; desc.n_ctx = n_ctx;
-    desc.rms_eps = DS4_RMS_EPS; desc.rope_base = DS4_ROPE_FREQ_BASE;
-    desc.token_embd  = dense_wdesc_of(&model, weights.token_embd);
-    desc.output_norm = dense_wdesc_of(&model, weights.output_norm);
-    desc.output      = dense_wdesc_of(&model, weights.output);
-    desc.layers = xcalloc(DS4_N_LAYER, sizeof(desc.layers[0]));
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_layer_weights *lw = &weights.layer[il];
-        ds4_dense_layer_desc *L = &desc.layers[il];
-        L->attn_norm   = dense_wdesc_of(&model, lw->attn_norm);
-        L->attn_q      = dense_wdesc_of(&model, lw->attn_q);
-        L->attn_q_bias = dense_wdesc_of(&model, lw->attn_q_bias);
-        L->attn_k      = dense_wdesc_of(&model, lw->attn_k);
-        L->attn_k_bias = dense_wdesc_of(&model, lw->attn_k_bias);
-        L->attn_v      = dense_wdesc_of(&model, lw->attn_v);
-        L->attn_v_bias = dense_wdesc_of(&model, lw->attn_v_bias);
-        L->attn_out    = dense_wdesc_of(&model, lw->attn_out);
-        L->ffn_norm    = dense_wdesc_of(&model, lw->ffn_norm);
-        L->ffn_gate    = dense_wdesc_of(&model, lw->ffn_gate);
-        L->ffn_up      = dense_wdesc_of(&model, lw->ffn_up);
-        L->ffn_down    = dense_wdesc_of(&model, lw->ffn_down);
-    }
+    ds4_dense_model_desc desc;
+    dense_build_desc(&desc, &model, &weights, n_ctx);
 
     ds4_dense_gpu *g = ds4_dense_gpu_create(&desc);
     if (!g) { if (errlen) snprintf(err, errlen, "dense GPU create failed"); free(desc.layers); token_vec_free(&toks); vocab_free(&vocab); model_close(&model); return 1; }
@@ -25834,6 +25844,281 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
     vocab_free(&vocab);
     model_close(&model);
     if (rc && errlen) snprintf(err, errlen, "dense forward failed");
+    return rc;
+}
+
+/* Decode a token to its raw bytes (like dense_print_token but into `out`).
+ * Returns the number of bytes written. */
+static int dense_token_bytes(const ds4_vocab *vocab, int token, char *out, size_t cap) {
+    if (token < 0 || token >= vocab->n_vocab) return 0;
+    ds4_str s = vocab->token[token];
+    uint64_t p = 0;
+    size_t n = 0;
+    while (p < s.len && n < cap) {
+        uint32_t cp = utf8_decode_one(s.ptr, s.len, &p);
+        const int b = gpt2_codepoint_to_byte(cp);
+        if (b >= 0) out[n++] = (char)b;
+    }
+    return (int)n;
+}
+
+/* Append `n` bytes to a growable char buffer (NUL-terminated). */
+static void dense_sbuf_append(char **buf, size_t *len, size_t *cap, const char *data, size_t n) {
+    if (*len + n + 1 > *cap) {
+        size_t nc = *cap ? *cap * 2 : 256;
+        while (nc < *len + n + 1) nc *= 2;
+        *buf = xrealloc(*buf, nc);
+        *cap = nc;
+    }
+    memcpy(*buf + *len, data, n);
+    *len += n;
+    (*buf)[*len] = '\0';
+}
+
+/* Append a ChatML "<|im_start|>{role}\n{content}<|im_end|>\n" block to `t`. */
+static void dense_chat_append_block(token_vec *t, const ds4_vocab *vocab,
+                                    int im_start, int im_end,
+                                    const char *role, const char *content) {
+    token_vec_push(t, im_start);
+    const size_t rl = strlen(role), cl = content ? strlen(content) : 0;
+    char *buf = xmalloc(rl + cl + 2);
+    memcpy(buf, role, rl); buf[rl] = '\n';
+    if (cl) memcpy(buf + rl + 1, content, cl);
+    buf[rl + 1 + cl] = '\0';
+    bpe_tokenize_text(vocab, buf, t);
+    free(buf);
+    token_vec_push(t, im_end);
+    bpe_tokenize_text(vocab, "\n", t);
+}
+
+/* Interactive multi-turn chat REPL for dense (Qwen2-style ChatML) models. Keeps
+ * the KV cache across turns (only the new tokens of each turn are prefilled) and
+ * generates until <|im_end|>/EOS — no fixed token limit. Reads user lines from
+ * stdin; "/exit" or EOF (Ctrl-D) quits; the context is fixed at create time. */
+int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
+                   char *err, size_t errlen) {
+    ds4_model model;
+    ds4_vocab vocab;
+    ds4_weights weights;
+    model_open(&model, model_path, false, true);
+    config_validate_model(&model);
+    if (ds4_arch_is_deepseek()) {
+        if (errlen) snprintf(err, errlen, "not a dense model");
+        model_close(&model);
+        return 1;
+    }
+    vocab_load(&vocab, &model);
+    weights_bind(&weights, &model, false, 0, 0, true, false);
+
+    const int im_start = vocab.user_id;      /* <|im_start|> */
+    const int im_end   = vocab.assistant_id; /* <|im_end|>   */
+    if (im_start < 0 || im_end < 0) {
+        if (errlen) snprintf(err, errlen, "model has no ChatML tokens (not a chat model?)");
+        vocab_free(&vocab); model_close(&model);
+        return 1;
+    }
+
+    const uint32_t n_ctx = ctx_size > 0 ? (uint32_t)ctx_size : 4096u;
+    ds4_dense_model_desc desc;
+    dense_build_desc(&desc, &model, &weights, n_ctx);
+
+    ds4_dense_gpu *g = ds4_dense_gpu_create(&desc);
+    if (!g) {
+        if (errlen) snprintf(err, errlen, "dense GPU create failed");
+        free(desc.layers); vocab_free(&vocab); model_close(&model);
+        return 1;
+    }
+
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    const char *sys = (system && system[0]) ? system : "You are a helpful assistant.";
+    /* Reflection directive, injected into the user message ONLY on /think turns so
+     * non-think turns answer directly (a system-wide instruction would make the
+     * model reflect even when off). */
+    static const char *think_directive =
+        "\n\n(Reason step by step inside <think> and </think> — you may think in any "
+        "language, keep it brief. Then, immediately after </think>, write a clear, "
+        "complete final answer in the SAME language as this message.)";
+
+    uint32_t pos = 0;
+    int rc = 0;
+    bool first = true;
+    const bool think = true;   /* reflection is always on for dense models */
+
+    printf("ds4 dense chat (ChatML, reflection always on). ctx=%u tokens.\n"
+           "Commands: /help  /exit (Ctrl-D).\n", n_ctx);
+    fflush(stdout);
+
+    char *line = NULL;
+    size_t cap = 0;
+    while (rc == 0) {
+        printf("\n\033[1m>\033[0m ");
+        fflush(stdout);
+        ssize_t nr = getline(&line, &cap, stdin);
+        if (nr < 0) { printf("\n"); break; }            /* EOF / Ctrl-D */
+        while (nr > 0 && (line[nr - 1] == '\n' || line[nr - 1] == '\r')) line[--nr] = '\0';
+        if (nr == 0) continue;
+        if (!strcmp(line, "/exit") || !strcmp(line, "/quit")) break;
+        if (!strcmp(line, "/help")) {
+            printf("  reflection is always on: the model reasons inside <think>...</think>\n"
+                   "  (shown dimmed), then gives the final answer.\n"
+                   "  /help   show this\n"
+                   "  /exit   quit\n");
+            continue;
+        }
+
+        const bool think_turn = think;
+
+        /* system block (first turn only) stays permanently in history */
+        if (first) {
+            token_vec st = {0};
+            dense_chat_append_block(&st, &vocab, im_start, im_end, "system", sys);
+            for (uint32_t i = 0; i < (uint32_t)st.len && rc == 0; i++)
+                if (ds4_dense_gpu_forward(g, &desc, st.v[i], pos++, logits) != 0) rc = 1;
+            token_vec_free(&st);
+            first = false;
+            if (rc) break;
+        }
+
+        /* Start of this turn's user block. A /think turn rewinds here afterwards to
+         * re-feed a CLEAN turn (user without the reflection directive + the final
+         * answer without the <think> reasoning), so later turns don't imitate the
+         * reasoning and the context isn't bloated. */
+        const uint32_t pos_user_start = pos;
+
+        token_vec t = {0};
+        if (think_turn) {
+            /* user message + reflection directive (this turn only) */
+            char *um = xmalloc((size_t)nr + strlen(think_directive) + 1);
+            memcpy(um, line, (size_t)nr);
+            strcpy(um + nr, think_directive);
+            dense_chat_append_block(&t, &vocab, im_start, im_end, "user", um);
+            free(um);
+        } else {
+            dense_chat_append_block(&t, &vocab, im_start, im_end, "user", line);
+        }
+        token_vec_push(&t, im_start);
+        bpe_tokenize_text(&vocab, "assistant\n", &t);
+
+        if (pos + (uint32_t)t.len + 8u >= n_ctx) {
+            printf("[context full — start a new session to continue]\n");
+            token_vec_free(&t);
+            break;
+        }
+
+        /* prefill this turn's new tokens (KV from prior turns is reused) */
+        for (uint32_t i = 0; i < (uint32_t)t.len && rc == 0; i++)
+            if (ds4_dense_gpu_forward(g, &desc, t.v[i], pos++, logits) != 0) rc = 1;
+        token_vec_free(&t);
+        if (rc) break;
+
+        /* reflection: prime "<think>\n" so the model opens its reasoning */
+        if (think_turn) {
+            token_vec th = {0};
+            bpe_tokenize_text(&vocab, "<think>\n", &th);
+            for (uint32_t i = 0; i < (uint32_t)th.len && pos < n_ctx - 1u && rc == 0; i++)
+                if (ds4_dense_gpu_forward(g, &desc, th.v[i], pos++, logits) != 0) rc = 1;
+            token_vec_free(&th);
+            if (rc) break;
+        }
+
+        /* Generate until <|im_end|>/EOS or context full (no token limit). A byte
+         * filter holds back the most recent bytes so the "<think>"/"</think>"
+         * markers can be detected and SUPPRESSED from the output: the reasoning
+         * prints dimmed, the marker is dropped, then the final answer prints
+         * normally. The answer text (after "</think>") is accumulated so the turn
+         * can be re-fed clean (reasoning stripped from history). */
+        bool in_think = think_turn;
+        bool answer_started = false;   /* skip leading whitespace of the final answer */
+        char pend[16];
+        int pend_len = 0;
+        char *ans = NULL;
+        size_t ans_len = 0, ans_cap = 0;
+        if (think_turn) { printf("\033[2m\xf0\x9f\x92\xad "); fflush(stdout); }  /* dim + 💭 */
+        while (pos < n_ctx - 1u) {
+            const int next = sample_argmax(logits, DS4_N_VOCAB);
+            if (next == im_end || next == vocab.eos_id) break;   /* closed below */
+            char tb[96];
+            const int tn = dense_token_bytes(&vocab, next, tb, sizeof(tb));
+            for (int k = 0; k < tn; k++) {
+                if (pend_len < (int)sizeof(pend)) pend[pend_len++] = tb[k];
+                if (pend_len >= 8 && memcmp(pend + pend_len - 8, "</think>", 8) == 0) {
+                    const int pre = pend_len - 8;                 /* flush text before marker */
+                    if (pre > 0) { fwrite(pend, 1, (size_t)pre, stdout);
+                                   if (!in_think) dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); }
+                    pend_len = 0;
+                    if (in_think) { printf("\033[0m\n"); in_think = false; }   /* drop marker, exit dim */
+                } else if (pend_len >= 7 && memcmp(pend + pend_len - 7, "<think>", 7) == 0) {
+                    const int pre = pend_len - 7;
+                    if (pre > 0) { fwrite(pend, 1, (size_t)pre, stdout);
+                                   if (!in_think) dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); }
+                    pend_len = 0;
+                    if (!in_think) { printf("\033[2m"); in_think = true; }     /* drop marker, enter dim */
+                } else if (pend_len > 7) {                        /* keep <=7 bytes held back */
+                    const char b = pend[0];
+                    if (in_think) {
+                        fwrite(&b, 1, 1, stdout);                  /* reasoning, dim */
+                    } else {
+                        dense_sbuf_append(&ans, &ans_len, &ans_cap, &b, 1);  /* capture full answer */
+                        if (answer_started || (b != ' ' && b != '\n' && b != '\r' && b != '\t')) {
+                            answer_started = true; fwrite(&b, 1, 1, stdout);  /* skip leading ws */
+                        }
+                    }
+                    memmove(pend, pend + 1, (size_t)(--pend_len));
+                }
+            }
+            fflush(stdout);
+            if (ds4_dense_gpu_forward(g, &desc, next, pos++, logits) != 0) { rc = 1; break; }
+        }
+        if (pend_len > 0) {                                       /* flush whatever is left */
+            if (in_think) {
+                fwrite(pend, 1, (size_t)pend_len, stdout);
+            } else {
+                dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pend_len);
+                int s = 0;
+                if (!answer_started)
+                    while (s < pend_len && (pend[s]==' '||pend[s]=='\n'||pend[s]=='\r'||pend[s]=='\t')) s++;
+                if (pend_len - s > 0) { answer_started = true; fwrite(pend + s, 1, (size_t)(pend_len - s), stdout); }
+            }
+        }
+        if (in_think) printf("\033[0m");   /* never closed: restore color */
+
+        /* Trim leading whitespace from the captured answer text. */
+        const char *ans_trim = ans ? ans : "";
+        while (*ans_trim == ' ' || *ans_trim == '\n' || *ans_trim == '\r' || *ans_trim == '\t') ans_trim++;
+
+        /* Close the turn in the KV. For a reflection turn that closed </think> with
+         * a non-empty answer, STRIP the reasoning: rewind to the turn start and
+         * re-feed a CLEAN turn (user without the directive + the answer without the
+         * <think> reasoning), so later turns don't imitate the reasoning and the
+         * context isn't bloated. Otherwise keep the response as generated. */
+        if (rc == 0) {
+            const bool strip = think_turn && !in_think && ans_trim[0] != '\0';
+            token_vec close = {0};
+            if (strip) {
+                pos = pos_user_start;
+                dense_chat_append_block(&close, &vocab, im_start, im_end, "user", line);
+                token_vec_push(&close, im_start);
+                bpe_tokenize_text(&vocab, "assistant\n", &close);
+                bpe_tokenize_text(&vocab, ans_trim, &close);
+            }
+            token_vec_push(&close, im_end);
+            bpe_tokenize_text(&vocab, "\n", &close);   /* ...<|im_end|>\n */
+            for (uint32_t i = 0; i < (uint32_t)close.len && pos < n_ctx - 1u; i++)
+                if (ds4_dense_gpu_forward(g, &desc, close.v[i], pos++, logits) != 0) { rc = 1; break; }
+            token_vec_free(&close);
+        }
+        free(ans);
+        printf("\n");
+        fflush(stdout);
+    }
+
+    free(line);
+    free(logits);
+    ds4_dense_gpu_free(g);
+    free(desc.layers);
+    vocab_free(&vocab);
+    model_close(&model);
+    if (rc && errlen) snprintf(err, errlen, "dense chat forward failed");
     return rc;
 }
 

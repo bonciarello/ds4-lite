@@ -46,6 +46,10 @@ static id<MTLCommandQueue> g_queue;
 static id<MTLLibrary> g_library;
 static id<MTLCommandBuffer> g_batch_cb;
 static id<MTLComputeCommandEncoder> g_batch_enc;
+/* When set, dispatches sharing the batch encoder are serialized with a
+ * buffer-scope memory barrier between them (dense forward chains data-dependent
+ * ops in one command buffer). Scoped to the dense path; off for DeepSeek. */
+static bool g_batch_serialize;
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
 static id<MTLSharedEvent> g_selected_readback_event;
 static uint64_t g_selected_readback_event_value;
@@ -703,6 +707,26 @@ static NSUInteger ds4_gpu_tensor_offset(const ds4_gpu_tensor *tensor) {
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void);
 static void ds4_gpu_stream_expert_cache_note_owned_created(void);
 
+/* Wrap an external (e.g. zero-copy mmap-backed) MTLBuffer at [offset,offset+bytes)
+ * as a non-owning ds4_gpu_tensor. The underlying buffer must outlive the tensor;
+ * freeing the tensor drops only the wrapper, not the buffer. Mirrors
+ * ds4_gpu_tensor_view but takes a raw buffer. */
+static ds4_gpu_tensor *ds4_gpu_tensor_wrap_buffer(id<MTLBuffer> buf, uint64_t offset, uint64_t bytes) {
+    if (!buf) return NULL;
+    @autoreleasepool {
+        DS4MetalTensor *view = [DS4MetalTensor new];
+        view.buffer = buf;
+        view.offset = offset;
+        view.bytes = bytes;
+        view.owner = 0;
+        pthread_mutex_lock(&g_tensor_mu);
+        const int tracked = ds4_gpu_tensor_track_view_locked((__bridge const void *)view);
+        pthread_mutex_unlock(&g_tensor_mu);
+        if (!tracked) { view.buffer = nil; return NULL; }
+        return (__bridge_retained ds4_gpu_tensor *)view;
+    }
+}
+
 static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
     if (g_batch_cb) {
         *owned = 0;
@@ -724,7 +748,11 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
 
 static void ds4_gpu_end_compute_encoder(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc) {
     if (!enc) return;
-    if (g_batch_cb && cb == g_batch_cb && enc == g_batch_enc) return;
+    if (g_batch_cb && cb == g_batch_cb && enc == g_batch_enc) {
+        if (g_batch_serialize)  /* order the next data-dependent dispatch */
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        return;
+    }
     [enc endEncoding];
 }
 
@@ -3771,6 +3799,64 @@ static bool ds4_gpu_run_simple(const char *kernel, const void *args, size_t args
     return ds4_gpu_finish_command_buffer(cb, owned, label);
 }
 
+/* Dispatch an optimized simdgroup K-quant matvec kernel (q4_K/q6_K _sg).
+ * Each threadgroup runs `nsg` simdgroups of 32 lanes; each simdgroup computes
+ * `nr0` output rows cooperatively (simd_sum reduction). args = {in_dim,out_dim};
+ * bufs = {W, x, out}. Grid: ceil(out_dim/(nsg*nr0)) threadgroups of (32,nsg). */
+static bool ds4_gpu_run_kquant_sg(const char *kernel, const void *args, size_t args_len,
+                                  ds4_gpu_tensor * const *bufs, uint32_t out_dim,
+                                  uint32_t nr0, uint32_t nsg, const char *label) {
+    id<MTLComputePipelineState> p = ds4_gpu_get_pipeline(kernel);
+    if (!p) return false;
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return false;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:p];
+    [enc setBytes:args length:args_len atIndex:0];
+    for (int i = 0; i < 3; i++)
+        [enc setBuffer:ds4_gpu_tensor_buffer(bufs[i]) offset:ds4_gpu_tensor_offset(bufs[i]) atIndex:(NSUInteger)(i + 1)];
+    const uint32_t rows_per_tg = nr0 * nsg;
+    [enc dispatchThreadgroups:MTLSizeMake((out_dim + rows_per_tg - 1u) / rows_per_tg, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, label);
+}
+
+/* Generic dispatch: arg struct at buffer(0), then `nbuf` tensors at buffer(1..).
+ * Caller chooses the grid and threadgroup size. Honors the batch command buffer
+ * (no commit/wait when batching). */
+static bool ds4_gpu_run_grid(const char *kernel, const void *args, size_t args_len,
+                             ds4_gpu_tensor * const *bufs, int nbuf,
+                             MTLSize grid, MTLSize tpg, const char *label) {
+    id<MTLComputePipelineState> p = ds4_gpu_get_pipeline(kernel);
+    if (!p) return false;
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return false;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:p];
+    [enc setBytes:args length:args_len atIndex:0];
+    for (int i = 0; i < nbuf; i++)
+        [enc setBuffer:ds4_gpu_tensor_buffer(bufs[i]) offset:ds4_gpu_tensor_offset(bufs[i]) atIndex:(NSUInteger)(i + 1)];
+    [enc dispatchThreadgroups:grid threadsPerThreadgroup:tpg];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, label);
+}
+
+/* Name of the optimized simdgroup K-quant kernel for a weight type, or NULL.
+ * Also reports nr0 (output rows per simdgroup); nsg is 2 for all of them. */
+static const char *dense_kquant_sg_kernel(int type, uint32_t *nr0) {
+    switch (type) {
+        case 10: if (nr0) *nr0 = 4; return "kernel_dense_mul_mv_q2_K_f32_sg";
+        case 11: if (nr0) *nr0 = 2; return "kernel_dense_mul_mv_q3_K_f32_sg";
+        case 12: if (nr0) *nr0 = 2; return "kernel_dense_mul_mv_q4_K_f32_sg";
+        case 13: if (nr0) *nr0 = 1; return "kernel_dense_mul_mv_q5_K_f32_sg";
+        case 14: if (nr0) *nr0 = 2; return "kernel_dense_mul_mv_q6_K_f32_sg";
+        default: return NULL;
+    }
+}
+
 /* Run an F32 dense matvec out[out_dim] = W[out_dim,in_dim] . x[in_dim] on GPU.
  * Leaves the result in obuf; `scratch` receives a host copy (out_dim floats). */
 static bool ds4_gpu_dense_matvec_f32(ds4_gpu_tensor *obuf, ds4_gpu_tensor *W,
@@ -3943,7 +4029,12 @@ int ds4_gpu_dense_matvec_verify(int type, const void *wbytes, uint64_t wnbytes,
         ds4_gpu_tensor_write(xb, 0, x, (uint64_t)in_dim * 4);
         struct __attribute__((packed)) { uint32_t in_dim, out_dim; } qa = { in_dim, out_dim };
         ds4_gpu_tensor *bufs[3] = { Wb, xb, ob };
-        if (ds4_gpu_run_simple(kernel, &qa, sizeof(qa), bufs, 3, out_dim, "weight matvec")) {
+        uint32_t sg_nr0 = 2;
+        const char *sg = getenv("DS4_DENSE_SG") ? dense_kquant_sg_kernel(type, &sg_nr0) : NULL;
+        bool ran = sg
+            ? ds4_gpu_run_kquant_sg(sg, &qa, sizeof(qa), bufs, out_dim, sg_nr0, 2u, "weight matvec sg")
+            : ds4_gpu_run_simple(kernel, &qa, sizeof(qa), bufs, 3, out_dim, "weight matvec");
+        if (ran) {
             ds4_gpu_tensor_read(ob, 0, got, (uint64_t)out_dim * 4);
             const uint8_t *wb = (const uint8_t *)wbytes;
             float maxerr = 0.0f, maxmag = 1.0f;
@@ -3994,15 +4085,31 @@ struct ds4_dense_gpu {
     bool   profile;                  /* DS4_DENSE_PROFILE: per-phase timing */
     double t_attn, t_ffn, t_out;     /* accumulated ms per phase */
     uint64_t n_fwd;
+    const void *model_base;          /* mmap base for zero-copy weights */
+    uint64_t    model_size;
+    bool   zerocopy;                 /* wrap mmap weights instead of copying */
 };
 
 static ds4_gpu_tensor *dense_cached_weight(ds4_dense_gpu *g, const void *data, uint64_t bytes) {
     NSNumber *key = @((unsigned long long)(uintptr_t)data);
     NSValue *v = g->wcache[key];
     if (v) return (ds4_gpu_tensor *)[v pointerValue];
-    ds4_gpu_tensor *buf = ds4_gpu_tensor_alloc(bytes);
+    ds4_gpu_tensor *buf = NULL;
+    if (g->zerocopy) {
+        /* Wrap the mmap-backed weight directly — no 4.7GB GPU copy. */
+        const uint64_t offset = (uint64_t)((const char *)data - (const char *)g->model_base);
+        uint64_t inner = 0;
+        id<MTLBuffer> wb = ds4_gpu_wrap_model_range(g->model_base, g->model_size, offset, bytes, &inner);
+        if (wb) buf = ds4_gpu_tensor_wrap_buffer(wb, inner, bytes);
+        if (!buf) {  /* fall back to a copy for this weight */
+            buf = ds4_gpu_tensor_alloc(bytes);
+            if (buf) ds4_gpu_tensor_write(buf, 0, data, bytes);
+        }
+    } else {
+        buf = ds4_gpu_tensor_alloc(bytes);
+        if (buf) ds4_gpu_tensor_write(buf, 0, data, bytes);
+    }
     if (!buf) return NULL;
-    ds4_gpu_tensor_write(buf, 0, data, bytes);
     g->wcache[key] = [NSValue valueWithPointer:buf];
     return buf;
 }
@@ -4022,12 +4129,15 @@ static bool dense_matvec(ds4_dense_gpu *g, const ds4_dense_wdesc *W, ds4_gpu_ten
     ds4_gpu_tensor *Wb = dense_cached_weight(g, W->data, W->bytes);
     if (!Wb) return false;
     const uint32_t in_dim = W->dim0, out_dim = W->dim1;
+    struct __attribute__((packed)) { uint32_t in_dim, out_dim; } qa = { in_dim, out_dim };
+    ds4_gpu_tensor *bufs[3] = { Wb, x, out };
+    uint32_t sg_nr0 = 2;
+    const char *sg = dense_kquant_sg_kernel(W->type, &sg_nr0);
+    if (sg)  /* optimized simdgroup K-quant matvec */
+        return ds4_gpu_run_kquant_sg(sg, &qa, sizeof(qa), bufs, out_dim, sg_nr0, 2u, "fwd matvec sg");
     const char *kernel = dense_kquant_kernel(W->type);
-    if (kernel) {
-        struct __attribute__((packed)) { uint32_t in_dim, out_dim; } qa = { in_dim, out_dim };
-        ds4_gpu_tensor *bufs[3] = { Wb, x, out };
+    if (kernel)
         return ds4_gpu_run_simple(kernel, &qa, sizeof(qa), bufs, 3, out_dim, "fwd matvec");
-    }
     if (W->type == 0)  /* f32 weight */
         return ds4_gpu_dense_matvec_f32(out, Wb, x, in_dim, out_dim, g->hostscratch, "fwd matvec f32");
     return false;
@@ -4038,7 +4148,10 @@ static bool dense_rms(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *x, 
     if (!wb) return false;
     struct __attribute__((packed)) { uint32_t n; float eps; } a = { n, eps };
     ds4_gpu_tensor *bufs[3] = { x, wb, out };
-    return ds4_gpu_run_simple("kernel_dense_rms_norm_f32", &a, sizeof(a), bufs, 3, 1u, "fwd rms");
+    if (getenv("DS4_RMS_SCALAR"))
+        return ds4_gpu_run_simple("kernel_dense_rms_norm_f32", &a, sizeof(a), bufs, 3, 1u, "fwd rms");
+    return ds4_gpu_run_grid("kernel_dense_rms_norm_f32_sg", &a, sizeof(a), bufs, 3,
+                            MTLSizeMake(1, 1, 1), MTLSizeMake(128, 1, 1), "fwd rms sg");
 }
 
 static bool dense_add_bias(ds4_dense_gpu *g, ds4_gpu_tensor *buf, const ds4_dense_wdesc *bias, uint32_t n) {
@@ -4069,7 +4182,23 @@ static bool dense_attn(ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_tensor *k
                        uint32_t nh, uint32_t nkv, uint32_t hd, uint32_t nctx, float scale) {
     struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; } a = { nh, nkv, hd, nctx, scale };
     ds4_gpu_tensor *bufs[4] = { q, kc, vc, out };
-    return ds4_gpu_run_simple("kernel_dense_attn_decode_f32", &a, sizeof(a), bufs, 4, nh, "fwd attn");
+    if (getenv("DS4_ATTN_SCALAR"))  /* A/B fallback to the old 28-thread kernel */
+        return ds4_gpu_run_simple("kernel_dense_attn_decode_f32", &a, sizeof(a), bufs, 4, nh, "fwd attn");
+    /* Optimized: one simdgroup (32 lanes) per query head, online softmax.
+     * Dispatch n_head threadgroups of 32 threads. */
+    id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dense_attn_decode_f32_sg");
+    if (!p) return false;
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return false;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:p];
+    [enc setBytes:&a length:sizeof(a) atIndex:0];
+    for (int i = 0; i < 4; i++)
+        [enc setBuffer:ds4_gpu_tensor_buffer(bufs[i]) offset:ds4_gpu_tensor_offset(bufs[i]) atIndex:(NSUInteger)(i + 1)];
+    [enc dispatchThreadgroups:MTLSizeMake(nh, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "fwd attn sg");
 }
 
 ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
@@ -4081,6 +4210,25 @@ ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
     g->n_vocab = d->n_vocab; g->n_ctx = d->n_ctx;
     g->wcache = [NSMutableDictionary dictionary];
     g->profile = getenv("DS4_DENSE_PROFILE") != NULL;
+    g->model_base = d->model_base; g->model_size = d->model_size;
+    if (!getenv("DS4_DENSE_NO_ZEROCOPY") && d->model_base && d->model_size) {
+        /* Map the whole model as overlapping shared buffers; overlap is sized to
+         * the largest weight so no single tensor straddles a view boundary. */
+        uint64_t maxw = 0;
+        for (uint32_t il = 0; il < d->n_layer; il++) {
+            const ds4_dense_layer_desc *L = &d->layers[il];
+            const ds4_dense_wdesc ws[] = { L->attn_q, L->attn_k, L->attn_v, L->attn_out,
+                                           L->ffn_gate, L->ffn_up, L->ffn_down };
+            for (size_t j = 0; j < sizeof(ws)/sizeof(ws[0]); j++)
+                if (ws[j].bytes > maxw) maxw = ws[j].bytes;
+        }
+        if (d->token_embd.bytes > maxw) maxw = d->token_embd.bytes;
+        if (d->output.bytes > maxw) maxw = d->output.bytes;
+        if (ds4_gpu_set_model_map_range(d->model_base, d->model_size, 0, d->model_size, maxw))
+            g->zerocopy = true;
+        else
+            fprintf(stderr, "ds4: dense zero-copy map failed; using weight copies\n");
+    }
     g->embedscratch = malloc((size_t)d->n_embd * sizeof(float));
     g->hostscratch = malloc((size_t)d->n_vocab * sizeof(float));
     g->x=ds4_gpu_tensor_alloc((uint64_t)g->n_embd*4); g->h=ds4_gpu_tensor_alloc((uint64_t)g->n_embd*4);
@@ -4135,10 +4283,17 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
         for (uint32_t b = 0; b < nblk; b++) ds4_q4k_dequant_block(row + (size_t)b*144u, g->embedscratch + b*256);
         ds4_gpu_tensor_write(g->x, 0, g->embedscratch, (uint64_t)ne*4);
 
-        /* Each kernel commits + waits on its own command buffer (ds4_gpu_run_simple).
-         * This is compute-bound on the reference 1-thread/row kernels, so command
-         * batching does not help; kernel-level optimization (simdgroup-cooperative
-         * matvec) is the lever. The ok-flag keeps the data dependencies explicit. */
+        /* With the simdgroup matvec/attention kernels the per-op compute is small,
+         * so the per-dispatch commit+wait round-trips dominate. Batch the whole
+         * token forward into ONE command buffer (a single commit+wait), serializing
+         * the data-dependent dispatches with buffer barriers (g_batch_serialize).
+         * The synchronous per-op path is kept for profiling (per-phase now_ms only
+         * means anything when each op waits) and for DS4_DENSE_NOBATCH A/B. */
+        const bool use_batch = !g->profile && !getenv("DS4_DENSE_NOBATCH");
+        if (use_batch) {
+            g_batch_serialize = true;
+            if (!ds4_gpu_begin_commands()) { g_batch_serialize = false; return 1; }
+        }
         bool ok = true;
         for (uint32_t il = 0; ok && il < d->n_layer; il++) {
             const ds4_dense_layer_desc *L = &d->layers[il];
@@ -4177,6 +4332,11 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
                 && dense_matvec(g, &d->output, g->h, g->logits);
         const double to1 = g->profile ? ds4_gpu_now_ms() : 0.0;
         if (g->profile) { g->t_out += to1 - to0; g->n_fwd++; }
+        if (use_batch) {
+            const int ended = ds4_gpu_end_commands();   /* commit + wait once */
+            g_batch_serialize = false;
+            if (!ended) return 1;
+        }
         if (!ok) return 1;
         ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)d->n_vocab*4);
         return 0;
@@ -4739,6 +4899,62 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         free(Wq2);free(x13);free(r13);free(g13);
         if(!ok){ if(errlen)snprintf(err,errlen,"q2_K GPU run failed"); goto free_gpu; }
         if(maxerr>=1e-2f){ if(errlen)snprintf(err,errlen,"q2_K max err %.6g >= 1e-2",(double)maxerr); goto free_gpu; }
+    }
+
+    /* --- Case 14: K-quant SIMDGROUP kernels (q2/q3/q4/q5/q6 _sg vs CPU dequant) ---
+     * Validates the optimized simdgroup matvec kernels (used by the dense forward)
+     * on synthetic random blocks. in_dim=512 (2 blocks) exercises the ib stride;
+     * out_dim=8 exercises multiple rows/simdgroups. */
+    {
+        struct { int type; uint32_t blk; float (*dot)(const uint8_t*, const float*);
+                 int doff0, doff1; } K[5] = {
+            { 10, 84u,  ds4_q2k_block_dot, 80, 82 },
+            { 11, 110u, ds4_q3k_block_dot, 108, -1 },
+            { 12, 144u, ds4_q4k_block_dot, 0, 2 },
+            { 13, 176u, ds4_q5k_block_dot, 0, 2 },
+            { 14, 210u, ds4_q6k_block_dot, 208, -1 },
+        };
+        const uint32_t in14 = 512u, out14 = 8u, nb14 = in14/256u;
+        float *x14 = malloc((size_t)in14*4), *r14 = malloc((size_t)out14*4), *g14 = malloc((size_t)out14*4);
+        bool ok = x14 && r14 && g14;
+        for (uint32_t i=0; i<in14 && ok; i++) x14[i] = 0.011f*(float)(i%37) - 0.2f;
+        for (int t=0; t<5 && ok; t++) {
+            const uint32_t bb = K[t].blk;
+            uint8_t *W = malloc((size_t)out14*nb14*bb);
+            ds4_gpu_tensor *Wb = ds4_gpu_tensor_alloc((uint64_t)out14*nb14*bb);
+            ds4_gpu_tensor *xb = ds4_gpu_tensor_alloc((uint64_t)in14*4);
+            ds4_gpu_tensor *ob = ds4_gpu_tensor_alloc((uint64_t)out14*4);
+            ok = W && Wb && xb && ob;
+            if (ok) {
+                for (uint32_t r=0; r<out14*nb14; r++) {
+                    uint8_t *blk = W + (size_t)r*bb;
+                    for (uint32_t i=0; i<bb; i++) blk[i] = (uint8_t)((r*131u + i*73u + 17u) & 0xFF);
+                    __fp16 d0=(__fp16)0.03f, d1=(__fp16)0.05f;
+                    memcpy(blk + K[t].doff0, &d0, 2);
+                    if (K[t].doff1 >= 0) memcpy(blk + K[t].doff1, &d1, 2);
+                    if (K[t].type==14) for (int i=0;i<16;i++) ((int8_t*)(blk+192))[i] = (int8_t)(((int)(r+i)%17)-8);
+                }
+                double maxmag = 1e-9;
+                for (uint32_t r=0; r<out14; r++) {
+                    double acc=0; for (uint32_t b=0;b<nb14;b++) acc += K[t].dot(W+((size_t)r*nb14+b)*bb, x14+(size_t)b*256);
+                    r14[r]=(float)acc; if (fabs(acc)>maxmag) maxmag=fabs(acc);
+                }
+                ds4_gpu_tensor_write(Wb,0,W,(uint64_t)out14*nb14*bb);
+                ds4_gpu_tensor_write(xb,0,x14,(uint64_t)in14*4);
+                struct __attribute__((packed)){ uint32_t in_dim, out_dim; } qa = { in14, out14 };
+                ds4_gpu_tensor *bufs[3] = { Wb, xb, ob };
+                uint32_t nr0=2; const char *sg = dense_kquant_sg_kernel(K[t].type, &nr0);
+                ok = sg && ds4_gpu_run_kquant_sg(sg, &qa, sizeof(qa), bufs, out14, nr0, 2u, "sg selftest");
+                if (ok) {
+                    ds4_gpu_tensor_read(ob, 0, g14, (uint64_t)out14*4);
+                    float me=0; for (uint32_t r=0;r<out14;r++){ float e=fabsf(g14[r]-r14[r]); if(e>me)me=e; }
+                    if ((double)me/maxmag >= 1e-3) { if(errlen) snprintf(err,errlen,"%s rel err %.4g >= 1e-3", sg, (double)me/maxmag); ok=false; }
+                }
+            }
+            ds4_gpu_tensor_free(Wb); ds4_gpu_tensor_free(xb); ds4_gpu_tensor_free(ob); free(W);
+        }
+        free(x14); free(r14); free(g14);
+        if (!ok) goto free_gpu;
     }
 
     rc = 0;   /* all cases passed */
