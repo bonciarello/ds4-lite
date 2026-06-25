@@ -23245,6 +23245,70 @@ static int sample_argmax(const float *logits, uint32_t n_vocab) {
     return best;
 }
 
+/* xorshift64 step (state must be non-zero). */
+static inline uint64_t dense_rng_next(uint64_t *s) {
+    uint64_t x = *s;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    *s = x;
+    return x;
+}
+
+/* Temperature + top-k + top-p (nucleus) sampler. temp<=0 -> greedy argmax.
+ * Picks the top_k highest-logit candidates in one pass (sorted insertion),
+ * softmaxes them with temperature, keeps the smallest nucleus with cumulative
+ * probability >= top_p, then samples one. */
+static int dense_sample(const float *logits, uint32_t n_vocab,
+                        float temp, float top_p, int top_k, uint64_t *rng) {
+    if (temp <= 0.0f) return sample_argmax(logits, n_vocab);
+    if (top_k <= 0 || top_k > (int)n_vocab) top_k = (int)n_vocab;
+    if (top_k > 512) top_k = 512;          /* cap for speed */
+
+    typedef struct { float l; int id; } cand_t;
+    cand_t *cand = xmalloc((size_t)top_k * sizeof(cand_t));
+    int filled = 0;
+    float worst = DS4_NEG_INF;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (filled < top_k) {
+            int p = filled++;
+            while (p > 0 && cand[p-1].l < v) { cand[p] = cand[p-1]; p--; }
+            cand[p].l = v; cand[p].id = (int)i;
+            worst = cand[filled-1].l;
+        } else if (v > worst) {
+            int p = top_k - 1;
+            while (p > 0 && cand[p-1].l < v) { cand[p] = cand[p-1]; p--; }
+            cand[p].l = v; cand[p].id = (int)i;
+            worst = cand[top_k-1].l;
+        }
+    }
+    const float maxl = cand[0].l;          /* candidates are sorted desc */
+    double sum = 0.0;
+    for (int i = 0; i < filled; i++) {
+        const double p = exp((double)(cand[i].l - maxl) / (double)temp);
+        cand[i].l = (float)p;              /* reuse .l as probability */
+        sum += p;
+    }
+    int keep = filled;
+    if (top_p > 0.0f && top_p < 1.0f) {
+        double cum = 0.0;
+        for (int i = 0; i < filled; i++) {
+            cum += (double)cand[i].l / sum;
+            if (cum >= (double)top_p) { keep = i + 1; break; }
+        }
+    }
+    double ksum = 0.0;
+    for (int i = 0; i < keep; i++) ksum += (double)cand[i].l;
+    const double r = ((double)(dense_rng_next(rng) >> 11) / (double)(1ull << 53)) * ksum;
+    int chosen = cand[0].id;
+    double acc = 0.0;
+    for (int i = 0; i < keep; i++) {
+        acc += (double)cand[i].l;
+        if (r < acc) { chosen = cand[i].id; break; }
+    }
+    free(cand);
+    return chosen;
+}
+
 static DS4_MAYBE_UNUSED void logits_top2(const float *logits, uint32_t n_vocab,
                         int *top0, float *logit0,
                         int *top1, float *logit1) {
@@ -25944,8 +26008,14 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     bool first = true;
     const bool think = true;   /* reflection is always on for dense models */
 
+    /* sampling: greedy by default; /temp /topp /topk adjust it live */
+    float temp = 0.0f, top_p = 0.95f;
+    int   top_k = 40;
+    uint64_t rng = (uint64_t)time(NULL) ^ 0x9E3779B97F4A7C15ull;
+    if (rng == 0) rng = 0x9E3779B97F4A7C15ull;
+
     printf("ds4 dense chat (ChatML, reflection always on). ctx=%u tokens.\n"
-           "Commands: /help  /exit (Ctrl-D).\n", n_ctx);
+           "Commands: /help  /temp <v>  /topp <v>  /topk <n>  /exit (Ctrl-D).\n", n_ctx);
     fflush(stdout);
 
     char *line = NULL;
@@ -25961,8 +26031,26 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         if (!strcmp(line, "/help")) {
             printf("  reflection is always on: the model reasons inside <think>...</think>\n"
                    "  (shown dimmed), then gives the final answer.\n"
-                   "  /help   show this\n"
-                   "  /exit   quit\n");
+                   "  /temp <v>  sampling temperature (0 = greedy, e.g. 0.7)\n"
+                   "  /topp <v>  nucleus top-p (0..1, e.g. 0.95)\n"
+                   "  /topk <n>  top-k candidates (e.g. 40)\n"
+                   "  /help      show this\n"
+                   "  /exit      quit\n");
+            continue;
+        }
+        if (!strncmp(line, "/temp", 5) && (line[5] == ' ' || line[5] == '\0')) {
+            if (line[5]) temp = (float)atof(line + 6);
+            printf("\033[2m(temperature = %.2f%s)\033[0m\n", (double)temp, temp <= 0 ? ", greedy" : "");
+            continue;
+        }
+        if (!strncmp(line, "/topp", 5) && (line[5] == ' ' || line[5] == '\0')) {
+            if (line[5]) top_p = (float)atof(line + 6);
+            printf("\033[2m(top_p = %.2f)\033[0m\n", (double)top_p);
+            continue;
+        }
+        if (!strncmp(line, "/topk", 5) && (line[5] == ' ' || line[5] == '\0')) {
+            if (line[5]) top_k = atoi(line + 6);
+            printf("\033[2m(top_k = %d)\033[0m\n", top_k);
             continue;
         }
 
@@ -26035,7 +26123,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         size_t ans_len = 0, ans_cap = 0;
         if (think_turn) { printf("\033[2m\xf0\x9f\x92\xad "); fflush(stdout); }  /* dim + 💭 */
         while (pos < n_ctx - 1u) {
-            const int next = sample_argmax(logits, DS4_N_VOCAB);
+            const int next = dense_sample(logits, DS4_N_VOCAB, temp, top_p, top_k, &rng);
             if (next == im_end || next == vocab.eos_id) break;   /* closed below */
             char tb[96];
             const int tn = dense_token_bytes(&vocab, next, tb, sizeof(tb));
