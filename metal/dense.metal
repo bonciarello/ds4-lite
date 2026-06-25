@@ -1658,3 +1658,13 @@ kernel void kernel_dense_rms_norm_f32(
     const float scale = 1.0f / sqrt(ss / (float)a.n + a.eps);
     for (uint i = 0; i < a.n; i++) out[i] = x[i] * scale * w[i];
 }
+
+// Element-wise add (residual): a[i] += b[i]. One thread per element.
+kernel void kernel_dense_add_f32(
+        constant uint & n [[buffer(0)]],
+        device       float * a [[buffer(1)]],
+        device const float * b [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    a[gid] += b[gid];
+}

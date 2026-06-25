@@ -3748,6 +3748,42 @@ static void ds4_q8_0_quantize_row(const float *src, uint8_t *dst, uint32_t n) {
     }
 }
 
+/* Dispatch a simple element-wise dense kernel: arg struct at buffer(0), then
+ * `nbuf` ds4_gpu_tensors at buffer(1..nbuf). One thread per element (`threads`).
+ * Used to chain RMSNorm/SwiGLU/add on GPU. */
+static bool ds4_gpu_run_simple(const char *kernel, const void *args, size_t args_len,
+                               ds4_gpu_tensor * const *bufs, int nbuf,
+                               uint32_t threads, const char *label) {
+    id<MTLComputePipelineState> p = ds4_gpu_get_pipeline(kernel);
+    if (!p) return false;
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return false;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:p];
+    [enc setBytes:args length:args_len atIndex:0];
+    for (int i = 0; i < nbuf; i++)
+        [enc setBuffer:ds4_gpu_tensor_buffer(bufs[i]) offset:ds4_gpu_tensor_offset(bufs[i]) atIndex:(NSUInteger)(i + 1)];
+    const NSUInteger tg = 64;
+    [enc dispatchThreadgroups:MTLSizeMake((threads + (uint32_t)tg - 1u) / (uint32_t)tg, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, label);
+}
+
+/* Run an F32 dense matvec out[out_dim] = W[out_dim,in_dim] . x[in_dim] on GPU.
+ * Leaves the result in obuf; `scratch` receives a host copy (out_dim floats). */
+static bool ds4_gpu_dense_matvec_f32(ds4_gpu_tensor *obuf, ds4_gpu_tensor *W,
+                                     ds4_gpu_tensor *x, uint32_t in_dim,
+                                     uint32_t out_dim, float *scratch, const char *label) {
+    ds4_gpu_q8_0_matvec_args a = ds4_gpu_make_f32_mv_args(in_dim, out_dim, 1);
+    ds4_gpu_mv_dispatch d = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
+    a.nr0 = d.nr0;
+    id<MTLComputePipelineState> p = ds4_gpu_get_mul_mv_pipeline(d.function_name, d.nsg);
+    if (!p) return false;
+    return ds4_gpu_matvec_run_once(p, &a, sizeof(a), W, x, obuf, out_dim, d.nr0, d.nsg, d.smem, scratch, label);
+}
+
 int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
     if (!g_initialized && !ds4_gpu_init()) {
         if (errlen) snprintf(err, errlen, "Metal init failed (no GPU device?)");
@@ -3944,6 +3980,63 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         float maxerr = 0.0f;
         for (uint32_t i = 0; i < n; i++) { const float e = fabsf(ngot[i]-nref[i]); if (e>maxerr) maxerr=e; }
         if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "rmsnorm max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
+    }
+
+    /* --- Case 6: full dense FFN block (rmsnorm -> gate/up -> swiglu -> down -> residual) --- */
+    {
+        const uint32_t ne = 64u, nff = 128u;     /* n_embd, n_ff (multiples of 32/4) */
+        const float eps = 1e-6f;
+        float xv[64], wn[64], *Wg = malloc((size_t)nff*ne*sizeof(float)),
+              *Wu = malloc((size_t)nff*ne*sizeof(float)), *Wd = malloc((size_t)ne*nff*sizeof(float)),
+              fref[64], fgot[64], *scratch = malloc((size_t)nff*sizeof(float));
+        bool ok = Wg && Wu && Wd && scratch;
+        ds4_gpu_tensor *xb=0,*wnb=0,*Wgb=0,*Wub=0,*Wdb=0,*hb=0,*gb=0,*ub=0,*ab=0,*db=0;
+        if (ok) {
+            for (uint32_t i=0;i<ne;i++){ xv[i]=0.04f*(float)i-1.0f; wn[i]=0.6f+0.005f*(float)i; }
+            for (uint32_t r=0;r<nff;r++) for (uint32_t i=0;i<ne;i++){
+                Wg[(size_t)r*ne+i]=0.002f*(float)(((r+1)*(i+3))%13)-0.01f;
+                Wu[(size_t)r*ne+i]=0.003f*(float)(((r+2)*(i+1))%11)-0.012f; }
+            for (uint32_t r=0;r<ne;r++) for (uint32_t i=0;i<nff;i++)
+                Wd[(size_t)r*nff+i]=0.001f*(float)(((r+1)*(i+5))%17)-0.008f;
+            /* CPU reference */
+            double ss=0; for(uint32_t i=0;i<ne;i++) ss+=(double)xv[i]*xv[i];
+            const float sc=1.0f/sqrtf((float)(ss/(double)ne)+eps);
+            float h[64]; for(uint32_t i=0;i<ne;i++) h[i]=xv[i]*sc*wn[i];
+            float gate[128],up[128],act[128];
+            for(uint32_t r=0;r<nff;r++){ double ag=0,au=0; for(uint32_t i=0;i<ne;i++){ag+=(double)Wg[(size_t)r*ne+i]*h[i]; au+=(double)Wu[(size_t)r*ne+i]*h[i];} gate[r]=(float)ag; up[r]=(float)au; }
+            for(uint32_t r=0;r<nff;r++) act[r]=(gate[r]/(1.0f+expf(-gate[r])))*up[r];
+            for(uint32_t r=0;r<ne;r++){ double ad=0; for(uint32_t i=0;i<nff;i++) ad+=(double)Wd[(size_t)r*nff+i]*act[i]; fref[r]=xv[r]+(float)ad; }
+
+            xb=ds4_gpu_tensor_alloc(ne*sizeof(float)); wnb=ds4_gpu_tensor_alloc(ne*sizeof(float));
+            Wgb=ds4_gpu_tensor_alloc((uint64_t)nff*ne*sizeof(float)); Wub=ds4_gpu_tensor_alloc((uint64_t)nff*ne*sizeof(float));
+            Wdb=ds4_gpu_tensor_alloc((uint64_t)ne*nff*sizeof(float)); hb=ds4_gpu_tensor_alloc(ne*sizeof(float));
+            gb=ds4_gpu_tensor_alloc(nff*sizeof(float)); ub=ds4_gpu_tensor_alloc(nff*sizeof(float));
+            ab=ds4_gpu_tensor_alloc(nff*sizeof(float)); db=ds4_gpu_tensor_alloc(ne*sizeof(float));
+            ok = xb&&wnb&&Wgb&&Wub&&Wdb&&hb&&gb&&ub&&ab&&db;
+        }
+        if (ok) {
+            ds4_gpu_tensor_write(xb,0,xv,ne*sizeof(float)); ds4_gpu_tensor_write(wnb,0,wn,ne*sizeof(float));
+            ds4_gpu_tensor_write(Wgb,0,Wg,(uint64_t)nff*ne*sizeof(float)); ds4_gpu_tensor_write(Wub,0,Wu,(uint64_t)nff*ne*sizeof(float));
+            ds4_gpu_tensor_write(Wdb,0,Wd,(uint64_t)ne*nff*sizeof(float));
+            struct __attribute__((packed)) { uint32_t n; float eps; } rn = { ne, eps };
+            ds4_gpu_tensor *norm_bufs[3] = { xb, wnb, hb };
+            ds4_gpu_tensor *glu_bufs[3]  = { gb, ub, ab };
+            ds4_gpu_tensor *add_bufs[2]  = { xb, db };
+            ok = ds4_gpu_run_simple("kernel_dense_rms_norm_f32", &rn, sizeof(rn), norm_bufs, 3, 1u, "ffn rmsnorm")
+              && ds4_gpu_dense_matvec_f32(gb, Wgb, hb, ne, nff, scratch, "ffn gate")
+              && ds4_gpu_dense_matvec_f32(ub, Wub, hb, ne, nff, scratch, "ffn up")
+              && ds4_gpu_run_simple("kernel_dense_swiglu_f32", &nff, sizeof(nff), glu_bufs, 3, nff, "ffn swiglu")
+              && ds4_gpu_dense_matvec_f32(db, Wdb, ab, nff, ne, scratch, "ffn down")
+              && ds4_gpu_run_simple("kernel_dense_add_f32", &ne, sizeof(ne), add_bufs, 2, ne, "ffn residual");
+            if (ok) ds4_gpu_tensor_read(xb, 0, fgot, ne*sizeof(float));
+        }
+        ds4_gpu_tensor_free(xb);ds4_gpu_tensor_free(wnb);ds4_gpu_tensor_free(Wgb);ds4_gpu_tensor_free(Wub);
+        ds4_gpu_tensor_free(Wdb);ds4_gpu_tensor_free(hb);ds4_gpu_tensor_free(gb);ds4_gpu_tensor_free(ub);
+        ds4_gpu_tensor_free(ab);ds4_gpu_tensor_free(db);
+        free(Wg);free(Wu);free(Wd);free(scratch);
+        if (!ok) { if (errlen) snprintf(err, errlen, "FFN block GPU run failed"); goto free_gpu; }
+        float maxerr=0.0f; for(uint32_t i=0;i<ne;i++){ const float e=fabsf(fgot[i]-fref[i]); if(e>maxerr)maxerr=e; }
+        if (maxerr >= 1e-4f) { if (errlen) snprintf(err, errlen, "FFN block max err %.6g >= 1e-4", (double)maxerr); goto free_gpu; }
     }
 
     rc = 0;   /* all cases passed */
