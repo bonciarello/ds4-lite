@@ -38,6 +38,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "linenoise.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -25945,18 +25946,28 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     const bool think = true;   /* reflection is always on for dense models */
 
     printf("ds4 dense chat (ChatML, reflection always on). ctx=%u tokens.\n"
-           "Commands: /help  /exit (Ctrl-D).\n", n_ctx);
+           "Commands: /help  /exit (Ctrl-D). Arrows: edit/history.\n", n_ctx);
     fflush(stdout);
 
+    /* linenoise: line editing + persistent history. The previous line is freed at
+     * the top of each iteration, so every continue/break exits cleanly with a single
+     * post-loop free (linenoiseFree(NULL) is a no-op). On a non-tty (piped) stdin
+     * linenoise transparently falls back to plain line reads. */
+    char histpath[PATH_MAX];
+    { const char *home = getenv("HOME"); if (!home || !home[0]) home = ".";
+      snprintf(histpath, sizeof(histpath), "%s/.ds4_dense_chat_history", home); }
+    linenoiseHistorySetMaxLen(512);
+    linenoiseHistoryLoad(histpath);
+
     char *line = NULL;
-    size_t cap = 0;
     while (rc == 0) {
-        printf("\n\033[1m>\033[0m ");
-        fflush(stdout);
-        ssize_t nr = getline(&line, &cap, stdin);
-        if (nr < 0) { printf("\n"); break; }            /* EOF / Ctrl-D */
-        while (nr > 0 && (line[nr - 1] == '\n' || line[nr - 1] == '\r')) line[--nr] = '\0';
+        linenoiseFree(line);
+        line = linenoise("> ");
+        if (!line) { printf("\n"); break; }             /* EOF / Ctrl-D */
+        const size_t nr = strlen(line);
         if (nr == 0) continue;
+        linenoiseHistoryAdd(line);
+        linenoiseHistorySave(histpath);
         if (!strcmp(line, "/exit") || !strcmp(line, "/quit")) break;
         if (!strcmp(line, "/help")) {
             printf("  reflection is always on: the model reasons inside <think>...</think>\n"
@@ -26112,7 +26123,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         fflush(stdout);
     }
 
-    free(line);
+    linenoiseFree(line);
     free(logits);
     ds4_dense_gpu_free(g);
     free(desc.layers);
