@@ -82,10 +82,14 @@ Stato:
     **Entrambi i sub-blocchi transformer (attn + FFN) girano end-to-end su GPU.**
     Kernel densi in `metal/dense.metal`; helper host riusabili `ds4_gpu_run_simple`,
     `ds4_gpu_dense_matvec_f32`, `ds4_gpu_matvec_run_once`.
-  - **Prossimo 3.5 step 4 (integrazione, il blocco grosso)**: comporre il layer denso
-    completo (attn+FFN, banale) e fare il **wiring coi pesi reali** + KV cache dense
-    nella session, dietro `ds4_arch_is_deepseek()` in `metal_graph_eval_token_raw_swa`
-    → continuazione greedy vs llama.cpp.
+  - **step 4 sotto-step 1+2** ✅ matvec type-dispatch sui **pesi reali** validato:
+    `./ds4 --metal-dense-weight-test MODEL.gguf` (`ds4_dense_weight_test` /
+    `ds4_gpu_dense_matvec_verify`). Su Qwen2 reale: attn_q (Q4_K), attn_v/ffn_down/
+    output (Q6_K) tutti PASS, rel_err ~1e-7 vs CPU. Copia il peso su GPU; lo zero-copy
+    `ds4_gpu_wrap_model_range` è rinviato al driver (serve per non duplicare GB di pesi).
+  - **Prossimi step 4**: (3) driver forward denso coi pesi reali (type-dispatch +
+    zero-copy wrap) → (4) KV cache dense nella session → (5) wiring dietro
+    `ds4_arch_is_deepseek()` in `metal_graph_eval_token_raw_swa` → (6) greedy vs llama.cpp.
     **Supporto quant per il dense — COMPLETO e validato su GPU** (`--metal-dense-selftest`,
     12 casi PASS <1e-2): F32, **Q8_0**, **Q3_K**, **Q4_K**, **Q5_K**, **Q6_K** matvec densi
     (kernel `kernel_dense_mul_mv_{q3,q4,q5,q6}_K_f32` in `metal/dense.metal`, dequant
