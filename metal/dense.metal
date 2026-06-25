@@ -1629,3 +1629,32 @@ kernel void kernel_dense_rope_neox_f32(
     head[i]          = x0 * c - x1 * s;
     head[i + rot_half] = x0 * s + x1 * c;
 }
+
+// ---- Dense FFN building blocks (Fase 3.5) ----------------------------------
+// SwiGLU activation: out[i] = silu(gate[i]) * up[i]. One thread per element.
+kernel void kernel_dense_swiglu_f32(
+        constant uint & n [[buffer(0)]],
+        device const float * gate [[buffer(1)]],
+        device const float * up   [[buffer(2)]],
+        device       float * out  [[buffer(3)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    const float g = gate[gid];
+    out[gid] = (g / (1.0f + exp(-g))) * up[gid];
+}
+
+// RMSNorm with learned weight: out[i] = x[i] / rms(x) * w[i]. Single-thread
+// reference reduction (correctness first; optimize later). One thread total.
+struct ds4_dense_rmsnorm_args { uint n; float eps; };
+kernel void kernel_dense_rms_norm_f32(
+        constant ds4_dense_rmsnorm_args & a [[buffer(0)]],
+        device const float * x   [[buffer(1)]],
+        device const float * w   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid != 0u) return;
+    float ss = 0.0f;
+    for (uint i = 0; i < a.n; i++) ss += x[i] * x[i];
+    const float scale = 1.0f / sqrt(ss / (float)a.n + a.eps);
+    for (uint i = 0; i < a.n; i++) out[i] = x[i] * scale * w[i];
+}

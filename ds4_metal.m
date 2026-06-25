@@ -3870,6 +3870,82 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "rope max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
     }
 
+    /* --- Case 4: SwiGLU activation (kernel_dense_swiglu_f32) --- */
+    {
+        const uint32_t n = 64u;
+        float gate[64], up[64], sref[64], sgot[64];
+        for (uint32_t i = 0; i < n; i++) { gate[i] = 0.05f*(float)i - 1.5f; up[i] = 0.02f*(float)i + 0.3f; }
+        for (uint32_t i = 0; i < n; i++) sref[i] = (gate[i]/(1.0f+expf(-gate[i]))) * up[i];
+        ds4_gpu_tensor *gb = ds4_gpu_tensor_alloc((uint64_t)n*sizeof(float));
+        ds4_gpu_tensor *ub = ds4_gpu_tensor_alloc((uint64_t)n*sizeof(float));
+        ds4_gpu_tensor *ob = ds4_gpu_tensor_alloc((uint64_t)n*sizeof(float));
+        id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dense_swiglu_f32");
+        bool ok = gb && ub && ob && p;
+        if (ok) {
+            ds4_gpu_tensor_write(gb, 0, gate, (uint64_t)n*sizeof(float));
+            ds4_gpu_tensor_write(ub, 0, up,   (uint64_t)n*sizeof(float));
+            int owned = 0; id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            ok = cb != nil;
+            if (ok) {
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:p];
+                [enc setBytes:&n length:sizeof(n) atIndex:0];
+                [enc setBuffer:ds4_gpu_tensor_buffer(gb) offset:ds4_gpu_tensor_offset(gb) atIndex:1];
+                [enc setBuffer:ds4_gpu_tensor_buffer(ub) offset:ds4_gpu_tensor_offset(ub) atIndex:2];
+                [enc setBuffer:ds4_gpu_tensor_buffer(ob) offset:ds4_gpu_tensor_offset(ob) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake((n+63u)/64u,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                ok = ds4_gpu_finish_command_buffer(cb, owned, "selftest swiglu");
+            }
+        }
+        if (ok) ds4_gpu_tensor_read(ob, 0, sgot, (uint64_t)n*sizeof(float));
+        ds4_gpu_tensor_free(gb); ds4_gpu_tensor_free(ub); ds4_gpu_tensor_free(ob);
+        if (!ok) { if (errlen) snprintf(err, errlen, "swiglu GPU run failed"); goto free_gpu; }
+        float maxerr = 0.0f;
+        for (uint32_t i = 0; i < n; i++) { const float e = fabsf(sgot[i]-sref[i]); if (e>maxerr) maxerr=e; }
+        if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "swiglu max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
+    }
+
+    /* --- Case 5: RMSNorm with weight (kernel_dense_rms_norm_f32) --- */
+    {
+        const uint32_t n = 128u;
+        const float eps = 1e-6f;
+        float xin[128], wn[128], nref[128], ngot[128];
+        for (uint32_t i = 0; i < n; i++) { xin[i] = 0.03f*(float)i - 1.0f; wn[i] = 0.5f + 0.01f*(float)i; }
+        double ss = 0.0; for (uint32_t i = 0; i < n; i++) ss += (double)xin[i]*xin[i];
+        const float scale = 1.0f/sqrtf((float)(ss/(double)n) + eps);
+        for (uint32_t i = 0; i < n; i++) nref[i] = xin[i]*scale*wn[i];
+        struct __attribute__((packed)) { uint32_t n; float eps; } ra = { n, eps };
+        ds4_gpu_tensor *xb = ds4_gpu_tensor_alloc((uint64_t)n*sizeof(float));
+        ds4_gpu_tensor *wb = ds4_gpu_tensor_alloc((uint64_t)n*sizeof(float));
+        ds4_gpu_tensor *ob = ds4_gpu_tensor_alloc((uint64_t)n*sizeof(float));
+        id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dense_rms_norm_f32");
+        bool ok = xb && wb && ob && p;
+        if (ok) {
+            ds4_gpu_tensor_write(xb, 0, xin, (uint64_t)n*sizeof(float));
+            ds4_gpu_tensor_write(wb, 0, wn,  (uint64_t)n*sizeof(float));
+            int owned = 0; id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            ok = cb != nil;
+            if (ok) {
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:p];
+                [enc setBytes:&ra length:sizeof(ra) atIndex:0];
+                [enc setBuffer:ds4_gpu_tensor_buffer(xb) offset:ds4_gpu_tensor_offset(xb) atIndex:1];
+                [enc setBuffer:ds4_gpu_tensor_buffer(wb) offset:ds4_gpu_tensor_offset(wb) atIndex:2];
+                [enc setBuffer:ds4_gpu_tensor_buffer(ob) offset:ds4_gpu_tensor_offset(ob) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                ok = ds4_gpu_finish_command_buffer(cb, owned, "selftest rmsnorm");
+            }
+        }
+        if (ok) ds4_gpu_tensor_read(ob, 0, ngot, (uint64_t)n*sizeof(float));
+        ds4_gpu_tensor_free(xb); ds4_gpu_tensor_free(wb); ds4_gpu_tensor_free(ob);
+        if (!ok) { if (errlen) snprintf(err, errlen, "rmsnorm GPU run failed"); goto free_gpu; }
+        float maxerr = 0.0f;
+        for (uint32_t i = 0; i < n; i++) { const float e = fabsf(ngot[i]-nref[i]); if (e>maxerr) maxerr=e; }
+        if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "rmsnorm max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
+    }
+
     rc = 0;   /* all cases passed */
 free_gpu:
     ds4_gpu_tensor_free(wf32);
