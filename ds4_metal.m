@@ -4122,38 +4122,41 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
         for (uint32_t b = 0; b < nblk; b++) ds4_q4k_dequant_block(row + (size_t)b*144u, g->embedscratch + b*256);
         ds4_gpu_tensor_write(g->x, 0, g->embedscratch, (uint64_t)ne*4);
 
-        for (uint32_t il = 0; il < d->n_layer; il++) {
+        /* Each kernel commits + waits on its own command buffer (ds4_gpu_run_simple).
+         * This is compute-bound on the reference 1-thread/row kernels, so command
+         * batching does not help; kernel-level optimization (simdgroup-cooperative
+         * matvec) is the lever. The ok-flag keeps the data dependencies explicit. */
+        bool ok = true;
+        for (uint32_t il = 0; ok && il < d->n_layer; il++) {
             const ds4_dense_layer_desc *L = &d->layers[il];
             ds4_dense_kv_layer *kv = &g->kv[il];
-            if (!dense_rms(g, g->h, g->x, &L->attn_norm, ne, eps)) return 1;
-            /* Write K/V directly into the KV cache slot at `pos` via views, so the
-             * matvec/bias/rope are ordered with everything else (no async blit). */
             ds4_gpu_tensor *kview = ds4_gpu_tensor_view(kv->k, (uint64_t)pos*kvd*4, (uint64_t)kvd*4);
             ds4_gpu_tensor *vview = ds4_gpu_tensor_view(kv->v, (uint64_t)pos*kvd*4, (uint64_t)kvd*4);
-            bool aok = kview && vview;
-            aok = aok && dense_matvec(g, &L->attn_q, g->h, g->q);
-            aok = aok && dense_matvec(g, &L->attn_k, g->h, kview);
-            aok = aok && dense_matvec(g, &L->attn_v, g->h, vview);
-            aok = aok && dense_add_bias(g, g->q,  &L->attn_q_bias, qd);
-            aok = aok && dense_add_bias(g, kview, &L->attn_k_bias, kvd);
-            aok = aok && dense_add_bias(g, vview, &L->attn_v_bias, kvd);
-            aok = aok && dense_rope(g->q,  nh,  hd, nrot, pos, base);
-            aok = aok && dense_rope(kview, nkv, hd, nrot, pos, base);
-            aok = aok && dense_attn(g->att, g->q, kv->k, kv->v, nh, nkv, hd, pos+1, scale);
+            ok = kview && vview
+              && dense_rms(g, g->h, g->x, &L->attn_norm, ne, eps)
+              && dense_matvec(g, &L->attn_q, g->h, g->q)
+              && dense_matvec(g, &L->attn_k, g->h, kview)
+              && dense_matvec(g, &L->attn_v, g->h, vview)
+              && dense_add_bias(g, g->q,  &L->attn_q_bias, qd)
+              && dense_add_bias(g, kview, &L->attn_k_bias, kvd)
+              && dense_add_bias(g, vview, &L->attn_v_bias, kvd)
+              && dense_rope(g->q,  nh,  hd, nrot, pos, base)
+              && dense_rope(kview, nkv, hd, nrot, pos, base)
+              && dense_attn(g->att, g->q, kv->k, kv->v, nh, nkv, hd, pos+1, scale)
+              && dense_matvec(g, &L->attn_out, g->att, g->o)
+              && dense_add(g->x, g->o, ne)
+              && dense_rms(g, g->h2, g->x, &L->ffn_norm, ne, eps)
+              && dense_matvec(g, &L->ffn_gate, g->h2, g->gate)
+              && dense_matvec(g, &L->ffn_up, g->h2, g->up)
+              && dense_swiglu(g->act, g->gate, g->up, nff)
+              && dense_matvec(g, &L->ffn_down, g->act, g->down)
+              && dense_add(g->x, g->down, ne);
             ds4_gpu_tensor_free(kview);
             ds4_gpu_tensor_free(vview);
-            if (!aok) return 1;
-            if (!dense_matvec(g, &L->attn_out, g->att, g->o)) return 1;
-            if (!dense_add(g->x, g->o, ne)) return 1;
-            if (!dense_rms(g, g->h2, g->x, &L->ffn_norm, ne, eps)) return 1;
-            if (!dense_matvec(g, &L->ffn_gate, g->h2, g->gate)) return 1;
-            if (!dense_matvec(g, &L->ffn_up, g->h2, g->up)) return 1;
-            if (!dense_swiglu(g->act, g->gate, g->up, nff)) return 1;
-            if (!dense_matvec(g, &L->ffn_down, g->act, g->down)) return 1;
-            if (!dense_add(g->x, g->down, ne)) return 1;
         }
-        if (!dense_rms(g, g->h, g->x, &d->output_norm, ne, eps)) return 1;
-        if (!dense_matvec(g, &d->output, g->h, g->logits)) return 1;
+        ok = ok && dense_rms(g, g->h, g->x, &d->output_norm, ne, eps)
+                && dense_matvec(g, &d->output, g->h, g->logits);
+        if (!ok) return 1;
         ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)d->n_vocab*4);
         return 0;
     }
