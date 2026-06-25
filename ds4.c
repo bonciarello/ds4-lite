@@ -25944,8 +25944,15 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     bool first = true;
     const bool think = true;   /* reflection is always on for dense models */
 
+    /* Sliding window: keep the clean token sequence of each completed turn so that,
+     * when the context fills, we can drop the oldest turns and rebuild the KV from
+     * the system prompt + the most recent turns that still fit. */
+    uint32_t base_pos = 0;          /* position right after the system block */
+    token_vec *hist = NULL;         /* [hist_n] clean per-turn token sequences */
+    size_t hist_n = 0, hist_cap = 0;
+
     printf("ds4 dense chat (ChatML, reflection always on). ctx=%u tokens.\n"
-           "Commands: /help  /exit (Ctrl-D).\n", n_ctx);
+           "Commands: /help  /exit (Ctrl-D). Context auto-slides when full.\n", n_ctx);
     fflush(stdout);
 
     char *line = NULL;
@@ -25976,14 +25983,9 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                 if (ds4_dense_gpu_forward(g, &desc, st.v[i], pos++, logits) != 0) rc = 1;
             token_vec_free(&st);
             first = false;
+            base_pos = pos;       /* turn history begins here */
             if (rc) break;
         }
-
-        /* Start of this turn's user block. A /think turn rewinds here afterwards to
-         * re-feed a CLEAN turn (user without the reflection directive + the final
-         * answer without the <think> reasoning), so later turns don't imitate the
-         * reasoning and the context isn't bloated. */
-        const uint32_t pos_user_start = pos;
 
         token_vec t = {0};
         if (think_turn) {
@@ -25999,11 +26001,40 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         token_vec_push(&t, im_start);
         bpe_tokenize_text(&vocab, "assistant\n", &t);
 
-        if (pos + (uint32_t)t.len + 8u >= n_ctx) {
-            printf("[context full — start a new session to continue]\n");
-            token_vec_free(&t);
-            break;
+        /* Sliding window: if this turn won't fit, drop the oldest stored turns and
+         * rebuild the KV from base_pos (system) + the most recent turns that fit,
+         * leaving headroom for the prompt and the reply. (Rebuild re-prefills the
+         * kept turns — bounded by the kept token count; cheap once prefill is fast.) */
+        const uint32_t headroom = 256u;
+        if (pos + (uint32_t)t.len + headroom + 8u >= n_ctx) {
+            uint32_t kept = 0;
+            size_t keep_from = hist_n;
+            for (size_t i = hist_n; i > 0; i--) {
+                const uint32_t L = (uint32_t)hist[i - 1].len;
+                if (base_pos + kept + L + (uint32_t)t.len + headroom + 8u >= n_ctx) break;
+                kept += L; keep_from = i - 1;
+            }
+            if (base_pos + (uint32_t)t.len + headroom + 8u >= n_ctx) {
+                printf("[context full: this message alone is too large]\n");
+                token_vec_free(&t);
+                break;
+            }
+            const size_t drop = keep_from;
+            for (size_t i = 0; i < drop; i++) token_vec_free(&hist[i]);
+            memmove(hist, hist + drop, (hist_n - drop) * sizeof(hist[0]));
+            hist_n -= drop;
+            pos = base_pos;                                   /* rebuild from system */
+            for (size_t i = 0; i < hist_n && rc == 0; i++)
+                for (uint32_t k = 0; k < (uint32_t)hist[i].len && rc == 0; k++)
+                    if (ds4_dense_gpu_forward(g, &desc, hist[i].v[k], pos++, logits) != 0) rc = 1;
+            if (rc) { token_vec_free(&t); break; }
+            printf("\033[2m[context slid: dropped %zu old turn(s)]\033[0m\n", drop);
         }
+
+        /* Start of this turn's user block (after any compaction). A /think turn
+         * rewinds here afterwards to re-feed a CLEAN turn (user without the
+         * directive + the answer without the <think> reasoning). */
+        const uint32_t pos_user_start = pos;
 
         /* prefill this turn's new tokens (KV from prior turns is reused) */
         for (uint32_t i = 0; i < (uint32_t)t.len && rc == 0; i++)
@@ -26093,25 +26124,48 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
          * context isn't bloated. Otherwise keep the response as generated. */
         if (rc == 0) {
             const bool strip = think_turn && !in_think && ans_trim[0] != '\0';
-            token_vec close = {0};
+            /* Canonical CLEAN turn: user (no directive) + assistant + answer. Used
+             * both as the stripped KV content and as the sliding-window transcript. */
+            token_vec turn_clean = {0};
+            dense_chat_append_block(&turn_clean, &vocab, im_start, im_end, "user", line);
+            token_vec_push(&turn_clean, im_start);
+            bpe_tokenize_text(&vocab, "assistant\n", &turn_clean);
+            if (ans_trim[0]) bpe_tokenize_text(&vocab, ans_trim, &turn_clean);
+            token_vec_push(&turn_clean, im_end);
+            bpe_tokenize_text(&vocab, "\n", &turn_clean);   /* ...<|im_end|>\n */
+
             if (strip) {
+                /* re-feed the clean turn over the dirty one (drops directive + reasoning) */
                 pos = pos_user_start;
-                dense_chat_append_block(&close, &vocab, im_start, im_end, "user", line);
-                token_vec_push(&close, im_start);
-                bpe_tokenize_text(&vocab, "assistant\n", &close);
-                bpe_tokenize_text(&vocab, ans_trim, &close);
+                for (uint32_t i = 0; i < (uint32_t)turn_clean.len && pos < n_ctx - 1u; i++)
+                    if (ds4_dense_gpu_forward(g, &desc, turn_clean.v[i], pos++, logits) != 0) { rc = 1; break; }
+            } else {
+                /* keep the live response; just append the closing <|im_end|>\n */
+                token_vec cl = {0};
+                token_vec_push(&cl, im_end);
+                bpe_tokenize_text(&vocab, "\n", &cl);
+                for (uint32_t i = 0; i < (uint32_t)cl.len && pos < n_ctx - 1u; i++)
+                    if (ds4_dense_gpu_forward(g, &desc, cl.v[i], pos++, logits) != 0) { rc = 1; break; }
+                token_vec_free(&cl);
             }
-            token_vec_push(&close, im_end);
-            bpe_tokenize_text(&vocab, "\n", &close);   /* ...<|im_end|>\n */
-            for (uint32_t i = 0; i < (uint32_t)close.len && pos < n_ctx - 1u; i++)
-                if (ds4_dense_gpu_forward(g, &desc, close.v[i], pos++, logits) != 0) { rc = 1; break; }
-            token_vec_free(&close);
+            /* record the turn for the sliding window (transfer ownership) */
+            if (rc == 0) {
+                if (hist_n == hist_cap) {
+                    hist_cap = hist_cap ? hist_cap * 2 : 16;
+                    hist = xrealloc(hist, hist_cap * sizeof(hist[0]));
+                }
+                hist[hist_n++] = turn_clean;
+            } else {
+                token_vec_free(&turn_clean);
+            }
         }
         free(ans);
         printf("\n");
         fflush(stdout);
     }
 
+    for (size_t i = 0; i < hist_n; i++) token_vec_free(&hist[i]);
+    free(hist);
     free(line);
     free(logits);
     ds4_dense_gpu_free(g);
