@@ -4347,13 +4347,15 @@ static ds4_gpu_mul_mm_args ds4_gpu_make_mm_args(uint64_t in_dim, uint64_t out_di
                                                 uint64_t n_tok, uint64_t row_bytes);
 
 /* Batched prefill matmul: out[n_tok, out_dim] = x[n_tok, in_dim] . dequant(W[out_dim,
- * in_dim]) for q4_K weights, via the proven simdgroup kernel_mul_mm. */
-static bool ds4_gpu_dense_matmul_q4k(ds4_gpu_tensor *out, ds4_gpu_tensor *W, ds4_gpu_tensor *x,
-                                     uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
-    const uint64_t row_bytes = (uint64_t)(in_dim / 256u) * 144u;
+ * in_dim]) for q4_K (type 12) / q6_K (type 14) weights, via the simdgroup kernel_mul_mm. */
+static bool ds4_gpu_dense_matmul(ds4_gpu_tensor *out, ds4_gpu_tensor *W, ds4_gpu_tensor *x,
+                                 uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, int type) {
+    const char *kernel = type == 14 ? "kernel_mul_mm_q6_K_f32" : "kernel_mul_mm_q4_K_f32";
+    const uint64_t blk = type == 14 ? 210u : 144u;
+    const uint64_t row_bytes = (uint64_t)(in_dim / 256u) * blk;
     const bool bc_inp = (in_dim % 32u) != 0;
     const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
-    id<MTLComputePipelineState> p = ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_q4_K_f32", bc_inp, bc_out);
+    id<MTLComputePipelineState> p = ds4_gpu_get_mul_mm_pipeline(kernel, bc_inp, bc_out);
     if (!p) return false;
     ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
     int owned = 0;
@@ -4410,7 +4412,7 @@ int ds4_gpu_dense_matmul_test(int n_tok_in, char *err, size_t errlen) {
             if (Wt && Xt && Ct) {
                 ds4_gpu_tensor_write(Wt, 0, W, (uint64_t)N * nb * 144u);
                 ds4_gpu_tensor_write(Xt, 0, X, (uint64_t)M * K * 4);
-                if (ds4_gpu_dense_matmul_q4k(Ct, Wt, Xt, K, N, M)) {
+                if (ds4_gpu_dense_matmul(Ct, Wt, Xt, K, N, M, 12)) {
                     ds4_gpu_tensor_read(Ct, 0, got, (uint64_t)M * N * 4);
                     float me = 0;
                     for (uint32_t i = 0; i < M * N; i++) { float e = fabsf(got[i] - ref[i]); if (e > me) me = e; }
@@ -4424,6 +4426,53 @@ int ds4_gpu_dense_matmul_test(int n_tok_in, char *err, size_t errlen) {
         free(W); free(X); free(ref); free(got);
         if (rc) return rc;
         printf("dense matmul q4_K: correctness PASS (M=%u, K=512, N=64)\n", M);
+    }
+
+    /* --- correctness q6_K: K=512, N=64 --- */
+    {
+        const uint32_t K = 512u, N = 64u, nb = K / 256u;
+        uint8_t *W = malloc((size_t)N * nb * 210u);
+        float *X = malloc((size_t)M * K * 4);
+        float *ref = malloc((size_t)M * N * 4), *got = malloc((size_t)M * N * 4);
+        int rc = 1;
+        if (W && X && ref && got) {
+            for (uint32_t r = 0; r < N * nb; r++) {
+                uint8_t *blk = W + (size_t)r * 210u;
+                for (int i = 0; i < 128; i++) blk[i]     = (uint8_t)((r * 7 + i * 13) & 0xFF);  /* ql */
+                for (int i = 0; i < 64;  i++) blk[128+i] = (uint8_t)((r * 3 + i * 5)  & 0xFF);  /* qh */
+                for (int i = 0; i < 16;  i++) ((int8_t*)(blk+192))[i] = (int8_t)((i % 8) + 1);   /* scales */
+                __fp16 d = (__fp16)0.012f; memcpy(blk + 208, &d, 2);
+            }
+            for (uint32_t i = 0; i < M * K; i++) X[i] = 0.01f * (float)((i % 53) - 26);
+            double maxmag = 1e-9;
+            for (uint32_t m = 0; m < M; m++)
+                for (uint32_t n = 0; n < N; n++) {
+                    double acc = 0;
+                    for (uint32_t b = 0; b < nb; b++)
+                        acc += ds4_q6k_block_dot(W + ((size_t)n * nb + b) * 210u, X + (size_t)m * K + b * 256);
+                    ref[m * N + n] = (float)acc;
+                    if (fabs(acc) > maxmag) maxmag = fabs(acc);
+                }
+            ds4_gpu_tensor *Wt = ds4_gpu_tensor_alloc((uint64_t)N * nb * 210u);
+            ds4_gpu_tensor *Xt = ds4_gpu_tensor_alloc((uint64_t)M * K * 4);
+            ds4_gpu_tensor *Ct = ds4_gpu_tensor_alloc((uint64_t)M * N * 4);
+            if (Wt && Xt && Ct) {
+                ds4_gpu_tensor_write(Wt, 0, W, (uint64_t)N * nb * 210u);
+                ds4_gpu_tensor_write(Xt, 0, X, (uint64_t)M * K * 4);
+                if (ds4_gpu_dense_matmul(Ct, Wt, Xt, K, N, M, 14)) {
+                    ds4_gpu_tensor_read(Ct, 0, got, (uint64_t)M * N * 4);
+                    float me = 0;
+                    for (uint32_t i = 0; i < M * N; i++) { float e = fabsf(got[i] - ref[i]); if (e > me) me = e; }
+                    const double rel = (double)me / maxmag;
+                    if (rel < 1e-2) rc = 0;
+                    else if (errlen) snprintf(err, errlen, "q6_K matmul rel err %.4g >= 1e-2", rel);
+                }
+            }
+            ds4_gpu_tensor_free(Wt); ds4_gpu_tensor_free(Xt); ds4_gpu_tensor_free(Ct);
+        }
+        free(W); free(X); free(ref); free(got);
+        if (rc) return rc;
+        printf("dense matmul q6_K: correctness PASS (M=%u, K=512, N=64)\n", M);
     }
 
     /* --- micro-benchmark: realistic K=3584, N=3584; matmul(M) vs M x matvec --- */
@@ -4450,13 +4499,13 @@ int ds4_gpu_dense_matmul_test(int n_tok_in, char *err, size_t errlen) {
                 ds4_gpu_tensor_write(Xt, 0, X, (uint64_t)M * K * 4);
                 ds4_gpu_tensor_write(xrow, 0, X, (uint64_t)K * 4);
                 /* warmup */
-                ds4_gpu_dense_matmul_q4k(Ct, Wt, Xt, K, N, M);
+                ds4_gpu_dense_matmul(Ct, Wt, Xt, K, N, M, 12);
                 struct __attribute__((packed)) { uint32_t in_dim, out_dim; } qa = { K, N };
                 ds4_gpu_tensor *mvb[3] = { Wt, xrow, orow };
                 ds4_gpu_run_kquant_sg("kernel_dense_mul_mv_q4_K_f32_sg", &qa, sizeof(qa), mvb, N, 2u, 2u, "warm");
                 /* time matmul (M tokens, weights read once) */
                 const double t0 = ds4_gpu_now_ms();
-                ds4_gpu_dense_matmul_q4k(Ct, Wt, Xt, K, N, M);
+                ds4_gpu_dense_matmul(Ct, Wt, Xt, K, N, M, 12);
                 const double t1 = ds4_gpu_now_ms();
                 /* time M separate matvecs (weights read M times) */
                 for (uint32_t m = 0; m < M; m++)
