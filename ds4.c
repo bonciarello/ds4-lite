@@ -25999,7 +25999,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         return 1;
     }
 
-    const uint32_t n_ctx = ctx_size > 0 ? (uint32_t)ctx_size : 4096u;
+    uint32_t n_ctx = ctx_size > 0 ? (uint32_t)ctx_size : 4096u;
     ds4_dense_model_desc desc;
     dense_build_desc(&desc, &model, &weights, n_ctx);
 
@@ -26058,7 +26058,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         linenoiseFree(line);
         line = linenoise("> ");
         if (!line) { printf("\n"); break; }             /* EOF / Ctrl-D */
-        const size_t nr = strlen(line);
+        size_t nr = strlen(line);   /* non-const: /read replaces line+nr */
         if (nr == 0) continue;
         linenoiseHistoryAdd(line);
         linenoiseHistorySave(histpath);
@@ -26066,11 +26066,13 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         if (!strcmp(line, "/help")) {
             printf("  reflection is always on: the model reasons inside <think>...</think>\n"
                    "  (shown dimmed), then gives the final answer.\n"
-                   "  /temp <v>  sampling temperature (0 = greedy, e.g. 0.7)\n"
-                   "  /topp <v>  nucleus top-p (0..1, e.g. 0.95)\n"
-                   "  /topk <n>  top-k candidates (e.g. 40)\n"
-                   "  /help      show this\n"
-                   "  /exit      quit\n");
+                   "  /temp <v>     sampling temperature (0 = greedy, e.g. 0.7)\n"
+                   "  /topp <v>     nucleus top-p (0..1, e.g. 0.95)\n"
+                   "  /topk <n>     top-k candidates (e.g. 40)\n"
+                   "  /read <file>  send a file's contents as the message\n"
+                   "  /ctx [N]      show or resize the context (resize resets the chat)\n"
+                   "  /help         show this\n"
+                   "  /exit         quit\n");
             continue;
         }
         if (!strncmp(line, "/temp", 5) && (line[5] == ' ' || line[5] == '\0')) {
@@ -26087,6 +26089,46 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             if (line[5]) top_k = atoi(line + 6);
             printf("\033[2m(top_k = %d)\033[0m\n", top_k);
             continue;
+        }
+        if (!strncmp(line, "/ctx", 4) && (line[4] == ' ' || line[4] == '\0')) {
+            if (line[4] && atoi(line + 5) > 0) {
+                const uint32_t newc = (uint32_t)atoi(line + 5);
+                ds4_dense_gpu_free(g);
+                desc.n_ctx = newc; n_ctx = newc;
+                g = ds4_dense_gpu_create(&desc);
+                if (!g) { if (errlen) snprintf(err, errlen, "ctx resize failed"); rc = 1; break; }
+                pos = 0; first = true; base_pos = 0;
+                for (size_t i = 0; i < hist_n; i++) token_vec_free(&hist[i]);   /* reset transcript */
+                hist_n = 0;
+                printf("\033[2m(context resized to %u — conversation reset)\033[0m\n", newc);
+            } else {
+                printf("\033[2m(context = %u tokens; used %u)\033[0m\n", n_ctx, pos);
+            }
+            continue;
+        }
+        if (!strncmp(line, "/read ", 6)) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s", line + 6);
+            FILE *fp = fopen(path, "rb");
+            if (!fp) { printf("\033[2m(cannot open %s)\033[0m\n", path); continue; }
+            fseek(fp, 0, SEEK_END);
+            const long fsz = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            if (fsz <= 0) { fclose(fp); printf("\033[2m(empty or invalid file)\033[0m\n"); continue; }
+            /* read into a fresh buffer and replace `line` (linenoise-managed: free
+             * the old line, hand it our malloc'd one — linenoiseFree == free). */
+            char *fb = malloc((size_t)fsz + 1u);
+            if (!fb) { fclose(fp); continue; }
+            size_t rd = fread(fb, 1, (size_t)fsz, fp);
+            fclose(fp);
+            fb[rd] = '\0';
+            while (rd > 0 && (fb[rd - 1] == '\n' || fb[rd - 1] == '\r')) fb[--rd] = '\0';
+            if (rd == 0) { free(fb); continue; }
+            linenoiseFree(line);
+            line = fb;
+            nr = rd;
+            printf("\033[2m(loaded %s — %zu chars)\033[0m\n", path, rd);
+            /* fall through: the file content is now the user message */
         }
 
         const bool think_turn = think;
