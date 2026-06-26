@@ -26430,7 +26430,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     const char *base_sys = (system && system[0]) ? system : "You are a helpful assistant.";
-    const bool tools_on = getenv("DS4_DENSE_TOOLS") != NULL;   /* function-calling */
+    const bool tools_on = getenv("DS4_DENSE_NO_TOOLS") == NULL;   /* function-calling: ON by default */
     char *sys_buf = NULL;
     const char *sys = base_sys;
     if (tools_on) {
@@ -26698,7 +26698,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
 
         /* Tool loop: while the answer is a tool call, run it, feed the result back
          * as a <tool_response>, open a new assistant turn, and regenerate. Bounded.
-         * Active only when tools are enabled (DS4_DENSE_TOOLS). */
+         * Tools are ON by default (disable with DS4_DENSE_NO_TOOLS). */
         bool tool_used = false;
         if (tools_on && rc == 0) {
             char *tn_args = xmalloc(65536);   /* large: Write/Edit content can be big */
