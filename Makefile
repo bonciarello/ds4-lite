@@ -11,6 +11,10 @@ DEBUG_FLAGS ?= -g
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 
+# Build-time version = git short SHA (DwarfStar4 fork; antirez ds4 is unversioned).
+DS4_GIT_REV := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+CFLAGS += -DDS4_VERSION='"$(DS4_GIT_REV)"'
+
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 ROCM_SRCS := $(wildcard rocm/*.cuh)

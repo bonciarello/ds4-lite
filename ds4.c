@@ -26505,8 +26505,8 @@ static void dense_print_banner(const char *model_path, uint32_t n_ctx,
     printf("\n%s╭", Z); dense_rep("─", Wbox - 2); printf("╮\n");
     /* header */
     char hv[160];
-    int hlen = snprintf(hv, sizeof hv, " DwarfStar4 v%s     ctx %u tokens", DS4_VERSION, n_ctx);
-    printf("│ %sDwarfStar%s%s4%s v%s     ctx %u tokens", B, Z, W, Z, DS4_VERSION, n_ctx);
+    int hlen = snprintf(hv, sizeof hv, " DwarfStar4 build %s     ctx %u tokens", DS4_VERSION, n_ctx);
+    printf("│ %sDwarfStar%s%s4%s build %s     ctx %u tokens", B, Z, W, Z, DS4_VERSION, n_ctx);
     for (int i = hlen; i < Wbox - 2; i++) putchar(' ');   /* header content spans Wbox-2 */
     printf("│\n├"); dense_rep("─", WL + 2); printf("┬"); dense_rep("─", WR + 2); printf("┤\n");
     for (int i = 0; i < 9; i++) {
@@ -26568,7 +26568,10 @@ static char *dense_readline(const char *prompt, const char *model_path,
                 struct timeval tv = { 0, 140000 };
                 if (select(wp + 1, &wf, NULL, NULL, &tv) <= 0) break;
             }
+            /* clear the visible screen (scrollback preserved) so the previous,
+             * now-reflowed box doesn't linger garbled above the fresh one. */
             linenoiseHide(&ls);
+            fputs("\033[H\033[2J", stdout);
             dense_print_banner(model_path, n_ctx, device_str, NULL);
             linenoiseShow(&ls);
         }
