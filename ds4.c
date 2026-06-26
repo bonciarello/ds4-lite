@@ -26545,21 +26545,35 @@ static void dense_fmt_tok(uint32_t n, char *b, size_t cap) {
     else snprintf(b, cap, "%.1fk", (double)n / 1000.0);
 }
 
-/* Claude-Code-style context status line shown under the prompt: left = used/total
- * tokens, right = a progress bar + percentage, padded to the terminal width. Colors
- * are inline (linenoise treats CSI as zero-width when measuring the status). */
+/* Input-box width = banner-box width (terminal width - 1). */
+static int dense_box_w(void) { int w = dense_term_width() - 1; return w < 24 ? 24 : w; }
+
+/* Top border of the input box, '\r\n'-terminated by the caller. */
+static void dense_print_topbar(void) {
+    const int W = dense_box_w();
+    fputs("\033[2m╭", stdout);
+    for (int i = 0; i < W - 2; i++) fputs("─", stdout);
+    fputs("╮\033[0m", stdout);
+}
+
+/* Two-line status rendered under the prompt: the bottom border of the input box, then
+ * the Claude-Code-style context bar (used/total tokens left, progress bar + % right).
+ * Both span the box width; colors inline (linenoise treats CSI as zero-width). */
 static void dense_ctx_status(char *out, size_t cap, uint32_t used, uint32_t total) {
-    int cols = dense_term_width(); if (cols < 28) cols = 28;
+    const int W = dense_box_w();
+    size_t o = 0;
+    o += (size_t)snprintf(out + o, cap - o, "\033[2m╰");                 /* bottom border */
+    for (int i = 0; i < W - 2 && o + 6 < cap; i++) o += (size_t)snprintf(out + o, cap - o, "─");
+    o += (size_t)snprintf(out + o, cap - o, "╯\033[0m\n");
     char lu[16], lt[16];
     dense_fmt_tok(used, lu, sizeof lu); dense_fmt_tok(total, lt, sizeof lt);
     char left[48]; int lcells = snprintf(left, sizeof left, "context %s/%s", lu, lt);
     double frac = total ? (double)used / (double)total : 0.0; if (frac > 1.0) frac = 1.0;
     const int pct = (int)(frac * 100.0 + 0.5);
-    const int barw = cols < 52 ? 10 : 18;
+    const int barw = W < 52 ? 10 : 18;
     int filled = (int)(frac * barw + 0.5); if (filled > barw) filled = barw;
     char pctbuf[8]; int pl = snprintf(pctbuf, sizeof pctbuf, "%d%%", pct);
-    int pad = cols - lcells - (barw + 1 + pl); if (pad < 1) pad = 1;
-    size_t o = 0;
+    int pad = W - lcells - (barw + 1 + pl); if (pad < 1) pad = 1;
     o += (size_t)snprintf(out + o, cap - o, "\033[2m%s", left);
     for (int i = 0; i < pad && o + 1 < cap; i++) out[o++] = ' ';
     out[o] = '\0';
@@ -26568,6 +26582,19 @@ static void dense_ctx_status(char *out, size_t cap, uint32_t used, uint32_t tota
     o += (size_t)snprintf(out + o, cap - o, "\033[2m");                  /* empty = dim  */
     for (int i = filled; i < barw && o + 8 < cap; i++) o += (size_t)snprintf(out + o, cap - o, "░");
     snprintf(out + o, cap - o, " %s\033[0m", pctbuf);
+}
+
+/* Live status update: recompute used = base + ~tokens(typed) on every refresh so the
+ * bar moves as you type. Returns 0 (let linenoise keep its normal cursor positioning). */
+struct dense_ctx_priv { uint32_t base, total; };
+static int dense_layout_cb(struct linenoiseState *l, size_t pr, size_t sr, void *priv) {
+    (void)pr; (void)sr;
+    struct dense_ctx_priv *c = (struct dense_ctx_priv *)priv;
+    const uint32_t est = c->base + (uint32_t)((l->len + 3) / 4);   /* ~4 bytes/token */
+    char st[640];
+    dense_ctx_status(st, sizeof st, est, c->total);
+    linenoiseEditSetStatus(l, st, NULL, NULL);
+    return 0;
 }
 
 /* SIGWINCH -> self-pipe so the prompt's select() wakes on a terminal resize. */
@@ -26586,12 +26613,15 @@ static char *dense_readline(const char *prompt, const char *model_path,
     if (!isatty(STDIN_FILENO) || g_winch_pipe[0] < 0) return linenoise(prompt);
     static char linebuf[8192];
     struct linenoiseState ls;
+    dense_print_topbar(); fputs("\r\n", stdout); fflush(stdout);   /* input-box top border */
     if (linenoiseEditStart(&ls, STDIN_FILENO, STDOUT_FILENO, linebuf, sizeof linebuf, prompt) == -1)
         return linenoise(prompt);
-    char stbuf[320];
-    dense_ctx_status(stbuf, sizeof stbuf, used, n_ctx);   /* context-window bar under prompt */
+    struct dense_ctx_priv cpriv = { used, n_ctx };
+    linenoiseEditSetLayoutCallback(&ls, dense_layout_cb, &cpriv);  /* live update while typing */
+    char stbuf[640];
+    dense_ctx_status(stbuf, sizeof stbuf, used, n_ctx);   /* bottom border + context bar */
     linenoiseEditSetStatus(&ls, stbuf, NULL, NULL);
-    linenoiseShow(&ls);                                   /* render prompt + status now */
+    linenoiseShow(&ls);                                   /* render box + status now */
     char *res = NULL;
     const int wp = g_winch_pipe[0];
     for (;;) {
@@ -26620,7 +26650,8 @@ static char *dense_readline(const char *prompt, const char *model_path,
                           tcsetattr(STDOUT_FILENO, TCSANOW, &tc); }
             dense_print_banner(model_path, n_ctx, device_str, init_text);
             if (have_t) tcsetattr(STDOUT_FILENO, TCSANOW, &traw);
-            dense_ctx_status(stbuf, sizeof stbuf, used, n_ctx);   /* bar width follows resize */
+            dense_print_topbar(); fputs("\r\n", stdout);          /* input-box top border */
+            dense_ctx_status(stbuf, sizeof stbuf, used, n_ctx);   /* bar/box width follows resize */
             linenoiseEditSetStatus(&ls, stbuf, NULL, NULL);
             linenoiseShow(&ls);
         }
