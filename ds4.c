@@ -26032,6 +26032,169 @@ static void dense_chat_append_block(token_vec *t, const ds4_vocab *vocab,
     bpe_tokenize_text(vocab, "\n", t);
 }
 
+/* Generate one assistant response: stream tokens (sampling), render any
+ * <think>...</think> reasoning dimmed with the markers suppressed, and return the
+ * malloc'd answer text (everything after </think>). Advances *pos_io; sets *rc_io
+ * non-zero on a forward error. Shared by the normal turn and tool-response rounds. */
+static char *dense_chat_gen_response(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
+                                     const ds4_vocab *vocab, uint32_t *pos_io, uint32_t n_ctx,
+                                     float *logits, int im_end, bool think_turn,
+                                     float temp, float top_p, int top_k, uint64_t *rng, int *rc_io) {
+    uint32_t pos = *pos_io;
+    bool in_think = think_turn, answer_started = false;
+    char pend[16]; int pend_len = 0;
+    char *ans = NULL; size_t ans_len = 0, ans_cap = 0;
+    if (think_turn) { printf("\033[2m\xf0\x9f\x92\xad "); fflush(stdout); }
+    while (pos < n_ctx - 1u) {
+        const int next = dense_sample(logits, DS4_N_VOCAB, temp, top_p, top_k, rng);
+        if (next == im_end || next == vocab->eos_id) break;
+        char tb[96];
+        const int tn = dense_token_bytes(vocab, next, tb, sizeof(tb));
+        for (int k = 0; k < tn; k++) {
+            if (pend_len < (int)sizeof(pend)) pend[pend_len++] = tb[k];
+            if (pend_len >= 8 && memcmp(pend + pend_len - 8, "</think>", 8) == 0) {
+                const int pre = pend_len - 8;
+                if (pre > 0) { fwrite(pend, 1, (size_t)pre, stdout);
+                               if (!in_think) dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); }
+                pend_len = 0;
+                if (in_think) { printf("\033[0m\n"); in_think = false; }
+            } else if (pend_len >= 7 && memcmp(pend + pend_len - 7, "<think>", 7) == 0) {
+                const int pre = pend_len - 7;
+                if (pre > 0) { fwrite(pend, 1, (size_t)pre, stdout);
+                               if (!in_think) dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); }
+                pend_len = 0;
+                if (!in_think) { printf("\033[2m"); in_think = true; }
+            } else if (pend_len > 7) {
+                const char b = pend[0];
+                if (in_think) { fwrite(&b, 1, 1, stdout); }
+                else {
+                    dense_sbuf_append(&ans, &ans_len, &ans_cap, &b, 1);
+                    if (answer_started || (b != ' ' && b != '\n' && b != '\r' && b != '\t')) {
+                        answer_started = true; fwrite(&b, 1, 1, stdout);
+                    }
+                }
+                memmove(pend, pend + 1, (size_t)(--pend_len));
+            }
+        }
+        fflush(stdout);
+        if (ds4_dense_gpu_forward(g, desc, next, pos++, logits) != 0) { *rc_io = 1; break; }
+    }
+    if (pend_len > 0) {
+        if (in_think) fwrite(pend, 1, (size_t)pend_len, stdout);
+        else {
+            dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pend_len);
+            int s = 0;
+            if (!answer_started) while (s < pend_len && (pend[s]==' '||pend[s]=='\n'||pend[s]=='\r'||pend[s]=='\t')) s++;
+            if (pend_len - s > 0) { answer_started = true; fwrite(pend + s, 1, (size_t)(pend_len - s), stdout); }
+        }
+    }
+    if (in_think) printf("\033[0m");
+    *pos_io = pos;
+    return ans;
+}
+
+/* ---- Chat tools (Qwen2 Hermes-style function calling) --------------------- */
+
+/* Extract the LAST <tool_call>{json}</tool_call> from `text`. Fills name and the
+ * raw arguments-object string (the value of "arguments"). Returns true if found. */
+static bool dense_tool_find_call(const char *text, char *name, size_t name_cap,
+                                 char *args, size_t args_cap) {
+    const char *open = NULL, *p = text;
+    while ((p = strstr(p, "<tool_call>")) != NULL) { open = p; p += 11; }   /* last one */
+    if (!open) return false;
+    const char *close = strstr(open, "</tool_call>");
+    const char *body = open + 11;
+    const char *end = close ? close : body + strlen(body);
+    /* name: "name"\s*:\s*"..." */
+    const char *n = strstr(body, "\"name\"");
+    if (!n || n >= end) return false;
+    n = strchr(n + 6, '"'); if (!n || n >= end) return false;
+    n++; size_t i = 0;
+    while (n < end && *n != '"' && i + 1 < name_cap) name[i++] = *n++;
+    name[i] = '\0';
+    /* arguments: take the {...} object after "arguments" */
+    const char *a = strstr(body, "\"arguments\"");
+    args[0] = '\0';
+    if (a && a < end) {
+        const char *brace = strchr(a, '{');
+        if (brace && brace < end) {
+            int depth = 0; size_t j = 0; const char *q = brace;
+            for (; q < end && j + 1 < args_cap; q++) {
+                if (*q == '{') depth++;
+                else if (*q == '}') { depth--; }
+                args[j++] = *q;
+                if (depth == 0) break;
+            }
+            args[j] = '\0';
+        }
+    }
+    return name[0] != '\0';
+}
+
+/* Pull a string field "key":"value" out of a small JSON object. */
+static bool dense_json_str(const char *json, const char *key, char *out, size_t cap) {
+    char pat[64]; snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *k = strstr(json, pat);
+    if (!k) return false;
+    const char *c = strchr(k + strlen(pat), ':'); if (!c) return false;
+    const char *v = c + 1; while (*v == ' ' || *v == '\t') v++;
+    if (*v != '"') return false;
+    v++; size_t i = 0;
+    while (*v && *v != '"' && i + 1 < cap) {
+        if (*v == '\\' && v[1]) v++;   /* unescape */
+        out[i++] = *v++;
+    }
+    out[i] = '\0';
+    return true;
+}
+
+/* Execute a tool by name with JSON arguments; append the result text to *out
+ * (a growable buffer). Tools mirror Claude Code's Read / LS / Bash. */
+static void dense_tool_exec(const char *name, const char *args,
+                            char **out, size_t *out_len, size_t *out_cap) {
+    char buf[8192];
+    if (!strcmp(name, "read_file")) {
+        char path[PATH_MAX];
+        if (!dense_json_str(args, "path", path, sizeof(path))) { dense_sbuf_append(out, out_len, out_cap, "error: missing path", 19); return; }
+        FILE *fp = fopen(path, "rb");
+        if (!fp) { int n = snprintf(buf, sizeof(buf), "error: cannot open %s", path); dense_sbuf_append(out, out_len, out_cap, buf, (size_t)n); return; }
+        size_t total = 0; size_t rd;
+        while ((rd = fread(buf, 1, sizeof(buf), fp)) > 0 && total < 65536) { dense_sbuf_append(out, out_len, out_cap, buf, rd); total += rd; }
+        fclose(fp);
+    } else if (!strcmp(name, "list_dir")) {
+        char path[PATH_MAX];
+        if (!dense_json_str(args, "path", path, sizeof(path))) snprintf(path, sizeof(path), ".");
+        char cmd[PATH_MAX + 16]; snprintf(cmd, sizeof(cmd), "ls -la %s 2>&1", path);
+        FILE *fp = popen(cmd, "r");
+        if (!fp) { dense_sbuf_append(out, out_len, out_cap, "error: ls failed", 16); return; }
+        size_t rd; while ((rd = fread(buf, 1, sizeof(buf), fp)) > 0) dense_sbuf_append(out, out_len, out_cap, buf, rd);
+        pclose(fp);
+    } else if (!strcmp(name, "bash")) {
+        char command[4096];
+        if (!dense_json_str(args, "command", command, sizeof(command))) { dense_sbuf_append(out, out_len, out_cap, "error: missing command", 22); return; }
+        char cmd[4128]; snprintf(cmd, sizeof(cmd), "%s 2>&1", command);
+        FILE *fp = popen(cmd, "r");
+        if (!fp) { dense_sbuf_append(out, out_len, out_cap, "error: exec failed", 18); return; }
+        size_t total = 0, rd;
+        while ((rd = fread(buf, 1, sizeof(buf), fp)) > 0 && total < 65536) { dense_sbuf_append(out, out_len, out_cap, buf, rd); total += rd; }
+        pclose(fp);
+    } else {
+        int n = snprintf(buf, sizeof(buf), "error: unknown tool '%s'", name);
+        dense_sbuf_append(out, out_len, out_cap, buf, (size_t)n);
+    }
+    if (*out_len == 0) dense_sbuf_append(out, out_len, out_cap, "(no output)", 11);
+}
+
+/* System-prompt addendum describing the tools (Qwen2/Hermes function-calling). */
+static const char *DENSE_TOOLS_PROMPT =
+    "\n\nYou have access to tools. To use one, emit exactly:\n"
+    "<tool_call>\n{\"name\": \"<tool>\", \"arguments\": {<args>}}\n</tool_call>\n"
+    "and stop. The result will be returned to you in a <tool_response>. Available tools:\n"
+    "- read_file: arguments {\"path\": string} — returns the file's contents.\n"
+    "- list_dir: arguments {\"path\": string} — lists a directory (ls -la).\n"
+    "- bash: arguments {\"command\": string} — runs a shell command, returns its output.\n"
+    "Call a tool only when needed; otherwise answer directly. After tools return, give the final answer.";
+
 /* Interactive multi-turn chat REPL for dense (Qwen2-style ChatML) models. Keeps
  * the KV cache across turns (only the new tokens of each turn are prefilled) and
  * generates until <|im_end|>/EOS — no fixed token limit. Reads user lines from
@@ -26071,7 +26234,15 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     }
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-    const char *sys = (system && system[0]) ? system : "You are a helpful assistant.";
+    const char *base_sys = (system && system[0]) ? system : "You are a helpful assistant.";
+    const bool tools_on = getenv("DS4_DENSE_TOOLS") != NULL;   /* function-calling */
+    char *sys_buf = NULL;
+    const char *sys = base_sys;
+    if (tools_on) {
+        sys_buf = xmalloc(strlen(base_sys) + strlen(DENSE_TOOLS_PROMPT) + 1);
+        strcpy(sys_buf, base_sys); strcat(sys_buf, DENSE_TOOLS_PROMPT);
+        sys = sys_buf;
+    }
     /* Reflection directive, injected into the user message ONLY on /think turns so
      * non-think turns answer directly (a system-wide instruction would make the
      * model reflect even when off). */
@@ -26276,60 +26447,49 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
          * prints dimmed, the marker is dropped, then the final answer prints
          * normally. The answer text (after "</think>") is accumulated so the turn
          * can be re-fed clean (reasoning stripped from history). */
-        bool in_think = think_turn;
-        bool answer_started = false;   /* skip leading whitespace of the final answer */
-        char pend[16];
-        int pend_len = 0;
-        char *ans = NULL;
-        size_t ans_len = 0, ans_cap = 0;
-        if (think_turn) { printf("\033[2m\xf0\x9f\x92\xad "); fflush(stdout); }  /* dim + 💭 */
-        while (pos < n_ctx - 1u) {
-            const int next = dense_sample(logits, DS4_N_VOCAB, temp, top_p, top_k, &rng);
-            if (next == im_end || next == vocab.eos_id) break;   /* closed below */
-            char tb[96];
-            const int tn = dense_token_bytes(&vocab, next, tb, sizeof(tb));
-            for (int k = 0; k < tn; k++) {
-                if (pend_len < (int)sizeof(pend)) pend[pend_len++] = tb[k];
-                if (pend_len >= 8 && memcmp(pend + pend_len - 8, "</think>", 8) == 0) {
-                    const int pre = pend_len - 8;                 /* flush text before marker */
-                    if (pre > 0) { fwrite(pend, 1, (size_t)pre, stdout);
-                                   if (!in_think) dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); }
-                    pend_len = 0;
-                    if (in_think) { printf("\033[0m\n"); in_think = false; }   /* drop marker, exit dim */
-                } else if (pend_len >= 7 && memcmp(pend + pend_len - 7, "<think>", 7) == 0) {
-                    const int pre = pend_len - 7;
-                    if (pre > 0) { fwrite(pend, 1, (size_t)pre, stdout);
-                                   if (!in_think) dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); }
-                    pend_len = 0;
-                    if (!in_think) { printf("\033[2m"); in_think = true; }     /* drop marker, enter dim */
-                } else if (pend_len > 7) {                        /* keep <=7 bytes held back */
-                    const char b = pend[0];
-                    if (in_think) {
-                        fwrite(&b, 1, 1, stdout);                  /* reasoning, dim */
-                    } else {
-                        dense_sbuf_append(&ans, &ans_len, &ans_cap, &b, 1);  /* capture full answer */
-                        if (answer_started || (b != ' ' && b != '\n' && b != '\r' && b != '\t')) {
-                            answer_started = true; fwrite(&b, 1, 1, stdout);  /* skip leading ws */
-                        }
-                    }
-                    memmove(pend, pend + 1, (size_t)(--pend_len));
-                }
-            }
-            fflush(stdout);
-            if (ds4_dense_gpu_forward(g, &desc, next, pos++, logits) != 0) { rc = 1; break; }
-        }
-        if (pend_len > 0) {                                       /* flush whatever is left */
-            if (in_think) {
-                fwrite(pend, 1, (size_t)pend_len, stdout);
-            } else {
-                dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pend_len);
-                int s = 0;
-                if (!answer_started)
-                    while (s < pend_len && (pend[s]==' '||pend[s]=='\n'||pend[s]=='\r'||pend[s]=='\t')) s++;
-                if (pend_len - s > 0) { answer_started = true; fwrite(pend + s, 1, (size_t)(pend_len - s), stdout); }
+        char *ans = dense_chat_gen_response(g, &desc, &vocab, &pos, n_ctx, logits, im_end,
+                                            think_turn, temp, top_p, top_k, &rng, &rc);
+
+        /* Tool loop: while the answer is a tool call, run it, feed the result back
+         * as a <tool_response>, open a new assistant turn, and regenerate. Bounded.
+         * Active only when tools are enabled (DS4_DENSE_TOOLS). */
+        bool tool_used = false;
+        if (tools_on && rc == 0) {
+            for (int round = 0; round < 8; round++) {
+                char tn_name[64], tn_args[4096];
+                const char *at = ans ? ans : "";
+                while (*at==' '||*at=='\n'||*at=='\r'||*at=='\t') at++;
+                if (!dense_tool_find_call(at, tn_name, sizeof(tn_name), tn_args, sizeof(tn_args))) break;
+                tool_used = true;
+                /* close the assistant turn that emitted the call */
+                token_vec cl = {0}; token_vec_push(&cl, im_end); bpe_tokenize_text(&vocab, "\n", &cl);
+                for (uint32_t i = 0; i < (uint32_t)cl.len && pos < n_ctx - 1u; i++)
+                    if (ds4_dense_gpu_forward(g, &desc, cl.v[i], pos++, logits) != 0) rc = 1;
+                token_vec_free(&cl);
+                if (rc) break;
+                /* execute the tool */
+                printf("\033[2m\n[tool: %s]\033[0m\n", tn_name);
+                char *res = NULL; size_t rl = 0, rc2 = 0;
+                dense_tool_exec(tn_name, tn_args, &res, &rl, &rc2);
+                /* feed the tool_response as a user turn, then open assistant (+<think>) */
+                token_vec tr = {0};
+                char *wrap = xmalloc(rl + 64);
+                int wn = snprintf(wrap, rl + 64, "<tool_response>\n%s\n</tool_response>", res ? res : "");
+                dense_chat_append_block(&tr, &vocab, im_start, im_end, "user", wrap);
+                free(wrap); free(res);
+                token_vec_push(&tr, im_start); bpe_tokenize_text(&vocab, "assistant\n", &tr);
+                if (think_turn) bpe_tokenize_text(&vocab, "<think>\n", &tr);
+                (void)wn;
+                for (uint32_t i = 0; i < (uint32_t)tr.len && pos < n_ctx - 1u && rc == 0; i++)
+                    if (ds4_dense_gpu_forward(g, &desc, tr.v[i], pos++, logits) != 0) rc = 1;
+                token_vec_free(&tr);
+                if (rc) break;
+                free(ans);
+                ans = dense_chat_gen_response(g, &desc, &vocab, &pos, n_ctx, logits, im_end,
+                                              think_turn, temp, top_p, top_k, &rng, &rc);
+                if (rc) break;
             }
         }
-        if (in_think) printf("\033[0m");   /* never closed: restore color */
 
         /* Trim leading whitespace from the captured answer text. */
         const char *ans_trim = ans ? ans : "";
@@ -26341,7 +26501,9 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
          * <think> reasoning), so later turns don't imitate the reasoning and the
          * context isn't bloated. Otherwise keep the response as generated. */
         if (rc == 0) {
-            const bool strip = think_turn && !in_think && ans_trim[0] != '\0';
+            /* strip reflection when we got a clean post-</think> answer; never strip a
+             * tool turn (the tool call/response exchange must stay in the KV). */
+            const bool strip = think_turn && ans_trim[0] != '\0' && !tool_used;
             /* Canonical CLEAN turn: user (no directive) + assistant + answer. Used
              * both as the stripped KV content and as the sliding-window transcript. */
             token_vec turn_clean = {0};
@@ -26384,6 +26546,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
 
     for (size_t i = 0; i < hist_n; i++) token_vec_free(&hist[i]);
     free(hist);
+    free(sys_buf);
     linenoiseFree(line);
     free(logits);
     ds4_dense_gpu_free(g);
