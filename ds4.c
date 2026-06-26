@@ -23836,8 +23836,9 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
 }
 
 int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
-                          const int *tokens, unsigned M, unsigned start_pos, float *last_logits) {
-    (void)g; (void)desc; (void)tokens; (void)M; (void)start_pos; (void)last_logits; return 1;
+                          const int *tokens, unsigned M, unsigned start_pos,
+                          float *last_logits, float *all_logits) {
+    (void)g; (void)desc; (void)tokens; (void)M; (void)start_pos; (void)last_logits; (void)all_logits; return 1;
 }
 
 ds4_context_memory ds4_context_memory_estimate_with_prefill(
@@ -25882,23 +25883,68 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
      * matmul prefill by default; DS4_DENSE_NOPREFILL forces the per-token path. */
     const double t_start = now_sec();
     if (toks.len > 1 && !getenv("DS4_DENSE_NOPREFILL")) {
-        if (ds4_dense_gpu_prefill(g, &desc, toks.v, (unsigned)toks.len, 0, logits) != 0) rc = 1;
+        if (ds4_dense_gpu_prefill(g, &desc, toks.v, (unsigned)toks.len, 0, logits, NULL) != 0) rc = 1;
         else pos = (uint32_t)toks.len;
     } else {
         for (uint32_t i = 0; i < (uint32_t)toks.len; i++)
             if (ds4_dense_gpu_forward(g, &desc, toks.v[i], pos++, logits) != 0) { rc = 1; break; }
     }
     const double t_prefill = now_sec();
-    /* greedy decode (timed: decode t/s) */
+    /* greedy decode (timed: decode t/s). Prompt-lookup speculative decoding: when
+     * the last NGRAM tokens recur earlier in the sequence, speculate the matching
+     * continuation and verify it in ONE batched forward (weights read once for all
+     * candidates). Only tokens equal to the greedy argmax are accepted, so the
+     * output is IDENTICAL to plain greedy. DS4_DENSE_NOSPEC disables it. */
     printf("=== ds4 dense greedy (%d tokens) ===\n", n_predict);
     int n_gen = 0;
-    for (int n = 0; rc == 0 && n < n_predict; n++) {
+    const int NGRAM = 2, MAXSPEC = 4;
+    /* Opt-in (DS4_DENSE_SPEC): exact (only argmax-matching tokens accepted) and
+     * acceptance works on repetitive output, but the verify forward reuses the
+     * batched-prefill driver whose per-call buffer alloc + all-token output matmul
+     * currently outweigh the token savings — a net win needs a lightweight verify
+     * path with pre-allocated scratch (follow-up). Off by default. */
+    const bool spec = getenv("DS4_DENSE_SPEC") != NULL;
+    int n_accepted = 0, n_spec_fwd = 0;     /* stats */
+    int *seq = xmalloc(((size_t)toks.len + (size_t)n_predict + 8) * sizeof(int));
+    int seq_len = 0;
+    for (uint32_t i = 0; i < (uint32_t)toks.len; i++) seq[seq_len++] = toks.v[i];
+    float *spec_logits = (spec && pos > 0) ? xmalloc((size_t)(MAXSPEC + 1) * DS4_N_VOCAB * sizeof(float)) : NULL;
+    while (rc == 0 && n_gen < n_predict) {
         int next = sample_argmax(logits, DS4_N_VOCAB);
         if (next == vocab.eos_id) break;
-        dense_print_token(&vocab, next);
-        n_gen++;
-        if (ds4_dense_gpu_forward(g, &desc, next, pos++, logits) != 0) { rc = 1; break; }
+        /* emit next (always the true greedy token) and append it to the sequence */
+        dense_print_token(&vocab, next); seq[seq_len++] = next; n_gen++;
+        /* prompt-lookup: the bigram ENDING at next; its earlier continuation
+         * (cand[0..kc)) speculates the tokens at pos+1, pos+2, ... */
+        int cand[4], kc = 0;
+        if (spec_logits && seq_len >= NGRAM && n_gen < n_predict) {
+            for (int j = seq_len - NGRAM - 1; j >= 0; j--) {
+                if (memcmp(seq + j, seq + seq_len - NGRAM, (size_t)NGRAM * sizeof(int)) == 0) {
+                    while (kc < MAXSPEC && j + NGRAM + kc < seq_len) { cand[kc] = seq[j + NGRAM + kc]; kc++; }
+                    break;
+                }
+            }
+        }
+        if (kc > n_predict - n_gen) kc = n_predict - n_gen;
+        if (kc <= 0 || pos + (uint32_t)kc + 2u >= desc.n_ctx) {     /* plain step */
+            if (ds4_dense_gpu_forward(g, &desc, next, pos++, logits) != 0) { rc = 1; break; }
+        } else {                                                   /* speculative step */
+            int batch[1 + 4]; batch[0] = next;
+            for (int i = 0; i < kc; i++) batch[1 + i] = cand[i];
+            if (ds4_dense_gpu_prefill(g, &desc, batch, (unsigned)(1 + kc), pos, NULL, spec_logits) != 0) { rc = 1; break; }
+            n_spec_fwd++;
+            int a = 0;
+            for (int i = 0; i < kc && n_gen < n_predict; i++) {
+                const int pred = sample_argmax(spec_logits + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB);
+                if (pred != cand[i] || pred == vocab.eos_id) break;
+                dense_print_token(&vocab, pred); seq[seq_len++] = pred; n_gen++; a++;
+            }
+            n_accepted += a;
+            pos = pos + 1u + (uint32_t)a;                          /* keep next + accepted */
+            memcpy(logits, spec_logits + (size_t)a * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
+        }
     }
+    free(seq); free(spec_logits);
     const double t_end = now_sec();
     printf("\n");
     fflush(stdout);
@@ -25912,6 +25958,9 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
                 "ds4 dense metrics: prompt=%d tok, prefill %.2f t/s (TTFT %.3f s), "
                 "gen %.2f t/s (%d tok)\n",
                 (int)toks.len, prefill_tps, prefill_dt, gen_tps, n_gen);
+        if (spec && n_spec_fwd > 0)
+            fprintf(stderr, "ds4 dense speculative: %d tokens accepted over %d spec forwards\n",
+                    n_accepted, n_spec_fwd);
         /* Optional CSV row in the project's speed-bench format (DS4_BENCH_CSV=path). */
         const char *csv = getenv("DS4_BENCH_CSV");
         if (csv && csv[0]) {

@@ -202,9 +202,12 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
                           int token, unsigned pos, float *logits);
 
 /* Batched prefill: process M tokens at positions [start_pos, start_pos+M) in one
- * forward (matmuls), write the KV cache, and return the last token's logits. */
+ * forward (matmuls), write the KV cache, and return the last token's logits. If
+ * all_logits != NULL it is filled with [M, n_vocab] logits for every position
+ * (used by speculative verification); last_logits may be NULL then. */
 int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
-                          const int *tokens, unsigned M, unsigned start_pos, float *last_logits);
+                          const int *tokens, unsigned M, unsigned start_pos,
+                          float *last_logits, float *all_logits);
 
 /* Load a dense model and greedily generate n_predict tokens (self-contained). */
 int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict,
