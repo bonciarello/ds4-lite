@@ -39,6 +39,7 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <signal.h>
+#include <termios.h>
 
 #include "ds4.h"
 #include "ds4_distributed.h"
@@ -26468,12 +26469,14 @@ static int dense_term_width(void) {
 static void dense_print_banner(const char *model_path, uint32_t n_ctx,
                                const char *device_str, const char *init_text) {
     const char *B = "\033[1;34m", *W = "\033[1;37m", *Z = "\033[0m", *C = "\033[36m", *D = "\033[2m";
-    int TW = dense_term_width(); if (TW < 35) TW = 35;
+    /* leave a 1-column right margin: a line exactly the terminal width triggers the
+     * right-margin auto-wrap (+ our '\n' = a blank line) inside linenoise's raw mode. */
+    int TW = dense_term_width() - 1; if (TW < 35) TW = 35;
     /* logo column needs 27; commands prefer 34 but shrink (and truncate) on narrow
-     * terminals so the box always fits exactly within TW. */
+     * terminals so the box always fits within TW. */
     int WL = TW - 7 - 34; if (WL < 27) WL = 27;   /* left (logo/info) column */
     int WR = TW - 7 - WL; if (WR < 1) WR = 1;     /* right (commands) column */
-    const int Wbox = WL + WR + 7;            /* == TW */
+    const int Wbox = WL + WR + 7;            /* == TW (terminal width - 1) */
     const int FC = WL + WR + 3;              /* full-width content cells */
     static const char *dg[6] = {"██████╗ ","██╔══██╗","██║  ██║","██║  ██║","██████╔╝","╚═════╝ "};
     static const char *sg[6] = {"███████╗","██╔════╝","███████╗","╚════██║","███████║","╚══════╝"};
@@ -26531,7 +26534,10 @@ static void dense_print_banner(const char *model_path, uint32_t n_ctx,
         }
     }
     printf("╰"); dense_rep("─", Wbox - 2); printf("╯\n");
-    printf("%sreflection on · 8 tools on · arrows: edit/history · auto-slide when full%s\n\n", D, Z);
+    const char *foot = (Wbox >= 62) ? "reflection on · 8 tools on · arrows: edit/history · auto-slide"
+                     : (Wbox >= 44) ? "reflection · 8 tools · arrows · auto-slide"
+                                    : "reflection · tools on";
+    printf("%s%s%s\n\n", D, foot, Z);
     fflush(stdout);
 }
 
@@ -26568,11 +26574,18 @@ static char *dense_readline(const char *prompt, const char *model_path,
                 struct timeval tv = { 0, 140000 };
                 if (select(wp + 1, &wf, NULL, NULL, &tv) <= 0) break;
             }
-            /* clear the visible screen (scrollback preserved) so the previous,
-             * now-reflowed box doesn't linger garbled above the fresh one. */
+            /* Clear the visible screen (scrollback preserved) so the previous,
+             * now-reflowed box doesn't linger garbled above the fresh one. The banner
+             * uses '\n' for line breaks, but linenoise has the tty in raw mode where
+             * '\n' is a bare line feed (no carriage return) — so temporarily re-enable
+             * output post-processing (ONLCR: \n -> \r\n) for the redraw, then restore. */
             linenoiseHide(&ls);
             fputs("\033[H\033[2J", stdout);
+            struct termios traw; int have_t = (tcgetattr(STDOUT_FILENO, &traw) == 0);
+            if (have_t) { struct termios tc = traw; tc.c_oflag |= (OPOST | ONLCR);
+                          tcsetattr(STDOUT_FILENO, TCSANOW, &tc); }
             dense_print_banner(model_path, n_ctx, device_str, NULL);
+            if (have_t) tcsetattr(STDOUT_FILENO, TCSANOW, &traw);
             linenoiseShow(&ls);
         }
         if (FD_ISSET(STDIN_FILENO, &rf)) {
