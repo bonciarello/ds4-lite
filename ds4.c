@@ -26069,6 +26069,8 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                    "  /temp <v>     sampling temperature (0 = greedy, e.g. 0.7)\n"
                    "  /topp <v>     nucleus top-p (0..1, e.g. 0.95)\n"
                    "  /topk <n>     top-k candidates (e.g. 40)\n"
+                   "  /save <file>  save the conversation to a file\n"
+                   "  /load <file>  restore a saved conversation\n"
                    "  /read <file>  send a file's contents as the message\n"
                    "  /ctx [N]      show or resize the context (resize resets the chat)\n"
                    "  /help         show this\n"
@@ -26104,6 +26106,55 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             } else {
                 printf("\033[2m(context = %u tokens; used %u)\033[0m\n", n_ctx, pos);
             }
+            continue;
+        }
+        if (!strncmp(line, "/save ", 6)) {
+            FILE *fp = fopen(line + 6, "wb");
+            if (!fp) { printf("\033[2m(cannot write %s)\033[0m\n", line + 6); continue; }
+            const uint32_t magic = 0x44533453u; /* "DS4S" */
+            const uint32_t nh = (uint32_t)hist_n;
+            fwrite(&magic, 4, 1, fp); fwrite(&n_ctx, 4, 1, fp); fwrite(&nh, 4, 1, fp);
+            for (size_t i = 0; i < hist_n; i++) {
+                const uint32_t len = (uint32_t)hist[i].len;
+                fwrite(&len, 4, 1, fp);
+                fwrite(hist[i].v, sizeof(int), len, fp);
+            }
+            fclose(fp);
+            printf("\033[2m(saved %zu turns to %s)\033[0m\n", hist_n, line + 6);
+            continue;
+        }
+        if (!strncmp(line, "/load ", 6)) {
+            FILE *fp = fopen(line + 6, "rb");
+            if (!fp) { printf("\033[2m(cannot open %s)\033[0m\n", line + 6); continue; }
+            uint32_t magic = 0, saved_ctx = 0, nh = 0;
+            if (fread(&magic, 4, 1, fp) != 1 || magic != 0x44533453u) { fclose(fp); printf("\033[2m(not a session file)\033[0m\n"); continue; }
+            if (fread(&saved_ctx, 4, 1, fp) != 1 || fread(&nh, 4, 1, fp) != 1) { fclose(fp); printf("\033[2m(corrupt session)\033[0m\n"); continue; }
+            /* reset the conversation, re-feed the system block, then the saved turns */
+            for (size_t i = 0; i < hist_n; i++) token_vec_free(&hist[i]);
+            hist_n = 0; pos = 0;
+            { token_vec st = {0};
+              dense_chat_append_block(&st, &vocab, im_start, im_end, "system", sys);
+              for (uint32_t i = 0; i < (uint32_t)st.len && pos < n_ctx - 1u && rc == 0; i++)
+                  if (ds4_dense_gpu_forward(g, &desc, st.v[i], pos++, logits) != 0) rc = 1;
+              token_vec_free(&st); }
+            first = false; base_pos = pos;
+            uint32_t loaded = 0;
+            for (uint32_t tt = 0; tt < nh && rc == 0; tt++) {
+                uint32_t len = 0;
+                if (fread(&len, 4, 1, fp) != 1 || len == 0 || len > n_ctx) break;
+                token_vec tv = {0};
+                int ok_read = 1;
+                for (uint32_t k = 0; k < len; k++) { int tok; if (fread(&tok, sizeof(int), 1, fp) != 1) { ok_read = 0; break; } token_vec_push(&tv, tok); }
+                if (!ok_read) { token_vec_free(&tv); break; }
+                for (uint32_t i = 0; i < (uint32_t)tv.len && pos < n_ctx - 1u && rc == 0; i++)
+                    if (ds4_dense_gpu_forward(g, &desc, tv.v[i], pos++, logits) != 0) rc = 1;
+                if (hist_n == hist_cap) { hist_cap = hist_cap ? hist_cap * 2 : 16; hist = xrealloc(hist, hist_cap * sizeof(hist[0])); }
+                hist[hist_n++] = tv;
+                loaded++;
+            }
+            fclose(fp);
+            printf("\033[2m(loaded %u turns from %s%s)\033[0m\n", loaded, line + 6,
+                   saved_ctx != n_ctx ? " — ctx differs" : "");
             continue;
         }
         if (!strncmp(line, "/read ", 6)) {
