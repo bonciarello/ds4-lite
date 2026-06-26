@@ -26490,10 +26490,9 @@ static int dense_term_width(void) {
 static void dense_print_banner(const char *model_path, uint32_t n_ctx,
                                const char *device_str, const char *init_text) {
     const char *B = "\033[1;34m", *W = "\033[1;37m", *Z = "\033[0m", *C = "\033[36m", *D = "\033[2m";
-    /* full terminal width: the resize redraw re-enables ONLCR, so a line exactly the
-     * terminal width is safe, and it makes typed text (which the terminal wraps at the
-     * real width) wrap exactly at the input-box border. */
-    int TW = dense_term_width(); if (TW < 35) TW = 35;
+    /* terminal width - 1: a 1-column right margin so a box line never fills the last
+     * column (which on some terminals wraps and drifts the next line). */
+    int TW = dense_term_width() - 1; if (TW < 35) TW = 35;
     /* logo column needs 27; commands prefer 34 but shrink (and truncate) on narrow
      * terminals so the box always fits within TW. */
     int WL = TW - 7 - 34; if (WL < 27) WL = 27;   /* left (logo/info) column */
@@ -26567,8 +26566,9 @@ static void dense_fmt_tok(uint32_t n, char *b, size_t cap) {
     else snprintf(b, cap, "%.1fk", (double)n / 1000.0);
 }
 
-/* Input-box width = banner-box width = full terminal width. */
-static int dense_box_w(void) { int w = dense_term_width(); return w < 24 ? 24 : w; }
+/* Input/banner box width = terminal width - 1: a 1-column right margin so a box line
+ * never fills the last column (which on some real terminals wraps + drifts with '\n'). */
+static int dense_box_w(void) { int w = dense_term_width() - 1; return w < 24 ? 24 : w; }
 
 /* Top border of the input box, '\r\n'-terminated by the caller. */
 static void dense_print_topbar(void) {
