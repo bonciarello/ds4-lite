@@ -26054,7 +26054,7 @@ static char *dense_chat_gen_response(ds4_dense_gpu *g, const ds4_dense_model_des
                                      float *logits, int im_end, bool think_turn,
                                      float temp, float top_p, int top_k, uint64_t *rng, int *rc_io) {
     uint32_t pos = *pos_io;
-    bool in_think = think_turn, answer_started = false;
+    bool in_think = think_turn, answer_started = false, in_toolcall = false;
     char pend[16]; int pend_len = 0;
     char *ans = NULL; size_t ans_len = 0, ans_cap = 0;
     if (think_turn) { printf("\033[2m\xf0\x9f\x92\xad "); fflush(stdout); }
@@ -26077,9 +26077,21 @@ static char *dense_chat_gen_response(ds4_dense_gpu *g, const ds4_dense_model_des
                                if (!in_think) dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); }
                 pend_len = 0;
                 if (!in_think) { printf("\033[2m"); in_think = true; }
-            } else if (pend_len > 7) {
+            } else if (pend_len >= 11 && memcmp(pend + pend_len - 11, "<tool_call>", 11) == 0) {
+                /* tool call: stop echoing the raw JSON (it's rendered as a box by the
+                 * tool loop) but keep it in `ans` so the parser still finds it. */
+                const int pre = pend_len - 11;
+                if (pre > 0) { fwrite(pend, 1, (size_t)pre, stdout);
+                               if (!in_think) dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); }
+                pend_len = 0;
+                if (in_think) { printf("\033[0m\n"); in_think = false; }
+                in_toolcall = true;
+                dense_sbuf_append(&ans, &ans_len, &ans_cap, "<tool_call>", 11);
+                printf("\033[2m\xe2\x80\xa6\033[0m"); fflush(stdout);
+            } else if (pend_len > 11) {
                 const char b = pend[0];
                 if (in_think) { fwrite(&b, 1, 1, stdout); }
+                else if (in_toolcall) { dense_sbuf_append(&ans, &ans_len, &ans_cap, &b, 1); }
                 else {
                     dense_sbuf_append(&ans, &ans_len, &ans_cap, &b, 1);
                     if (answer_started || (b != ' ' && b != '\n' && b != '\r' && b != '\t')) {
@@ -26094,6 +26106,7 @@ static char *dense_chat_gen_response(ds4_dense_gpu *g, const ds4_dense_model_des
     }
     if (pend_len > 0) {
         if (in_think) fwrite(pend, 1, (size_t)pend_len, stdout);
+        else if (in_toolcall) dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pend_len);
         else {
             dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pend_len);
             int s = 0;
@@ -26372,6 +26385,32 @@ static void dense_tool_exec(const char *name, const char *args,
         dense_sbuf_append(out, out_len, out_cap, buf, (size_t)n);
     }
     if (*out_len == 0) dense_sbuf_append(out, out_len, out_cap, "(no output)", 11);
+}
+
+/* Pretty-print a tool call + a preview of its result as a bordered block. */
+static void dense_tool_render(const char *name, const char *args, const char *res, size_t rl) {
+    /* header: 🔧 name  (args dimmed) */
+    printf("\n\033[1;36m\xf0\x9f\x94\xa7 %s\033[0m \033[2m%s\033[0m\n", name, args ? args : "{}");
+    if (!res || rl == 0) { printf("\033[2m\xe2\x94\x82\033[0m \033[2m(nessun output)\033[0m\n"); fflush(stdout); return; }
+    int total = 0;
+    for (size_t i = 0; i < rl; i++) if (res[i] == '\n') total++;
+    if (rl > 0 && res[rl-1] != '\n') total++;
+    const int MAXL = 8;
+    const char *p = res; int shown = 0;
+    while (shown < MAXL && (size_t)(p - res) < rl) {
+        const char *nl = memchr(p, '\n', rl - (size_t)(p - res));
+        size_t len = nl ? (size_t)(nl - p) : rl - (size_t)(p - res);
+        size_t clip = len > 200 ? 200 : len;
+        printf("\033[36m\xe2\x94\x82\033[0m ");          /* cyan left border */
+        fwrite(p, 1, clip, stdout);
+        if (clip < len) printf("\033[2m\xe2\x80\xa6\033[0m");
+        printf("\n");
+        shown++;
+        if (!nl) break;
+        p = nl + 1;
+    }
+    if (total > shown) printf("\033[36m\xe2\x94\x82\033[0m \033[2m\xe2\x80\xa6 +%d righe\033[0m\n", total - shown);
+    fflush(stdout);
 }
 
 /* System-prompt addendum describing the tools (Qwen2/Hermes function-calling). */
@@ -26714,10 +26753,10 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                     if (ds4_dense_gpu_forward(g, &desc, cl.v[i], pos++, logits) != 0) rc = 1;
                 token_vec_free(&cl);
                 if (rc) break;
-                /* execute the tool */
-                printf("\033[2m\n[tool: %s]\033[0m\n", tn_name);
+                /* execute the tool + render the call/result as a bordered block */
                 char *res = NULL; size_t rl = 0, rc2 = 0;
                 dense_tool_exec(tn_name, tn_args, &res, &rl, &rc2);
+                dense_tool_render(tn_name, tn_args, res, rl);
                 /* feed the tool_response as a user turn, then open assistant (+<think>) */
                 token_vec tr = {0};
                 char *wrap = xmalloc(rl + 64);
