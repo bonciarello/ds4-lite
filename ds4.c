@@ -25918,7 +25918,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         return 1;
     }
 
-    const uint32_t n_ctx = ctx_size > 0 ? (uint32_t)ctx_size : 4096u;
+    uint32_t n_ctx = ctx_size > 0 ? (uint32_t)ctx_size : 4096u;
     ds4_dense_model_desc desc;
     dense_build_desc(&desc, &model, &weights, n_ctx);
 
@@ -25961,9 +25961,44 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         if (!strcmp(line, "/help")) {
             printf("  reflection is always on: the model reasons inside <think>...</think>\n"
                    "  (shown dimmed), then gives the final answer.\n"
-                   "  /help   show this\n"
-                   "  /exit   quit\n");
+                   "  /read <file>  send a file's contents as the message\n"
+                   "  /ctx [N]      show or resize the context (resize resets the chat)\n"
+                   "  /help         show this\n"
+                   "  /exit         quit\n");
             continue;
+        }
+        if (!strncmp(line, "/ctx", 4) && (line[4] == ' ' || line[4] == '\0')) {
+            if (line[4] && atoi(line + 5) > 0) {
+                const uint32_t newc = (uint32_t)atoi(line + 5);
+                ds4_dense_gpu_free(g);
+                desc.n_ctx = newc; n_ctx = newc;
+                g = ds4_dense_gpu_create(&desc);
+                if (!g) { if (errlen) snprintf(err, errlen, "ctx resize failed"); rc = 1; break; }
+                pos = 0; first = true;
+                printf("\033[2m(context resized to %u — conversation reset)\033[0m\n", newc);
+            } else {
+                printf("\033[2m(context = %u tokens; used %u)\033[0m\n", n_ctx, pos);
+            }
+            continue;
+        }
+        if (!strncmp(line, "/read ", 6)) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s", line + 6);
+            FILE *fp = fopen(path, "rb");
+            if (!fp) { printf("\033[2m(cannot open %s)\033[0m\n", path); continue; }
+            fseek(fp, 0, SEEK_END);
+            const long fsz = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            if (fsz <= 0) { fclose(fp); printf("\033[2m(empty or invalid file)\033[0m\n"); continue; }
+            if ((size_t)fsz + 1u > cap) { line = xrealloc(line, (size_t)fsz + 1u); cap = (size_t)fsz + 1u; }
+            const size_t rd = fread(line, 1, (size_t)fsz, fp);
+            fclose(fp);
+            line[rd] = '\0';
+            nr = (ssize_t)rd;
+            while (nr > 0 && (line[nr - 1] == '\n' || line[nr - 1] == '\r')) line[--nr] = '\0';
+            if (nr == 0) continue;
+            printf("\033[2m(loaded %s — %zd chars)\033[0m\n", path, (ssize_t)nr);
+            /* fall through: the file content is now the user message */
         }
 
         const bool think_turn = think;
