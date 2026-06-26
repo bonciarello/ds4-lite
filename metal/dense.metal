@@ -2827,3 +2827,20 @@ kernel void kernel_dense_ssm_conv_f32(
     }
     out[t * a.C + c] = s;
 }
+
+/* Inclusive prefix-sum along the contiguous axis (ggml_cumsum semantics). The
+ * chunkwise gated delta rule cumsum-s the (log-)decay along each chunk. Layout is
+ * row-major [R, N]: R independent rows of length N, out[r,i] = Σ_{j<=i} in[r,i].
+ * One thread per row (N = chunk length, small) — reference, correctness-first. */
+struct dense_cumsum_args { uint N; uint R; };
+kernel void kernel_dense_cumsum_f32(
+        constant dense_cumsum_args & a [[buffer(0)]],
+        device const float * in  [[buffer(1)]],   /* [R, N] row-major */
+        device       float * out [[buffer(2)]],   /* [R, N] row-major */
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.R) return;
+    device const float * ir = in  + (size_t)gid * a.N;
+    device       float * orr = out + (size_t)gid * a.N;
+    float acc = 0.0f;
+    for (uint i = 0; i < a.N; ++i) { acc += ir[i]; orr[i] = acc; }
+}

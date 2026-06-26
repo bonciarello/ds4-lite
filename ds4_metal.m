@@ -5469,6 +5469,51 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "ssm_conv max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
     }
 
+    /* --- Case 15: qwen3_next inclusive prefix-sum (kernel_dense_cumsum_f32) --- */
+    {
+        const uint32_t N = 64u, R = 5u;            /* chunk length, rows */
+        float *in = malloc((size_t)R*N*sizeof(float));
+        float *sref = malloc((size_t)R*N*sizeof(float));
+        float *sgot = malloc((size_t)R*N*sizeof(float));
+        bool ok = in && sref && sgot;
+        ds4_gpu_tensor *ib=0,*ob=0;
+        if (ok) {
+            for (uint32_t i=0;i<R*N;i++) in[i] = 0.01f*(float)(((i*3u)%17u)) - 0.08f;
+            for (uint32_t r=0;r<R;r++){ double acc=0; for(uint32_t i=0;i<N;i++){ acc+=(double)in[(size_t)r*N+i]; sref[(size_t)r*N+i]=(float)acc; } }
+            ib=ds4_gpu_tensor_alloc((uint64_t)R*N*sizeof(float));
+            ob=ds4_gpu_tensor_alloc((uint64_t)R*N*sizeof(float));
+            ok = ib && ob;
+        }
+        if (ok) {
+            ds4_gpu_tensor_write(ib,0,in,(uint64_t)R*N*sizeof(float));
+            struct __attribute__((packed)) { uint32_t N,R; } sa = { N, R };
+            id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dense_cumsum_f32");
+            ok = p != nil;
+            if (ok) {
+                int owned=0; id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+                ok = cb != nil;
+                if (ok) {
+                    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                    [enc setComputePipelineState:p];
+                    [enc setBytes:&sa length:sizeof(sa) atIndex:0];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(ib) offset:ds4_gpu_tensor_offset(ib) atIndex:1];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(ob) offset:ds4_gpu_tensor_offset(ob) atIndex:2];
+                    const NSUInteger tg = 64;
+                    [enc dispatchThreadgroups:MTLSizeMake((R+tg-1)/tg,1,1) threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
+                    ds4_gpu_end_compute_encoder(cb, enc);
+                    ok = ds4_gpu_finish_command_buffer(cb, owned, "selftest cumsum");
+                }
+            }
+        }
+        if (ok) ds4_gpu_tensor_read(ob,0,sgot,(uint64_t)R*N*sizeof(float));
+        ds4_gpu_tensor_free(ib); ds4_gpu_tensor_free(ob);
+        float maxerr = 0.0f;
+        if (ok) for (uint32_t i=0;i<R*N;i++){ float e=fabsf(sgot[i]-sref[i]); if(e>maxerr)maxerr=e; }
+        free(in); free(sref); free(sgot);
+        if (!ok) { if (errlen) snprintf(err, errlen, "cumsum GPU run failed"); goto free_gpu; }
+        if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "cumsum max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
+    }
+
     rc = 0;   /* all cases passed */
 free_gpu:
     ds4_gpu_tensor_free(wf32);

@@ -121,8 +121,8 @@ n_v_heads → `ggml_gated_linear_attn(q,v,k,gate=α',β,state)` → RMSNorm(`ssm
 `ggml_mul_mat`, `ggml_cumsum` (prefix-sum along the chunk), `ggml_pad`, `ggml_mul`,
 `ggml_transpose`, `ggml_cont`, `ggml_view`/`reshape`, plus a triangular mask. So the only
 **exotic kernels** ds4 lacks are:
-1. **`ssm_conv`** — causal depthwise 1-D conv. ✅ **landed + validated** (see §6).
-2. **`cumsum`** — segmented prefix-sum along a chunk axis. ⬜ small, easy to port + test.
+1. **`ssm_conv`** — causal depthwise 1-D conv. ✅ **landed + validated** (see §7).
+2. **`cumsum`** — inclusive prefix-sum along a chunk axis. ✅ **landed + validated** (§7).
 Everything else (the chunked matmuls, masking, gating) is expressible with ds4's existing
 dense matvec/elementwise kernels. This is **more tractable** than the original
 "port a selective-scan recurrence" framing — no numerically-delicate sequential scan kernel.
@@ -140,13 +140,18 @@ dense matvec/elementwise kernels. This is **more tractable** than the original
   (instead of crashing or loading garbage).
 
 ## 7. Kernel work landed (Phase 3, partial)
-- **`kernel_dense_ssm_conv_f32`** in `metal/dense.metal`: causal depthwise 1-D conv
-  (`out[t,c] = Σ_k sx[t+k,c]·w[k,c]`, history prepended → causal window). The first of
-  the two exotic kernels qwen3_next needs.
-- **Validated on-device** (M1 Max) as Case 14 of `./ds4 --metal-dense-selftest`: GPU vs
-  CPU reference, max err < 1e-5, PASS. Uses ds4's standard dispatch path
-  (`ds4_gpu_run`/buffers/pipeline), so it slots straight into the eventual DeltaNet graph.
-- **Remaining for a runnable model**: `cumsum` kernel (+ test); the chunked delta-rule
-  graph (matmuls/mask/gate via existing kernels); 512-expert MoE + shared expert; hybrid
-  per-layer dispatch + the recurrent conv/SSM **state cache**; end-to-end greedy match vs
-  llama.cpp — which needs the ~38 GB Qwen3-Coder-Next GGUF to validate.
+Both exotic kernels qwen3_next needs are now in `metal/dense.metal`, each validated
+on-device (M1 Max) against a CPU reference in `./ds4 --metal-dense-selftest` (PASS):
+- **`kernel_dense_ssm_conv_f32`** (Case 14) — causal depthwise 1-D conv
+  (`out[t,c] = Σ_k sx[t+k,c]·w[k,c]`, history prepended → causal window). max err < 1e-5.
+- **`kernel_dense_cumsum_f32`** (Case 15) — inclusive prefix-sum along the chunk axis
+  (`out[r,i] = Σ_{j<=i} in[r,j]`). max err < 1e-5.
+
+Both reuse ds4's standard dispatch path (buffers/pipeline/encode), so they slot directly
+into the eventual DeltaNet graph. Everything else the delta rule needs (chunked matmuls,
+triangular mask, gating) is already expressible with ds4's dense matvec/elementwise kernels.
+
+**Remaining for a runnable model** (all needs the ~38 GB Qwen3-Coder-Next GGUF to validate
+end-to-end, so deferred): wire the chunked delta-rule graph; 512-expert MoE + shared
+expert; hybrid per-layer dispatch (linear vs full attention every 4th); the recurrent
+conv/state **cache** (fixed-size per layer, not per-token); greedy match vs llama.cpp.
