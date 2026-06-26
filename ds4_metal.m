@@ -4089,9 +4089,13 @@ struct ds4_dense_gpu {
     uint64_t    model_size;
     bool   zerocopy;                 /* wrap mmap weights instead of copying */
     ds4_gpu_tensor *pm, *pl, *pacc;  /* split-KV attention partials [n_head, S_max(, hd)] */
+    /* pre-allocated scratch for small batched forwards (speculative verify), so
+     * the per-call alloc/free overhead is paid once. Sized DS4_VERIFY_MAX rows. */
+    ds4_gpu_tensor *vXb, *vHb, *vOb, *vQb, *vattb, *vgateb, *vupb, *vactb, *vAllT;
 };
 
 #define DS4_ATTN_SPLIT_MAX 64u   /* max KV splits for long-context attention */
+#define DS4_VERIFY_MAX     32u    /* max tokens for the pre-allocated verify path */
 
 static ds4_gpu_tensor *dense_cached_weight(ds4_dense_gpu *g, const void *data, uint64_t bytes) {
     NSNumber *key = @((unsigned long long)(uintptr_t)data);
@@ -4257,6 +4261,13 @@ ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
     g->pm   = ds4_gpu_tensor_alloc((uint64_t)d->n_head*DS4_ATTN_SPLIT_MAX*4);
     g->pl   = ds4_gpu_tensor_alloc((uint64_t)d->n_head*DS4_ATTN_SPLIT_MAX*4);
     g->pacc = ds4_gpu_tensor_alloc((uint64_t)d->n_head*DS4_ATTN_SPLIT_MAX*d->head_dim*4);
+    /* pre-allocated verify scratch (DS4_VERIFY_MAX rows) */
+    const uint64_t V = DS4_VERIFY_MAX;
+    g->vXb=ds4_gpu_tensor_alloc(V*g->n_embd*4);   g->vHb=ds4_gpu_tensor_alloc(V*g->n_embd*4);
+    g->vOb=ds4_gpu_tensor_alloc(V*g->n_embd*4);   g->vQb=ds4_gpu_tensor_alloc(V*g->qd*4);
+    g->vattb=ds4_gpu_tensor_alloc(V*g->qd*4);     g->vgateb=ds4_gpu_tensor_alloc(V*g->n_ff*4);
+    g->vupb=ds4_gpu_tensor_alloc(V*g->n_ff*4);    g->vactb=ds4_gpu_tensor_alloc(V*g->n_ff*4);
+    g->vAllT=ds4_gpu_tensor_alloc(V*(uint64_t)g->n_vocab*4);
     return g;
 }
 
@@ -4277,6 +4288,9 @@ void ds4_dense_gpu_free(ds4_dense_gpu *g) {
     ds4_gpu_tensor_free(g->gate); ds4_gpu_tensor_free(g->up); ds4_gpu_tensor_free(g->act);
     ds4_gpu_tensor_free(g->logits);
     ds4_gpu_tensor_free(g->pm); ds4_gpu_tensor_free(g->pl); ds4_gpu_tensor_free(g->pacc);
+    ds4_gpu_tensor_free(g->vXb); ds4_gpu_tensor_free(g->vHb); ds4_gpu_tensor_free(g->vOb);
+    ds4_gpu_tensor_free(g->vQb); ds4_gpu_tensor_free(g->vattb); ds4_gpu_tensor_free(g->vgateb);
+    ds4_gpu_tensor_free(g->vupb); ds4_gpu_tensor_free(g->vactb); ds4_gpu_tensor_free(g->vAllT);
     if (g->kv) for (uint32_t il = 0; il < g->n_layer; il++) { ds4_gpu_tensor_free(g->kv[il].k); ds4_gpu_tensor_free(g->kv[il].v); }
     free(g->kv); free(g->embedscratch); free(g->hostscratch);
     for (NSNumber *key in g->wcache) ds4_gpu_tensor_free((ds4_gpu_tensor *)[g->wcache[key] pointerValue]);
@@ -4624,18 +4638,21 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
         const float eps=d->rms_eps, base=d->rope_base, scale=1.0f/sqrtf((float)hd);
         const uint32_t nblk = ne/256u;
 
-        ds4_gpu_tensor *Xb=ds4_gpu_tensor_alloc((uint64_t)M*ne*4);
-        ds4_gpu_tensor *Hb=ds4_gpu_tensor_alloc((uint64_t)M*ne*4);
-        ds4_gpu_tensor *Ob=ds4_gpu_tensor_alloc((uint64_t)M*ne*4);
-        ds4_gpu_tensor *Qb=ds4_gpu_tensor_alloc((uint64_t)M*qd*4);
-        ds4_gpu_tensor *attb=ds4_gpu_tensor_alloc((uint64_t)M*qd*4);
-        ds4_gpu_tensor *gateb=ds4_gpu_tensor_alloc((uint64_t)M*nff*4);
-        ds4_gpu_tensor *upb=ds4_gpu_tensor_alloc((uint64_t)M*nff*4);
-        ds4_gpu_tensor *actb=ds4_gpu_tensor_alloc((uint64_t)M*nff*4);
-        ds4_gpu_tensor *Hrow=ds4_gpu_tensor_alloc((uint64_t)ne*4);
-        ds4_gpu_tensor *logitsT=ds4_gpu_tensor_alloc((uint64_t)d->n_vocab*4);
+        /* reuse pre-allocated scratch for small batches (speculative verify) */
+        const bool use_pre = (M <= DS4_VERIFY_MAX && g->vXb != NULL);
+        ds4_gpu_tensor *Xb = use_pre ? g->vXb : ds4_gpu_tensor_alloc((uint64_t)M*ne*4);
+        ds4_gpu_tensor *Hb = use_pre ? g->vHb : ds4_gpu_tensor_alloc((uint64_t)M*ne*4);
+        ds4_gpu_tensor *Ob = use_pre ? g->vOb : ds4_gpu_tensor_alloc((uint64_t)M*ne*4);
+        ds4_gpu_tensor *Qb = use_pre ? g->vQb : ds4_gpu_tensor_alloc((uint64_t)M*qd*4);
+        ds4_gpu_tensor *attb = use_pre ? g->vattb : ds4_gpu_tensor_alloc((uint64_t)M*qd*4);
+        ds4_gpu_tensor *gateb = use_pre ? g->vgateb : ds4_gpu_tensor_alloc((uint64_t)M*nff*4);
+        ds4_gpu_tensor *upb = use_pre ? g->vupb : ds4_gpu_tensor_alloc((uint64_t)M*nff*4);
+        ds4_gpu_tensor *actb = use_pre ? g->vactb : ds4_gpu_tensor_alloc((uint64_t)M*nff*4);
+        ds4_gpu_tensor *Hrow = all_logits ? NULL : ds4_gpu_tensor_alloc((uint64_t)ne*4);
+        ds4_gpu_tensor *logitsT = all_logits ? NULL : ds4_gpu_tensor_alloc((uint64_t)d->n_vocab*4);
         float *emb = malloc((size_t)ne*sizeof(float));
-        bool ok = Xb&&Hb&&Ob&&Qb&&attb&&gateb&&upb&&actb&&Hrow&&logitsT&&emb;
+        bool ok = Xb&&Hb&&Ob&&Qb&&attb&&gateb&&upb&&actb&&emb
+                  && (all_logits || (Hrow && logitsT));
 
         for (uint32_t m=0; ok && m<M; m++) {
             const uint8_t *row = (const uint8_t*)d->token_embd.data + (size_t)tokens[m]*nblk*144u;
@@ -4680,7 +4697,7 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
 
         ds4_gpu_tensor *allT = NULL;
         if (ok && all_logits) {       /* logits for ALL M tokens (speculative verify) */
-            allT = ds4_gpu_tensor_alloc((uint64_t)M*d->n_vocab*4);
+            allT = use_pre ? g->vAllT : ds4_gpu_tensor_alloc((uint64_t)M*d->n_vocab*4);
             ok = allT
               && dense_rms_batch(g, Hb, Xb, &d->output_norm, M, ne, eps)
               && dense_matmul_w(g, &d->output, Hb, allT, M);
@@ -4702,12 +4719,13 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
         } else if (ok && last_logits) {
             ds4_gpu_tensor_read(logitsT, 0, last_logits, (uint64_t)d->n_vocab*4);
         }
-        ds4_gpu_tensor_free(allT);
-
-        ds4_gpu_tensor_free(Xb); ds4_gpu_tensor_free(Hb); ds4_gpu_tensor_free(Ob);
-        ds4_gpu_tensor_free(Qb); ds4_gpu_tensor_free(attb); ds4_gpu_tensor_free(gateb);
-        ds4_gpu_tensor_free(upb); ds4_gpu_tensor_free(actb); ds4_gpu_tensor_free(Hrow);
-        ds4_gpu_tensor_free(logitsT); free(emb);
+        ds4_gpu_tensor_free(Hrow); ds4_gpu_tensor_free(logitsT); free(emb);  /* NULL-safe */
+        if (!use_pre) {
+            ds4_gpu_tensor_free(allT);
+            ds4_gpu_tensor_free(Xb); ds4_gpu_tensor_free(Hb); ds4_gpu_tensor_free(Ob);
+            ds4_gpu_tensor_free(Qb); ds4_gpu_tensor_free(attb); ds4_gpu_tensor_free(gateb);
+            ds4_gpu_tensor_free(upb); ds4_gpu_tensor_free(actb);
+        }
         return ok ? 0 : 1;
     }
 }

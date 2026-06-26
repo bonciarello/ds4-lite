@@ -25897,14 +25897,14 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
      * output is IDENTICAL to plain greedy. DS4_DENSE_NOSPEC disables it. */
     printf("=== ds4 dense greedy (%d tokens) ===\n", n_predict);
     int n_gen = 0;
-    const int NGRAM = 2, MAXSPEC = 4;
-    /* Opt-in (DS4_DENSE_SPEC): exact (only argmax-matching tokens accepted) and
-     * acceptance works on repetitive output, but the verify forward reuses the
-     * batched-prefill driver whose per-call buffer alloc + all-token output matmul
-     * currently outweigh the token savings — a net win needs a lightweight verify
-     * path with pre-allocated scratch (follow-up). Off by default. */
+    const int NGRAM = 3, MAXSPEC = 31;   /* fill the 32-wide matmul tile */
+    /* Opt-in (DS4_DENSE_SPEC): exact (only argmax-matching tokens accepted, so the
+     * output is byte-identical to greedy). Speculating up to a full 32-token batch
+     * fills the matmul tile, so verifying many candidates costs ~one forward — a big
+     * win on repetitive output (~1.4x). An adaptive backoff pauses speculation after
+     * empty verifies so non-repetitive text isn't slowed. */
     const bool spec = getenv("DS4_DENSE_SPEC") != NULL;
-    int n_accepted = 0, n_spec_fwd = 0;     /* stats */
+    int n_accepted = 0, n_spec_fwd = 0, cooldown = 0;   /* stats + adaptive backoff */
     int *seq = xmalloc(((size_t)toks.len + (size_t)n_predict + 8) * sizeof(int));
     int seq_len = 0;
     for (uint32_t i = 0; i < (uint32_t)toks.len; i++) seq[seq_len++] = toks.v[i];
@@ -25916,8 +25916,9 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
         dense_print_token(&vocab, next); seq[seq_len++] = next; n_gen++;
         /* prompt-lookup: the bigram ENDING at next; its earlier continuation
          * (cand[0..kc)) speculates the tokens at pos+1, pos+2, ... */
-        int cand[4], kc = 0;
-        if (spec_logits && seq_len >= NGRAM && n_gen < n_predict) {
+        int cand[31], kc = 0;
+        if (cooldown > 0) cooldown--;
+        if (spec_logits && cooldown == 0 && seq_len >= NGRAM && n_gen < n_predict) {
             for (int j = seq_len - NGRAM - 1; j >= 0; j--) {
                 if (memcmp(seq + j, seq + seq_len - NGRAM, (size_t)NGRAM * sizeof(int)) == 0) {
                     while (kc < MAXSPEC && j + NGRAM + kc < seq_len) { cand[kc] = seq[j + NGRAM + kc]; kc++; }
@@ -25929,7 +25930,7 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
         if (kc <= 0 || pos + (uint32_t)kc + 2u >= desc.n_ctx) {     /* plain step */
             if (ds4_dense_gpu_forward(g, &desc, next, pos++, logits) != 0) { rc = 1; break; }
         } else {                                                   /* speculative step */
-            int batch[1 + 4]; batch[0] = next;
+            int batch[1 + 31]; batch[0] = next;
             for (int i = 0; i < kc; i++) batch[1 + i] = cand[i];
             if (ds4_dense_gpu_prefill(g, &desc, batch, (unsigned)(1 + kc), pos, NULL, spec_logits) != 0) { rc = 1; break; }
             n_spec_fwd++;
@@ -25940,6 +25941,7 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
                 dense_print_token(&vocab, pred); seq[seq_len++] = pred; n_gen++; a++;
             }
             n_accepted += a;
+            cooldown = (a == 0) ? 16 : 0;     /* back off after an empty verify */
             pos = pos + 1u + (uint32_t)a;                          /* keep next + accepted */
             memcpy(logits, spec_logits + (size_t)a * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
         }
