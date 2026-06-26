@@ -2844,3 +2844,35 @@ kernel void kernel_dense_cumsum_f32(
     float acc = 0.0f;
     for (uint i = 0; i < a.N; ++i) { acc += ir[i]; orr[i] = acc; }
 }
+
+/* Per-head RMSNorm with a shared weight (qwen3_next full-attn q/k norm). Input is
+ * [n_head, head_dim] row-major; each head is normalized independently over head_dim
+ * with weight w[head_dim]. One thread per head — reference, correctness-first. */
+struct dense_head_rms_args { uint n_head; uint head_dim; float eps; };
+kernel void kernel_dense_head_rms_norm_f32(
+        constant dense_head_rms_args & a [[buffer(0)]],
+        device const float * x   [[buffer(1)]],   /* [n_head, head_dim] */
+        device const float * w   [[buffer(2)]],   /* [head_dim] */
+        device       float * out [[buffer(3)]],   /* [n_head, head_dim] */
+        uint h [[thread_position_in_grid]]) {
+    if (h >= a.n_head) return;
+    device const float * xh = x   + (size_t)h * a.head_dim;
+    device       float * oh = out + (size_t)h * a.head_dim;
+    float ss = 0.0f;
+    for (uint i = 0; i < a.head_dim; ++i) ss += xh[i] * xh[i];
+    const float scale = 1.0f / sqrt(ss / (float)a.head_dim + a.eps);
+    for (uint i = 0; i < a.head_dim; ++i) oh[i] = xh[i] * scale * w[i];
+}
+
+/* Sigmoid output gate: out[i] = x[i] * sigmoid(gate[i]). qwen3_next gates both the
+ * full-attn output and (via SiLU, separate kernel) the DeltaNet output. */
+struct dense_sigmoid_gate_args { uint n; };
+kernel void kernel_dense_sigmoid_gate_f32(
+        constant dense_sigmoid_gate_args & a [[buffer(0)]],
+        device const float * x    [[buffer(1)]],
+        device const float * gate [[buffer(2)]],
+        device       float * out  [[buffer(3)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.n) return;
+    out[gid] = x[gid] * (1.0f / (1.0f + exp(-gate[gid])));
+}

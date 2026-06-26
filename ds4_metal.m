@@ -5514,6 +5514,71 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "cumsum max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
     }
 
+    /* --- Case 16: qwen3_next per-head RMSNorm (kernel_dense_head_rms_norm_f32) --- */
+    {
+        const uint32_t NH = 4u, HD = 32u; const float eps = 1e-6f;
+        float *xin = malloc((size_t)NH*HD*4), *wv = malloc((size_t)HD*4);
+        float *ref = malloc((size_t)NH*HD*4), *got = malloc((size_t)NH*HD*4);
+        bool ok = xin && wv && ref && got;
+        ds4_gpu_tensor *xb=0,*wb=0,*ob=0;
+        if (ok) {
+            for (uint32_t i=0;i<NH*HD;i++) xin[i]=0.02f*(float)(((i*7u)%19u))-0.15f;
+            for (uint32_t i=0;i<HD;i++)    wv[i]=0.5f+0.01f*(float)i;
+            for (uint32_t h=0;h<NH;h++){ double ss=0; for(uint32_t i=0;i<HD;i++) ss+=(double)xin[h*HD+i]*xin[h*HD+i];
+                float sc=1.0f/sqrtf((float)(ss/(double)HD)+eps); for(uint32_t i=0;i<HD;i++) ref[h*HD+i]=xin[h*HD+i]*sc*wv[i]; }
+            xb=ds4_gpu_tensor_alloc((uint64_t)NH*HD*4); wb=ds4_gpu_tensor_alloc((uint64_t)HD*4); ob=ds4_gpu_tensor_alloc((uint64_t)NH*HD*4);
+            ok = xb&&wb&&ob;
+        }
+        if (ok) {
+            ds4_gpu_tensor_write(xb,0,xin,(uint64_t)NH*HD*4); ds4_gpu_tensor_write(wb,0,wv,(uint64_t)HD*4);
+            struct __attribute__((packed)) { uint32_t nh,hd; float eps; } ha = { NH, HD, eps };
+            id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dense_head_rms_norm_f32");
+            ok = p != nil;
+            if (ok) { int owned=0; id<MTLCommandBuffer> cb=ds4_gpu_command_buffer(&owned); ok=cb!=nil;
+                if (ok) { id<MTLComputeCommandEncoder> enc=ds4_gpu_compute_encoder(cb);
+                    [enc setComputePipelineState:p]; [enc setBytes:&ha length:sizeof(ha) atIndex:0];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(xb) offset:ds4_gpu_tensor_offset(xb) atIndex:1];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(wb) offset:ds4_gpu_tensor_offset(wb) atIndex:2];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(ob) offset:ds4_gpu_tensor_offset(ob) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake((NH+63u)/64u,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+                    ds4_gpu_end_compute_encoder(cb, enc); ok=ds4_gpu_finish_command_buffer(cb,owned,"selftest head_rms"); } }
+        }
+        if (ok) ds4_gpu_tensor_read(ob,0,got,(uint64_t)NH*HD*4);
+        ds4_gpu_tensor_free(xb); ds4_gpu_tensor_free(wb); ds4_gpu_tensor_free(ob);
+        float me=0; if (ok) for(uint32_t i=0;i<NH*HD;i++){ float e=fabsf(got[i]-ref[i]); if(e>me)me=e; }
+        free(xin); free(wv); free(ref); free(got);
+        if (!ok) { if (errlen) snprintf(err, errlen, "head_rms GPU run failed"); goto free_gpu; }
+        if (me >= 1e-5f) { if (errlen) snprintf(err, errlen, "head_rms max err %.6g >= 1e-5", (double)me); goto free_gpu; }
+    }
+
+    /* --- Case 17: qwen3_next sigmoid output gate (kernel_dense_sigmoid_gate_f32) --- */
+    {
+        const uint32_t n = 96u;
+        float xin[96], gin[96], ref[96], got[96];
+        for (uint32_t i=0;i<n;i++){ xin[i]=0.03f*(float)i-1.2f; gin[i]=0.05f*(float)i-2.0f; }
+        for (uint32_t i=0;i<n;i++) ref[i]=xin[i]*(1.0f/(1.0f+expf(-gin[i])));
+        ds4_gpu_tensor *xb=ds4_gpu_tensor_alloc(n*4), *gb=ds4_gpu_tensor_alloc(n*4), *ob=ds4_gpu_tensor_alloc(n*4);
+        bool ok = xb&&gb&&ob;
+        if (ok) {
+            ds4_gpu_tensor_write(xb,0,xin,n*4); ds4_gpu_tensor_write(gb,0,gin,n*4);
+            id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dense_sigmoid_gate_f32");
+            ok = p != nil;
+            if (ok) { int owned=0; id<MTLCommandBuffer> cb=ds4_gpu_command_buffer(&owned); ok=cb!=nil;
+                if (ok) { id<MTLComputeCommandEncoder> enc=ds4_gpu_compute_encoder(cb);
+                    [enc setComputePipelineState:p]; [enc setBytes:&n length:sizeof(n) atIndex:0];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(xb) offset:ds4_gpu_tensor_offset(xb) atIndex:1];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(gb) offset:ds4_gpu_tensor_offset(gb) atIndex:2];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(ob) offset:ds4_gpu_tensor_offset(ob) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake((n+63u)/64u,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+                    ds4_gpu_end_compute_encoder(cb, enc); ok=ds4_gpu_finish_command_buffer(cb,owned,"selftest sigmoid_gate"); } }
+        }
+        if (ok) ds4_gpu_tensor_read(ob,0,got,n*4);
+        ds4_gpu_tensor_free(xb); ds4_gpu_tensor_free(gb); ds4_gpu_tensor_free(ob);
+        float me=0; if (ok) for(uint32_t i=0;i<n;i++){ float e=fabsf(got[i]-ref[i]); if(e>me)me=e; }
+        if (!ok) { if (errlen) snprintf(err, errlen, "sigmoid_gate GPU run failed"); goto free_gpu; }
+        if (me >= 1e-5f) { if (errlen) snprintf(err, errlen, "sigmoid_gate max err %.6g >= 1e-5", (double)me); goto free_gpu; }
+    }
+
     rc = 0;   /* all cases passed */
 free_gpu:
     ds4_gpu_tensor_free(wf32);
