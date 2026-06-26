@@ -36,6 +36,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <glob.h>
+#include <sys/ioctl.h>
 
 #include "ds4.h"
 #include "ds4_distributed.h"
@@ -26440,58 +26441,86 @@ static const char *DENSE_TOOLS_PROMPT =
 /* Repeat a UTF-8 glyph n times. */
 static void dense_rep(const char *s, int n) { for (int i = 0; i < n; i++) fputs(s, stdout); }
 
-/* Claude-Code-style startup banner: a rounded box whose left column shows the DS4
- * logo (D,S blue; 4 white) + the model and launch directory, and whose right column
- * lists the slash commands. Left/right inner widths are 34/32 visible cells. */
-static void dense_print_banner(const char *model_path, uint32_t n_ctx) {
-    const char *B = "\033[1;34m", *W = "\033[1;37m", *Z = "\033[0m", *C = "\033[36m";
+/* Usable terminal width for the banner box (clamped to [68,120]). */
+static int dense_term_width(void) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col >= 40) {
+        int w = ws.ws_col; return w > 120 ? 120 : w;
+    }
+    const char *c = getenv("COLUMNS");
+    if (c && atoi(c) >= 40) { int w = atoi(c); return w > 120 ? 120 : (w < 68 ? 68 : w); }
+    return 80;
+}
+
+/* Claude-Code-style startup banner: a rounded box spanning the terminal width. Left
+ * column: the DS4 logo (D,S blue; 4 white) + model, launch dir, and Metal device.
+ * Right column: the slash commands. A full-width section below holds the Metal init
+ * log (init_text, '\n'-separated). device_str/init_text may be NULL. */
+static void dense_print_banner(const char *model_path, uint32_t n_ctx,
+                               const char *device_str, const char *init_text) {
+    const char *B = "\033[1;34m", *W = "\033[1;37m", *Z = "\033[0m", *C = "\033[36m", *D = "\033[2m";
+    const int TW = dense_term_width();
+    const int WR = 34;                       /* right (commands) column */
+    int WL = TW - 7 - WR; if (WL < 27) WL = 27;
+    const int Wbox = WL + WR + 7;            /* actual box width */
+    const int FC = WL + WR + 3;              /* full-width content cells */
     static const char *dg[6] = {"██████╗ ","██╔══██╗","██║  ██║","██║  ██║","██████╔╝","╚═════╝ "};
     static const char *sg[6] = {"███████╗","██╔════╝","███████╗","╚════██║","███████║","╚══════╝"};
     static const char *fg[6] = {"██╗  ██╗","██║  ██║","███████║","╚════██║","     ██║","     ╚═╝"};
     static const char *cmd[9] = {
-        "/help        all commands",
-        "/temp <v>    temperature",
-        "/topp <v>    nucleus (top-p)",
-        "/topk <n>    top-k sampling",
-        "/ctx [N]     show/resize ctx",
-        "/save /load  session file",
-        "/read <f>    file as message",
-        "/exit        quit (Ctrl-D)",
-        "" };
-    /* model basename + cwd (with ~ for $HOME), truncated to fit the column */
+        "/help        all commands",   "/temp <v>    temperature",
+        "/topp <v>    nucleus (top-p)", "/topk <n>    top-k sampling",
+        "/ctx [N]     show/resize ctx", "/save /load  session file",
+        "/read <f>    file as message", "/exit        quit (Ctrl-D)", "" };
+    /* model basename (drop .gguf) + cwd (~ for $HOME) + device, truncated to fit WL */
     const char *base = strrchr(model_path, '/'); base = base ? base + 1 : model_path;
+    char bname[96]; snprintf(bname, sizeof bname, "%s", base);
+    size_t bl = strlen(bname);
+    if (bl > 5 && !strcmp(bname + bl - 5, ".gguf")) bname[bl - 5] = '\0';
     char cwd[PATH_MAX]; if (!getcwd(cwd, sizeof(cwd))) snprintf(cwd, sizeof(cwd), "?");
     const char *home = getenv("HOME"); char disp[PATH_MAX];
     if (home && home[0] && !strncmp(cwd, home, strlen(home)))
         snprintf(disp, sizeof(disp), "~%s", cwd + strlen(home));
     else snprintf(disp, sizeof(disp), "%s", cwd);
-    char bname[80]; snprintf(bname, sizeof bname, "%s", base);
-    size_t bl = strlen(bname);
-    if (bl > 5 && !strcmp(bname + bl - 5, ".gguf")) bname[bl - 5] = '\0';   /* drop .gguf */
-    char mrow[40]; snprintf(mrow, sizeof(mrow), "model  %.27s", bname);
-    char prow[40];                                  /* ASCII '..' ellipsis (1 byte = 1 cell) */
-    if (strlen(disp) > 27) snprintf(prow, sizeof(prow), "path   ..%s", disp + strlen(disp) - 25);
+    const int valw = WL - 7;                              /* room after a 7-char label */
+    char mrow[256], prow[256], drow[256];
+    snprintf(mrow, sizeof(mrow), "model  %.*s", valw, bname);
+    if ((int)strlen(disp) > valw && valw > 3)
+        snprintf(prow, sizeof(prow), "path   ..%s", disp + strlen(disp) - (valw - 2));
     else snprintf(prow, sizeof(prow), "path   %s", disp);
-    char blank[2] = "";
-    const char *ltext[3] = { blank, mrow, prow };   /* rows 7-9 left text */
+    snprintf(drow, sizeof(drow), "device %.*s", valw, device_str ? device_str : "-");
+    const char *lrows[3] = { mrow, prow, drow };          /* left text rows 6,7,8 */
 
-    /* top + header (full width 71) */
-    printf("\n\033[0m╭"); dense_rep("─", 71); printf("╮\n");
-    char hv[120];
+    printf("\n%s╭", Z); dense_rep("─", Wbox - 2); printf("╮\n");
+    /* header */
+    char hv[160];
     int hlen = snprintf(hv, sizeof hv, " DwarfStar4 v%s     ctx %u tokens", DS4_VERSION, n_ctx);
     printf("│ %sDwarfStar%s%s4%s v%s     ctx %u tokens", B, Z, W, Z, DS4_VERSION, n_ctx);
-    for (int i = hlen; i < 71; i++) putchar(' ');
-    printf("│\n├"); dense_rep("─", 36); printf("┬"); dense_rep("─", 34); printf("┤\n");
-    /* 9 body rows: 6 logo, then blank/model/path */
+    for (int i = hlen; i < Wbox - 2; i++) putchar(' ');   /* header content spans Wbox-2 */
+    printf("│\n├"); dense_rep("─", WL + 2); printf("┬"); dense_rep("─", WR + 2); printf("┤\n");
     for (int i = 0; i < 9; i++) {
-        if (i < 6)
-            printf("│    %s%s%s%s%s%s        │ %s%-32s%s │\n",
-                   B, dg[i], sg[i], W, fg[i], Z, C, cmd[i], Z);
-        else
-            printf("│ %s%-34s%s │ %s%-32s%s │\n", Z, ltext[i-6], Z, C, cmd[i], Z);
+        if (i < 6) {
+            printf("│    %s%s%s%s%s%s", B, dg[i], sg[i], W, fg[i], Z);
+            for (int s = 0; s < WL - 27; s++) putchar(' ');     /* pad logo(24)+indent(3) to WL */
+            printf(" │ %s%-*s%s │\n", C, WR, cmd[i], Z);
+        } else {
+            printf("│ %s%-*s%s │ %s%-*s%s │\n", D, WL, lrows[i-6], Z, C, WR, cmd[i], Z);
+        }
     }
-    printf("╰"); dense_rep("─", 36); printf("┴"); dense_rep("─", 34); printf("╯\n");
-    printf("%sreflection on · 8 tools on · arrows: edit/history · auto-slide when full%s\n\n", "\033[2m", Z);
+    /* full-width init-log section */
+    if (init_text && init_text[0]) {
+        printf("├"); dense_rep("─", WL + 2); printf("┴"); dense_rep("─", WR + 2); printf("┤\n");
+        const char *p = init_text;
+        while (*p) {
+            const char *nl = strchr(p, '\n');
+            int len = nl ? (int)(nl - p) : (int)strlen(p);
+            if (len > FC) len = FC;
+            printf("│ %s%-*.*s%s │\n", D, FC, len, p, Z);
+            if (!nl) break; p = nl + 1;
+        }
+    }
+    printf("╰"); dense_rep("─", Wbox - 2); printf("╯\n");
+    printf("%sreflection on · 8 tools on · arrows: edit/history · auto-slide when full%s\n\n", D, Z);
     fflush(stdout);
 }
 
@@ -26522,7 +26551,52 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     ds4_dense_model_desc desc;
     dense_build_desc(&desc, &model, &weights, n_ctx);
 
+    /* Capture the Metal init log (stderr) during GPU create so the banner can show it
+     * inside the box. The two tty-gated progress lines (residency/warming) are static
+     * text, reconstructed here. On failure the captured log is replayed to stderr. */
+    char dev_str[96] = "", init_log[2048] = "";
+    char cap_path[64] = "/tmp/ds4_init_XXXXXX";
+    int cap_saved = -1, cap_fd = -1;
+    const bool do_cap = ds4_log_is_tty(stdout) && !getenv("DS4_NO_BANNER");
+    if (do_cap) {
+        fflush(stderr); cap_fd = mkstemp(cap_path);
+        if (cap_fd >= 0) { cap_saved = dup(STDERR_FILENO); if (cap_saved >= 0) dup2(cap_fd, STDERR_FILENO); }
+    }
     ds4_dense_gpu *g = ds4_dense_gpu_create(&desc);
+    if (cap_saved >= 0) {
+        fflush(stderr); dup2(cap_saved, STDERR_FILENO); close(cap_saved);
+        off_t sz = lseek(cap_fd, 0, SEEK_END); lseek(cap_fd, 0, SEEK_SET);
+        char *raw = NULL;
+        if (sz > 0) { raw = malloc((size_t)sz + 1); ssize_t r = read(cap_fd, raw, (size_t)sz); if (r < 0) r = 0; raw[r] = '\0'; }
+        close(cap_fd); unlink(cap_path); cap_fd = -1;
+        if (raw) {
+            if (!g) fputs(raw, stderr);   /* keep errors visible if init failed */
+            else {
+                size_t it = 0; bool prog = false; char *line = raw;
+                while (line && *line) {
+                    char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+                    const char *dv = strstr(line, "Metal device ");
+                    if (dv) snprintf(dev_str, sizeof dev_str, "%s", dv + 13);
+                    else if (*line) {
+                        if (!prog && strstr(line, "model views created")) {
+                            it += snprintf(init_log + it, sizeof init_log - it,
+                                "ds4: requesting Metal residency (may take tens of seconds)... done\n"
+                                "ds4: warming Metal model views... done\n");
+                            prog = true;
+                        }
+                        it += snprintf(init_log + it, sizeof init_log - it, "%s\n", line);
+                    }
+                    line = nl ? nl + 1 : NULL;
+                }
+                if (!prog && it < sizeof init_log)
+                    snprintf(init_log + it, sizeof init_log - it,
+                        "ds4: requesting Metal residency (may take tens of seconds)... done\n"
+                        "ds4: warming Metal model views... done\n");
+            }
+            free(raw);
+        }
+    }
+    if (cap_fd >= 0) { close(cap_fd); unlink(cap_path); }
     if (!g) {
         if (errlen) snprintf(err, errlen, "dense GPU create failed");
         free(desc.layers); vocab_free(&vocab); model_close(&model);
@@ -26566,7 +26640,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     token_vec *hist = NULL;         /* [hist_n] clean per-turn token sequences */
     size_t hist_n = 0, hist_cap = 0;
 
-    dense_print_banner(model_path, n_ctx);
+    dense_print_banner(model_path, n_ctx, dev_str[0] ? dev_str : NULL, init_log[0] ? init_log : NULL);
 
     /* linenoise: line editing + persistent history. The previous line is freed at
      * the top of each iteration, so every continue/break exits cleanly with a single
