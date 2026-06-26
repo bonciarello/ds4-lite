@@ -25883,8 +25883,18 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
      * matmul prefill by default; DS4_DENSE_NOPREFILL forces the per-token path. */
     const double t_start = now_sec();
     if (toks.len > 1 && !getenv("DS4_DENSE_NOPREFILL")) {
-        if (ds4_dense_gpu_prefill(g, &desc, toks.v, (unsigned)toks.len, 0, logits, NULL) != 0) rc = 1;
-        else pos = (uint32_t)toks.len;
+        /* Chunked prefill: process the prompt in CHUNK-token batches instead of one
+         * giant batch — bounds the scratch memory (the M-sized buffers) and keeps the
+         * matmul tiles full. Each chunk attends to all prior KV; only the last chunk
+         * needs the logits. CHUNK is tunable via DS4_PREFILL_CHUNK. */
+        uint32_t CHUNK = 512u;
+        { const char *e = getenv("DS4_PREFILL_CHUNK"); if (e && atoi(e) > 0) CHUNK = (uint32_t)atoi(e); }
+        for (uint32_t start = 0; start < (uint32_t)toks.len && rc == 0; start += CHUNK) {
+            const uint32_t M = (start + CHUNK <= (uint32_t)toks.len) ? CHUNK : (uint32_t)toks.len - start;
+            float *lg = (start + M >= (uint32_t)toks.len) ? logits : NULL;   /* logits only for the last chunk */
+            if (ds4_dense_gpu_prefill(g, &desc, toks.v + start, M, start, lg, NULL) != 0) rc = 1;
+        }
+        if (rc == 0) pos = (uint32_t)toks.len;
     } else {
         for (uint32_t i = 0; i < (uint32_t)toks.len; i++)
             if (ds4_dense_gpu_forward(g, &desc, toks.v[i], pos++, logits) != 0) { rc = 1; break; }
