@@ -37,6 +37,8 @@
 #include <unistd.h>
 #include <glob.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
+#include <signal.h>
 
 #include "ds4.h"
 #include "ds4_distributed.h"
@@ -26533,6 +26535,52 @@ static void dense_print_banner(const char *model_path, uint32_t n_ctx,
     fflush(stdout);
 }
 
+/* SIGWINCH -> self-pipe so the prompt's select() wakes on a terminal resize. */
+static int g_winch_pipe[2] = { -1, -1 };
+static void dense_winch_handler(int sig) {
+    (void)sig;
+    if (g_winch_pipe[1] >= 0) { char b = 1; ssize_t r = write(g_winch_pipe[1], &b, 1); (void)r; }
+}
+
+/* Read a line with linenoise's multiplexed API, reprinting the banner (at the new
+ * width) when the terminal is resized. Falls back to blocking linenoise() when stdin
+ * is not a tty or the self-pipe is unavailable. Returns a malloc'd line or NULL (EOF). */
+static char *dense_readline(const char *prompt, const char *model_path,
+                            uint32_t n_ctx, const char *device_str) {
+    if (!isatty(STDIN_FILENO) || g_winch_pipe[0] < 0) return linenoise(prompt);
+    static char linebuf[8192];
+    struct linenoiseState ls;
+    if (linenoiseEditStart(&ls, STDIN_FILENO, STDOUT_FILENO, linebuf, sizeof linebuf, prompt) == -1)
+        return linenoise(prompt);
+    char *res = NULL;
+    const int wp = g_winch_pipe[0];
+    for (;;) {
+        fd_set rf; FD_ZERO(&rf);
+        FD_SET(STDIN_FILENO, &rf); FD_SET(wp, &rf);
+        const int mx = wp > STDIN_FILENO ? wp : STDIN_FILENO;
+        const int rv = select(mx + 1, &rf, NULL, NULL, NULL);
+        if (rv < 0) { if (errno == EINTR) continue; break; }
+        if (FD_ISSET(wp, &rf)) {
+            /* debounce: coalesce a burst of resize events (drag) into one reprint */
+            for (;;) {
+                char drain[128]; while (read(wp, drain, sizeof drain) > 0) {}
+                fd_set wf; FD_ZERO(&wf); FD_SET(wp, &wf);
+                struct timeval tv = { 0, 140000 };
+                if (select(wp + 1, &wf, NULL, NULL, &tv) <= 0) break;
+            }
+            linenoiseHide(&ls);
+            dense_print_banner(model_path, n_ctx, device_str, NULL);
+            linenoiseShow(&ls);
+        }
+        if (FD_ISSET(STDIN_FILENO, &rf)) {
+            res = linenoiseEditFeed(&ls);
+            if (res != linenoiseEditMore) break;
+        }
+    }
+    linenoiseEditStop(&ls);
+    return (res == linenoiseEditMore) ? NULL : res;
+}
+
 int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                    char *err, size_t errlen) {
     ds4_model model;
@@ -26661,10 +26709,20 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     linenoiseHistorySetMaxLen(512);
     linenoiseHistoryLoad(histpath);
 
+    /* SIGWINCH self-pipe: reprint the banner at the new width when the terminal is
+     * resized (auto-reprint; a fresh correctly-sized box appears below). */
+    if (isatty(STDIN_FILENO) && pipe(g_winch_pipe) == 0) {
+        fcntl(g_winch_pipe[0], F_SETFL, O_NONBLOCK);
+        fcntl(g_winch_pipe[1], F_SETFL, O_NONBLOCK);
+        struct sigaction sa; memset(&sa, 0, sizeof sa);
+        sa.sa_handler = dense_winch_handler; sigemptyset(&sa.sa_mask);
+        sigaction(SIGWINCH, &sa, NULL);
+    }
+
     char *line = NULL;
     while (rc == 0) {
         linenoiseFree(line);
-        line = linenoise("> ");
+        line = dense_readline("> ", model_path, n_ctx, dev_str[0] ? dev_str : NULL);
         if (!line) { printf("\n"); break; }             /* EOF / Ctrl-D */
         size_t nr = strlen(line);   /* non-const: /read replaces line+nr */
         if (nr == 0) continue;
