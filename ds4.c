@@ -152,8 +152,9 @@ typedef enum {
  * MoE+MLA DeepSeek path. DS4_ARCH_DEEPSEEK is value 0 so existing shapes that do
  * not set .arch keep the original behavior. See docs/DENSE_SUPPORT_DESIGN.md. */
 typedef enum {
-    DS4_ARCH_DEEPSEEK = 0,   /* MLA + MoE + indexer + hash-compression */
-    DS4_ARCH_DENSE    = 1,   /* standard attention + dense SwiGLU FFN  */
+    DS4_ARCH_DEEPSEEK  = 0,  /* MLA + MoE + indexer + hash-compression */
+    DS4_ARCH_DENSE     = 1,  /* standard attention + dense SwiGLU FFN  */
+    DS4_ARCH_QWEN3NEXT = 2,  /* hybrid Gated-DeltaNet linear-attn + MoE (see docs/QWEN3NEXT_PLAN.md) */
 } ds4_arch_family;
 
 typedef struct {
@@ -367,6 +368,7 @@ static int g_ds4_lock_fd = -1;
  * return false. See docs/DENSE_SUPPORT_DESIGN.md section 3.1. Marked maybe-unused
  * because call sites are introduced incrementally (Fase 2+). */
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_deepseek(void) { return DS4_ARCH == DS4_ARCH_DEEPSEEK; }
+DS4_MAYBE_UNUSED static inline bool ds4_arch_is_qwen3next(void) { return DS4_ARCH == DS4_ARCH_QWEN3NEXT; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_moe(void)     { return DS4_N_EXPERT != 0; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_mla(void)     { return DS4_N_LORA_Q != 0; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_indexer(void) { return DS4_N_INDEXER_HEAD != 0; }
@@ -4094,6 +4096,31 @@ static void config_build_dense_shape(const ds4_model *m, const char *ns) {
     g_ds4_shape = s;
 }
 
+/* Phase-0 skeleton for qwen3_next (general.architecture == "qwen3next"): read enough
+ * metadata to identify the model and set the arch family. The full hybrid engine
+ * (Gated-DeltaNet linear attention + 512-expert MoE) is NOT implemented yet — the engine
+ * rejects it cleanly at open. Roadmap + GGUF tensor map in docs/QWEN3NEXT_PLAN.md. */
+static void config_build_qwen3next_shape(const ds4_model *m) {
+    const char *ns = "qwen3next";
+    ds4_shape s;
+    memset(&s, 0, sizeof(s));
+    s.arch    = DS4_ARCH_QWEN3NEXT;
+    s.meta_ns = ns;
+    s.name    = "Qwen3-Next";
+    model_get_u32_ns(m, ns, "block_count",              &s.n_layer);
+    model_get_u32_ns(m, ns, "embedding_length",         &s.n_embd);
+    model_get_u32_ns(m, ns, "attention.head_count",     &s.n_head);
+    model_get_u32_ns(m, ns, "attention.head_count_kv",  &s.n_head_kv);
+    model_get_u32_ns(m, ns, "vocab_size",               &s.n_vocab);
+    model_get_u32_ns(m, ns, "expert_count",             &s.n_expert);
+    model_get_u32_ns(m, ns, "expert_used_count",        &s.n_expert_used);
+    uint64_t ctx_train = 0;
+    if (!model_get_u64_ns(m, ns, "context_length", &ctx_train) || ctx_train == 0)
+        ctx_train = DS4_DEFAULT_ROPE_ORIG_CTX;
+    s.rope_orig_ctx = ctx_train;
+    g_ds4_shape = s;
+}
+
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
 static void config_validate_model(const ds4_model *m) {
@@ -4108,6 +4135,10 @@ static void config_validate_model(const ds4_model *m) {
          * open. config_validate_model does NOT validate dense tensor layout here —
          * that is the dense binding's job. */
         config_build_dense_shape(m, dense_ns);
+        return;
+    }
+    if (ds4_str_eq_cstr(arch, "qwen3next")) {        /* hybrid Gated-DeltaNet + MoE */
+        config_build_qwen3next_shape(m);
         return;
     }
 
@@ -25870,6 +25901,16 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
         model_close(&model);
         return 1;
     }
+    if (ds4_arch_is_qwen3next()) {
+        fprintf(stderr,
+            "ds4: qwen3_next detected (%u layers, %u experts) — this architecture is not yet\n"
+            "     runnable: it needs the Gated-DeltaNet linear-attention kernels + 512-expert\n"
+            "     MoE. Implementation is scaffolded; see docs/QWEN3NEXT_PLAN.md.\n",
+            (unsigned)DS4_N_LAYER, (unsigned)DS4_N_EXPERT);
+        if (errlen) snprintf(err, errlen, "qwen3_next not yet supported (see docs/QWEN3NEXT_PLAN.md)");
+        model_close(&model);
+        return 1;
+    }
     vocab_load(&vocab, &model);
     weights_bind(&weights, &model, false, 0, 0, true, false);
 
@@ -26868,6 +26909,16 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     config_validate_model(&model);
     if (ds4_arch_is_deepseek()) {
         if (errlen) snprintf(err, errlen, "not a dense model");
+        model_close(&model);
+        return 1;
+    }
+    if (ds4_arch_is_qwen3next()) {
+        fprintf(stderr,
+            "ds4: qwen3_next detected (%u layers, %u experts) — this architecture is not yet\n"
+            "     runnable: it needs the Gated-DeltaNet linear-attention kernels + 512-expert\n"
+            "     MoE. Implementation is scaffolded; see docs/QWEN3NEXT_PLAN.md.\n",
+            (unsigned)DS4_N_LAYER, (unsigned)DS4_N_EXPERT);
+        if (errlen) snprintf(err, errlen, "qwen3_next not yet supported (see docs/QWEN3NEXT_PLAN.md)");
         model_close(&model);
         return 1;
     }
