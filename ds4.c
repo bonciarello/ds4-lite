@@ -26433,6 +26433,68 @@ static const char *DENSE_TOOLS_PROMPT =
  * the KV cache across turns (only the new tokens of each turn are prefilled) and
  * generates until <|im_end|>/EOS — no fixed token limit. Reads user lines from
  * stdin; "/exit" or EOF (Ctrl-D) quits; the context is fixed at create time. */
+#ifndef DS4_VERSION
+#define DS4_VERSION "0.1.0"
+#endif
+
+/* Repeat a UTF-8 glyph n times. */
+static void dense_rep(const char *s, int n) { for (int i = 0; i < n; i++) fputs(s, stdout); }
+
+/* Claude-Code-style startup banner: a rounded box whose left column shows the DS4
+ * logo (D,S blue; 4 white) + the model and launch directory, and whose right column
+ * lists the slash commands. Left/right inner widths are 34/32 visible cells. */
+static void dense_print_banner(const char *model_path, uint32_t n_ctx) {
+    const char *B = "\033[1;34m", *W = "\033[1;37m", *Z = "\033[0m", *C = "\033[36m";
+    static const char *dg[6] = {"██████╗ ","██╔══██╗","██║  ██║","██║  ██║","██████╔╝","╚═════╝ "};
+    static const char *sg[6] = {"███████╗","██╔════╝","███████╗","╚════██║","███████║","╚══════╝"};
+    static const char *fg[6] = {"██╗  ██╗","██║  ██║","███████║","╚════██║","     ██║","     ╚═╝"};
+    static const char *cmd[9] = {
+        "/help        all commands",
+        "/temp <v>    temperature",
+        "/topp <v>    nucleus (top-p)",
+        "/topk <n>    top-k sampling",
+        "/ctx [N]     show/resize ctx",
+        "/save /load  session file",
+        "/read <f>    file as message",
+        "/exit        quit (Ctrl-D)",
+        "" };
+    /* model basename + cwd (with ~ for $HOME), truncated to fit the column */
+    const char *base = strrchr(model_path, '/'); base = base ? base + 1 : model_path;
+    char cwd[PATH_MAX]; if (!getcwd(cwd, sizeof(cwd))) snprintf(cwd, sizeof(cwd), "?");
+    const char *home = getenv("HOME"); char disp[PATH_MAX];
+    if (home && home[0] && !strncmp(cwd, home, strlen(home)))
+        snprintf(disp, sizeof(disp), "~%s", cwd + strlen(home));
+    else snprintf(disp, sizeof(disp), "%s", cwd);
+    char bname[80]; snprintf(bname, sizeof bname, "%s", base);
+    size_t bl = strlen(bname);
+    if (bl > 5 && !strcmp(bname + bl - 5, ".gguf")) bname[bl - 5] = '\0';   /* drop .gguf */
+    char mrow[40]; snprintf(mrow, sizeof(mrow), "model  %.27s", bname);
+    char prow[40];                                  /* ASCII '..' ellipsis (1 byte = 1 cell) */
+    if (strlen(disp) > 27) snprintf(prow, sizeof(prow), "path   ..%s", disp + strlen(disp) - 25);
+    else snprintf(prow, sizeof(prow), "path   %s", disp);
+    char blank[2] = "";
+    const char *ltext[3] = { blank, mrow, prow };   /* rows 7-9 left text */
+
+    /* top + header (full width 71) */
+    printf("\n\033[0m╭"); dense_rep("─", 71); printf("╮\n");
+    char hv[120];
+    int hlen = snprintf(hv, sizeof hv, " DwarfStar4 v%s     ctx %u tokens", DS4_VERSION, n_ctx);
+    printf("│ %sDwarfStar%s%s4%s v%s     ctx %u tokens", B, Z, W, Z, DS4_VERSION, n_ctx);
+    for (int i = hlen; i < 71; i++) putchar(' ');
+    printf("│\n├"); dense_rep("─", 36); printf("┬"); dense_rep("─", 34); printf("┤\n");
+    /* 9 body rows: 6 logo, then blank/model/path */
+    for (int i = 0; i < 9; i++) {
+        if (i < 6)
+            printf("│    %s%s%s%s%s%s        │ %s%-32s%s │\n",
+                   B, dg[i], sg[i], W, fg[i], Z, C, cmd[i], Z);
+        else
+            printf("│ %s%-34s%s │ %s%-32s%s │\n", Z, ltext[i-6], Z, C, cmd[i], Z);
+    }
+    printf("╰"); dense_rep("─", 36); printf("┴"); dense_rep("─", 34); printf("╯\n");
+    printf("%sreflection on · 8 tools on · arrows: edit/history · auto-slide when full%s\n\n", "\033[2m", Z);
+    fflush(stdout);
+}
+
 int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                    char *err, size_t errlen) {
     ds4_model model;
@@ -26504,10 +26566,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     token_vec *hist = NULL;         /* [hist_n] clean per-turn token sequences */
     size_t hist_n = 0, hist_cap = 0;
 
-    printf("ds4 dense chat (ChatML, reflection always on). ctx=%u tokens.\n"
-           "Commands: /help  /temp <v>  /topp <v>  /topk <n>  /exit (Ctrl-D)."
-           " Arrows: edit/history. Context auto-slides when full.\n", n_ctx);
-    fflush(stdout);
+    dense_print_banner(model_path, n_ctx);
 
     /* linenoise: line editing + persistent history. The previous line is freed at
      * the top of each iteration, so every continue/break exits cleanly with a single
