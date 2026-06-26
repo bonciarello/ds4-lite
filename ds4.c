@@ -25811,6 +25811,17 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
     desc->n_head = DS4_N_HEAD; desc->n_kv = DS4_N_HEAD_KV; desc->head_dim = DS4_N_HEAD_DIM;
     desc->n_vocab = DS4_N_VOCAB; desc->n_rot = DS4_N_ROT; desc->n_ctx = n_ctx;
     desc->rms_eps = DS4_RMS_EPS; desc->rope_base = DS4_ROPE_FREQ_BASE;
+    /* YaRN / NTK-aware context extension: when the requested context exceeds the
+     * model's native training context, scale the RoPE base so positions stay in
+     * distribution. base' = base * s^(d/(d-2)), s = n_ctx/orig. Gated, so for
+     * n_ctx <= native the base is unchanged (identical behaviour). */
+    if (DS4_ROPE_ORIG_CTX > 0 && (uint64_t)n_ctx > DS4_ROPE_ORIG_CTX) {
+        const double s = (double)n_ctx / (double)DS4_ROPE_ORIG_CTX;
+        const double d = (double)DS4_N_HEAD_DIM;
+        desc->rope_base = (float)((double)DS4_ROPE_FREQ_BASE * pow(s, d / (d - 2.0)));
+        fprintf(stderr, "ds4: NTK context extension: ctx %u > native %llu, rope_base %.0f -> %.0f\n",
+                n_ctx, (unsigned long long)DS4_ROPE_ORIG_CTX, (double)DS4_ROPE_FREQ_BASE, (double)desc->rope_base);
+    }
     desc->model_base = model->map; desc->model_size = model->size;
     desc->token_embd  = dense_wdesc_of(model, weights->token_embd);
     desc->output_norm = dense_wdesc_of(model, weights->output_norm);
