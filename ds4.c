@@ -26582,7 +26582,7 @@ static void dense_print_banner(const char *model_path, uint32_t n_ctx,
         "/help        all commands",   "/temp <v>    temperature",
         "/topp <v>    nucleus (top-p)", "/topk <n>    top-k sampling",
         "/ctx [N]     show/resize ctx", "/save /load  session file",
-        "/read <f>    file as message", "/model [n]   models (whichllm)",
+        "/read <f>    file as message", "/model       switch/download",
         "/exit        quit (Ctrl-D)" };
     /* model basename (drop .gguf) + cwd (~ for $HOME) + device, truncated to fit WL */
     const char *base = strrchr(model_path, '/'); base = base ? base + 1 : model_path;
@@ -26604,12 +26604,14 @@ static void dense_print_banner(const char *model_path, uint32_t n_ctx,
     const char *lrows[3] = { mrow, prow, drow };          /* left text rows 6,7,8 */
 
     printf("\n%s╭", Z); dense_rep("─", Wbox - 2); printf("╮\n");
-    /* header */
-    char hv[160];
-    int hlen = snprintf(hv, sizeof hv, " DwarfStar4 build %s     ctx %u tokens", DS4_VERSION, n_ctx);
-    printf("│ %sDwarfStar%s%s4%s build %s     ctx %u tokens", B, Z, W, Z, DS4_VERSION, n_ctx);
-    for (int i = hlen; i < Wbox - 2; i++) putchar(' ');   /* header content spans Wbox-2 */
-    printf("│\n├"); dense_rep("─", WL + 2); printf("┬"); dense_rep("─", WR + 2); printf("┤\n");
+    /* header: "DwarfStar4" on the left, the build version right-aligned (no ctx count) */
+    (void)n_ctx;
+    char rt[64]; int rlen = snprintf(rt, sizeof rt, "build %s ", DS4_VERSION);
+    const int leftvis = 11;                               /* visible width of " DwarfStar4" */
+    int hpad = (Wbox - 2) - leftvis - rlen; if (hpad < 1) hpad = 1;
+    printf("│ %sDwarfStar%s%s4%s", B, Z, W, Z);
+    for (int i = 0; i < hpad; i++) putchar(' ');
+    printf("%s%s%s│\n├", D, rt, Z); dense_rep("─", WL + 2); printf("┬"); dense_rep("─", WR + 2); printf("┤\n");
     for (int i = 0; i < 9; i++) {
         if (i < 6) {
             printf("│    %s%s%s%s%s%s", B, dg[i], sg[i], W, fg[i], Z);
@@ -26847,9 +26849,16 @@ static const char *DENSE_MODEL_PY =
     "        except Exception: pass\n"
     "        print(f\"\\n\\033[31mdownload failed: {e}\\033[0m\"); return\n"
     "    print(f\"\\n\\033[32mdone: {dst}\\033[0m\")\n"
+    "def cmd_menu(n):\n"
+    "    d=run_whichllm(n); models=d.get(\"models\",[])\n"
+    "    json.dump(models,open(STATE,\"w\"))\n"
+    "    for m in models:\n"
+    "        sz=(m.get(\"file_size_bytes\") or 0)/1e9; tps=m.get(\"estimated_tok_per_sec\") or 0\n"
+    "        print(\"%s\\t%s\\t%.1f\\t%.0f\\t%d\"%(m[\"model_id\"],(m.get(\"quant_type\") or \"?\"),sz,tps,1 if m.get(\"can_run\") else 0))\n"
     "if __name__==\"__main__\":\n"
     "    c=sys.argv[1] if len(sys.argv)>1 else \"list\"\n"
     "    if c==\"list\": cmd_list(int(sys.argv[2]) if len(sys.argv)>2 else 8)\n"
+    "    elif c==\"menu\": cmd_menu(int(sys.argv[2]) if len(sys.argv)>2 else 10)\n"
     "    elif c==\"get\": cmd_get(int(sys.argv[2]))\n";
 
 static const char *dense_model_script_path(void) {
@@ -26864,40 +26873,108 @@ static const char *dense_model_script_path(void) {
     return path[0] ? path : NULL;
 }
 
-/* Interactive first-run / no-model picker: lists local GGUFs in ./gguf and whichllm's
- * hardware-ranked models, reads a choice from stdin, downloads the picked model if
- * needed, and writes the chosen path to `out`. Returns false if the user quits. */
+/* Arrow-key menu: draws labels[0..n) with the current row highlighted, returns the
+ * chosen index, or -1 if the user cancels (q / Esc / Ctrl-C). Raw mode on the tty.
+ * Falls back to -1 (caller treats as cancel) when stdin/stdout is not a terminal. */
+static int dense_menu_select(const char *title, const char *const *labels, int n) {
+    if (n <= 0 || !isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return -1;
+    struct termios oldt, raw;
+    if (tcgetattr(STDIN_FILENO, &oldt) != 0) return -1;
+    raw = oldt;
+    raw.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+    raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    if (title && *title) printf("\n\033[1m%s\033[0m\n", title);
+    int sel = 0;
+    for (int i = 0; i < n; i++)
+        printf(i == sel ? "\033[36m❯ %s\033[0m\n" : "  \033[2m%s\033[0m\n", labels[i]);
+    printf("\033[2m↑/↓ move · ↵ select · q cancel\033[0m");
+    fflush(stdout);
+    int result = -1;
+    for (;;) {
+        unsigned char c;
+        if (read(STDIN_FILENO, &c, 1) != 1) break;
+        int moved = 0;
+        if (c == '\r' || c == '\n') { result = sel; break; }
+        else if (c == 'q' || c == 'Q' || c == 3) { result = -1; break; }   /* q / Ctrl-C */
+        else if (c == 'k') { sel = (sel - 1 + n) % n; moved = 1; }          /* vim keys */
+        else if (c == 'j') { sel = (sel + 1) % n; moved = 1; }
+        else if (c == 27) {                                                 /* ESC seq */
+            unsigned char a, b;
+            if (read(STDIN_FILENO, &a, 1) != 1 || a != '[') { result = -1; break; }
+            if (read(STDIN_FILENO, &b, 1) != 1) { result = -1; break; }
+            if (b == 'A') { sel = (sel - 1 + n) % n; moved = 1; }           /* up */
+            else if (b == 'B') { sel = (sel + 1) % n; moved = 1; }          /* down */
+        }
+        if (moved) {
+            printf("\r\033[%dA", n);                                        /* up to first row */
+            for (int i = 0; i < n; i++)
+                printf(i == sel ? "\033[2K\033[36m❯ %s\033[0m\n" : "\033[2K  \033[2m%s\033[0m\n", labels[i]);
+            printf("\033[2K\033[2m↑/↓ move · ↵ select · q cancel\033[0m");
+            fflush(stdout);
+        }
+    }
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    printf("\n");
+    return result;
+}
+
+/* Interactive model picker (first-run / no-model AND the /model command). Shows a single
+ * arrow-key menu combining the GGUFs already present in ./gguf with whichllm's
+ * hardware-ranked downloadable models; on a download pick it fetches the GGUF. Writes the
+ * chosen path to `out`. Returns false if the user cancels. */
 static bool dense_pick_model(char *out, size_t cap) {
     const char *script = dense_model_script_path();
     glob_t gl; memset(&gl, 0, sizeof gl);
     glob("gguf/*.gguf", 0, NULL, &gl);
-    printf("\n\033[1mLocal models (./gguf):\033[0m\n");
-    if (gl.gl_pathc == 0) printf("  \033[2m(none)\033[0m\n");
-    for (size_t i = 0; i < gl.gl_pathc; i++)
-        printf("  \033[36mL%zu\033[0m %s\n", i + 1, gl.gl_pathv[i]);
+
+    enum { PICK_MAX = 64 };
+    static char labelbuf[PICK_MAX][224];
+    const char *labels[PICK_MAX];
+    int kind[PICK_MAX];   /* 0 = local file, 1 = whichllm download */
+    int ref[PICK_MAX];    /* local: glob index · download: whichllm 1-based index */
+    int n = 0;
+
+    /* local models first */
+    for (size_t i = 0; i < gl.gl_pathc && n < PICK_MAX; i++) {
+        const char *path = gl.gl_pathv[i];
+        const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
+        struct stat stt; double gb = 0; if (stat(path, &stt) == 0) gb = (double)stt.st_size / 1e9;
+        snprintf(labelbuf[n], sizeof labelbuf[n], "● local     %-42.42s %6.1f GB", base, gb);
+        labels[n] = labelbuf[n]; kind[n] = 0; ref[n] = (int)i; n++;
+    }
+
+    /* downloadable models from whichllm (machine-readable 'menu') */
     if (script) {
-        printf("\n\033[2m(querying whichllm…)\033[0m\n");
-        char cmd[PATH_MAX + 32]; snprintf(cmd, sizeof cmd, "python3 '%s' list 12 2>&1", script);
+        printf("\033[2m(querying whichllm…)\033[0m\n"); fflush(stdout);
+        char cmd[PATH_MAX + 32]; snprintf(cmd, sizeof cmd, "python3 '%s' menu 12 2>/dev/null", script);
         FILE *fp = popen(cmd, "r");
-        if (fp) { char b[4096]; size_t r; while ((r = fread(b, 1, sizeof b, fp)) > 0) fwrite(b, 1, r, stdout); pclose(fp); }
+        if (fp) {
+            char ln[512]; int didx = 0;
+            while (fgets(ln, sizeof ln, fp) && n < PICK_MAX) {
+                char *t1 = strchr(ln, '\t'); if (!t1) continue; *t1 = '\0';   /* model_id */
+                char *quant = t1 + 1; char *t2 = strchr(quant, '\t'); if (!t2) continue; *t2 = '\0';
+                char *szs   = t2 + 1; char *t3 = strchr(szs,   '\t'); if (!t3) continue; *t3 = '\0';
+                char *tps   = t3 + 1; char *t4 = strchr(tps,   '\t'); if (!t4) continue; *t4 = '\0';
+                const int canrun = atoi(t4 + 1);
+                didx++;
+                snprintf(labelbuf[n], sizeof labelbuf[n], "↓ download  %-42.42s %-6.6s %5s GB ~%st/s%s",
+                         ln, quant, szs, tps, canrun ? "" : "  (tight fit)");
+                labels[n] = labelbuf[n]; kind[n] = 1; ref[n] = didx; n++;
+            }
+            pclose(fp);
+        }
     }
-    printf("\n\033[1mChoose a model:\033[0m  \033[36m<n>\033[0m download recommended · "
-           "\033[36mL<n>\033[0m use a local file · \033[36mq\033[0m quit\n> ");
-    fflush(stdout);
-    char line[128];
-    if (!fgets(line, sizeof line, stdin)) { globfree(&gl); return false; }
-    char *p = line; while (*p == ' ' || *p == '\t') p++;
-    size_t L = strlen(p); while (L && (p[L-1]=='\n'||p[L-1]=='\r'||p[L-1]==' ')) p[--L] = '\0';
-    if (p[0] == '\0' || p[0] == 'q' || p[0] == 'Q') { globfree(&gl); return false; }
-    if (p[0] == 'L' || p[0] == 'l') {
-        int idx = atoi(p + 1); bool ok = (idx >= 1 && (size_t)idx <= gl.gl_pathc);
-        if (ok) snprintf(out, cap, "%s", gl.gl_pathv[idx - 1]);
-        globfree(&gl); return ok;
-    }
+
+    if (n == 0) { globfree(&gl); printf("\033[2m(no local models, and whichllm/python3 unavailable)\033[0m\n"); return false; }
+
+    const int sel = dense_menu_select("Select a model   (● already downloaded · ↓ download)", labels, n);
+    if (sel < 0) { globfree(&gl); return false; }
+    if (kind[sel] == 0) { snprintf(out, cap, "%s", gl.gl_pathv[ref[sel]]); globfree(&gl); return true; }
     globfree(&gl);
-    const int sel = atoi(p);
-    if (sel <= 0 || !script) return false;
-    char cmd[PATH_MAX + 32]; snprintf(cmd, sizeof cmd, "python3 '%s' get %d 2>&1", script, sel);
+
+    if (!script) return false;
+    char cmd[PATH_MAX + 32]; snprintf(cmd, sizeof cmd, "python3 '%s' get %d 2>&1", script, ref[sel]);
     FILE *fp = popen(cmd, "r");
     if (!fp) return false;
     char capb[8192]; size_t cl = 0, r; char b[4096];
@@ -27117,7 +27194,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                    "  /load <file>  restore a saved conversation\n"
                    "  /read <file>  send a file's contents as the message\n"
                    "  /ctx [N]      show or resize the context (resize resets the chat)\n"
-                   "  /model [n]    list models for your machine (whichllm); /model <n> downloads it\n"
+                   "  /model        arrow-key picker: switch to a local model or download a new one\n"
                    "  /help         show this\n"
                    "  /exit         quit\n");
             continue;
@@ -27203,50 +27280,21 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             continue;
         }
         if (!strncmp(line, "/model", 6) && (line[6] == ' ' || line[6] == '\0')) {
-            /* whichllm-powered model picker: '/model' lists hardware-ranked models,
-             * '/model <n>' downloads that one's GGUF into ./gguf. */
-            const char *script = dense_model_script_path();
-            if (!script) { printf("\033[2m(cannot create model helper)\033[0m\n"); continue; }
-            const char *arg = line + 6; while (*arg == ' ') arg++;
-            const int sel = atoi(arg);
-            char mcmd[PATH_MAX + 96];
-            if (sel > 0) snprintf(mcmd, sizeof mcmd, "python3 '%s' get %d 2>&1", script, sel);
-            else         snprintf(mcmd, sizeof mcmd, "python3 '%s' list 10 2>&1", script);
-            FILE *mfp = popen(mcmd, "r");
-            if (!mfp) { printf("\033[2m(model helper failed — need whichllm + python3 on PATH)\033[0m\n"); continue; }
-            char mbuf[4096]; size_t mrd;
-            char mcap[8192]; size_t mclen = 0;        /* capture to find the downloaded path */
-            while ((mrd = fread(mbuf, 1, sizeof mbuf, mfp)) > 0) {
-                fwrite(mbuf, 1, mrd, stdout); fflush(stdout);
-                size_t cp = mrd; if (mclen + cp >= sizeof mcap) cp = sizeof mcap - 1 - mclen;
-                if (cp > 0) { memcpy(mcap + mclen, mbuf, cp); mclen += cp; }
-            }
-            pclose(mfp);
-            mcap[mclen] = '\0';
-            /* On a successful download/selection, switch model live by re-execing ds4
-             * with the new path (the KV cache is model-specific, so the session resets;
-             * the user does not have to relaunch). The helper prints "done: <path>" or
-             * "already present: <path>". */
-            const char *dp = strstr(mcap, "done: ");
-            if (!dp) dp = strstr(mcap, "already present: ");
-            if (sel > 0 && dp) {
-                dp = strchr(dp, ':') + 1; while (*dp == ' ') dp++;
-                char newp[PATH_MAX]; size_t k = 0;
-                while (*dp && *dp != '\n' && *dp != '\033' && *dp != '\r' && k + 1 < sizeof newp) newp[k++] = *dp++;
-                newp[k] = '\0';
-                if (k > 0) {
-                    char exe[PATH_MAX]; snprintf(exe, sizeof exe, "%s", "ds4");
+            /* Unified arrow-key picker: local GGUFs + whichllm downloads. On a pick we
+             * switch model live by re-execing ds4 with the new path (the KV cache is
+             * model-specific, so the session resets; the user does not relaunch). */
+            char newp[PATH_MAX];
+            if (!dense_pick_model(newp, sizeof newp)) { printf("\033[2m(model unchanged)\033[0m\n"); continue; }
+            char exe[PATH_MAX]; snprintf(exe, sizeof exe, "%s", "ds4");
 #ifdef __APPLE__
-                    { uint32_t bs = sizeof exe; if (_NSGetExecutablePath(exe, &bs) != 0) snprintf(exe, sizeof exe, "%s", "ds4"); }
+            { uint32_t bs = sizeof exe; if (_NSGetExecutablePath(exe, &bs) != 0) snprintf(exe, sizeof exe, "%s", "ds4"); }
 #endif
-                    /* "auto" -> the new model recomputes its context for this machine */
-                    printf("\033[36m↻ switching to %s …\033[0m\n", newp); fflush(stdout);
-                    char *eargv[] = { exe, (char *)"--metal-dense-chat", newp, (char *)"auto", NULL };
-                    execv(exe, eargv);
-                    printf("\033[2m(could not relaunch automatically; run: %s --metal-dense-chat %s %u)\033[0m\n",
-                           exe, newp, n_ctx);
-                }
-            }
+            /* "auto" -> the new model recomputes its context for this machine */
+            printf("\033[36m↻ switching to %s …\033[0m\n", newp); fflush(stdout);
+            char *eargv[] = { exe, (char *)"--metal-dense-chat", newp, (char *)"auto", NULL };
+            execv(exe, eargv);
+            printf("\033[2m(could not relaunch automatically; run: %s --metal-dense-chat %s %u)\033[0m\n",
+                   exe, newp, n_ctx);
             continue;
         }
         if (!strncmp(line, "/read ", 6)) {
