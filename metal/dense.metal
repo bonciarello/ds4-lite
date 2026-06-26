@@ -2913,3 +2913,53 @@ kernel void kernel_dnet_ar_step_f32(
     for (uint i = 0; i < S; ++i) { float s = Sh[(size_t)i*S + j] + kh[i]*d; Sh[(size_t)i*S + j] = s; oj += s * qh[i]; }
     o[(size_t)h*S + j] = oj;
 }
+
+/* SiLU (swish): out = x * sigmoid(x). DeltaNet applies it to the conv output. */
+struct dense_silu_args { uint n; };
+kernel void kernel_dense_silu_f32(
+        constant dense_silu_args & a [[buffer(0)]],
+        device const float * x   [[buffer(1)]],
+        device       float * out [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.n) return;
+    const float v = x[gid];
+    out[gid] = v / (1.0f + exp(-v));
+}
+
+/* L2 normalization over each row of length D (ggml_l2_norm semantics): per row,
+ * scale = 1 / max(sqrt(sum x²), eps); out = x * scale. Note eps is compared against the
+ * NORM (not added under the sqrt) — unlike RMSNorm. qwen3_next L2-norms DeltaNet q and k
+ * per head over head_k_dim. One thread per row. */
+struct dense_l2norm_args { uint n_row; uint D; float eps; };
+kernel void kernel_dense_l2_norm_f32(
+        constant dense_l2norm_args & a [[buffer(0)]],
+        device const float * x   [[buffer(1)]],   /* [n_row, D] */
+        device       float * out [[buffer(2)]],   /* [n_row, D] */
+        uint r [[thread_position_in_grid]]) {
+    if (r >= a.n_row) return;
+    device const float * xr = x   + (size_t)r * a.D;
+    device       float * orr = out + (size_t)r * a.D;
+    float ss = 0.0f;
+    for (uint i = 0; i < a.D; ++i) ss += xr[i] * xr[i];
+    const float scale = 1.0f / fmax(sqrt(ss), a.eps);
+    for (uint i = 0; i < a.D; ++i) orr[i] = xr[i] * scale;
+}
+
+/* DeltaNet per-head gate + beta: from the ssm_ba split (alpha, b_raw), the ssm_dt bias and
+ * the ssm_a log-decay, produce the [g, beta] pair the recurrence (kernel_dnet_ar_step)
+ * consumes: g = softplus(alpha + dt_bias) * a ;  beta = sigmoid(b_raw). */
+struct dnet_gate_args { uint n_head; };
+kernel void kernel_dnet_gate_f32(
+        constant dnet_gate_args & a [[buffer(0)]],
+        device const float * alpha   [[buffer(1)]],   /* [n_head] */
+        device const float * dt_bias [[buffer(2)]],   /* [n_head] */
+        device const float * a_log   [[buffer(3)]],   /* [n_head]  (ssm_a) */
+        device const float * b_raw   [[buffer(4)]],   /* [n_head] */
+        device       float * gb      [[buffer(5)]],   /* [n_head, 2] : g, beta */
+        uint h [[thread_position_in_grid]]) {
+    if (h >= a.n_head) return;
+    const float ab = alpha[h] + dt_bias[h];
+    const float sp = (ab > 20.0f) ? ab : log(1.0f + exp(ab));   /* softplus */
+    gb[(size_t)h*2 + 0] = sp * a_log[h];
+    gb[(size_t)h*2 + 1] = 1.0f / (1.0f + exp(-b_raw[h]));        /* sigmoid */
+}

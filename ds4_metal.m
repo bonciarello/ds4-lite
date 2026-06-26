@@ -5631,6 +5631,85 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         if (me >= 1e-5f) { if (errlen) snprintf(err, errlen, "dnet_ar max err %.6g >= 1e-5", (double)me); goto free_gpu; }
     }
 
+    /* --- Case 19: SiLU (kernel_dense_silu_f32) --- */
+    {
+        const uint32_t n = 80u; float xin[80], ref[80], got[80];
+        for (uint32_t i=0;i<n;i++) xin[i]=0.06f*(float)i-2.4f;
+        for (uint32_t i=0;i<n;i++) ref[i]=xin[i]/(1.0f+expf(-xin[i]));
+        ds4_gpu_tensor *xb=ds4_gpu_tensor_alloc(n*4), *ob=ds4_gpu_tensor_alloc(n*4);
+        bool ok = xb&&ob;
+        if (ok) { ds4_gpu_tensor_write(xb,0,xin,n*4);
+            id<MTLComputePipelineState> p=ds4_gpu_get_pipeline("kernel_dense_silu_f32"); ok=p!=nil;
+            if (ok){ int owned=0; id<MTLCommandBuffer> cb=ds4_gpu_command_buffer(&owned); ok=cb!=nil;
+                if (ok){ id<MTLComputeCommandEncoder> enc=ds4_gpu_compute_encoder(cb); [enc setComputePipelineState:p];
+                    [enc setBytes:&n length:sizeof(n) atIndex:0];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(xb) offset:ds4_gpu_tensor_offset(xb) atIndex:1];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(ob) offset:ds4_gpu_tensor_offset(ob) atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake((n+63u)/64u,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+                    ds4_gpu_end_compute_encoder(cb,enc); ok=ds4_gpu_finish_command_buffer(cb,owned,"selftest silu"); } } }
+        if (ok) ds4_gpu_tensor_read(ob,0,got,n*4);
+        ds4_gpu_tensor_free(xb); ds4_gpu_tensor_free(ob);
+        float me=0; if (ok) for(uint32_t i=0;i<n;i++){float e=fabsf(got[i]-ref[i]);if(e>me)me=e;}
+        if (!ok){ if(errlen)snprintf(err,errlen,"silu GPU run failed"); goto free_gpu; }
+        if (me>=1e-5f){ if(errlen)snprintf(err,errlen,"silu max err %.6g >= 1e-5",(double)me); goto free_gpu; }
+    }
+
+    /* --- Case 20: per-row L2 norm (kernel_dense_l2_norm_f32) --- */
+    {
+        const uint32_t R=3u, D=16u; const float eps=1e-6f;
+        float *xin=malloc((size_t)R*D*4),*ref=malloc((size_t)R*D*4),*got=malloc((size_t)R*D*4);
+        bool ok = xin&&ref&&got; ds4_gpu_tensor *xb=0,*ob=0;
+        if (ok){
+            for(uint32_t i=0;i<R*D;i++) xin[i]=0.05f*(float)(((i*7)%19))-0.3f;
+            for(uint32_t r=0;r<R;r++){ double ss=0; for(uint32_t i=0;i<D;i++) ss+=(double)xin[r*D+i]*xin[r*D+i];
+                float sc=1.0f/fmaxf(sqrtf((float)ss),eps); for(uint32_t i=0;i<D;i++) ref[r*D+i]=xin[r*D+i]*sc; }
+            xb=ds4_gpu_tensor_alloc((uint64_t)R*D*4); ob=ds4_gpu_tensor_alloc((uint64_t)R*D*4); ok=xb&&ob;
+        }
+        if (ok){ ds4_gpu_tensor_write(xb,0,xin,(uint64_t)R*D*4);
+            struct __attribute__((packed)) { uint32_t nr,D; float eps; } la={R,D,eps};
+            id<MTLComputePipelineState> p=ds4_gpu_get_pipeline("kernel_dense_l2_norm_f32"); ok=p!=nil;
+            if (ok){ int owned=0; id<MTLCommandBuffer> cb=ds4_gpu_command_buffer(&owned); ok=cb!=nil;
+                if (ok){ id<MTLComputeCommandEncoder> enc=ds4_gpu_compute_encoder(cb); [enc setComputePipelineState:p];
+                    [enc setBytes:&la length:sizeof(la) atIndex:0];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(xb) offset:ds4_gpu_tensor_offset(xb) atIndex:1];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(ob) offset:ds4_gpu_tensor_offset(ob) atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake((R+63u)/64u,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+                    ds4_gpu_end_compute_encoder(cb,enc); ok=ds4_gpu_finish_command_buffer(cb,owned,"selftest l2norm"); } } }
+        if (ok) ds4_gpu_tensor_read(ob,0,got,(uint64_t)R*D*4);
+        ds4_gpu_tensor_free(xb); ds4_gpu_tensor_free(ob);
+        float me=0; if (ok) for(uint32_t i=0;i<R*D;i++){float e=fabsf(got[i]-ref[i]);if(e>me)me=e;}
+        free(xin);free(ref);free(got);
+        if (!ok){ if(errlen)snprintf(err,errlen,"l2norm GPU run failed"); goto free_gpu; }
+        if (me>=1e-5f){ if(errlen)snprintf(err,errlen,"l2norm max err %.6g >= 1e-5",(double)me); goto free_gpu; }
+    }
+
+    /* --- Case 21: DeltaNet gate+beta (kernel_dnet_gate_f32) --- */
+    {
+        const uint32_t NH=6u; float al[6],dt[6],ag[6],br[6],ref[12],got[12];
+        for(uint32_t h=0;h<NH;h++){ al[h]=0.1f*(float)h-0.3f; dt[h]=0.05f*(float)h-0.1f; ag[h]=-0.2f-0.03f*(float)h; br[h]=0.2f*(float)h-0.5f; }
+        for(uint32_t h=0;h<NH;h++){ float ab=al[h]+dt[h]; float sp=(ab>20.0f)?ab:logf(1.0f+expf(ab));
+            ref[h*2]=sp*ag[h]; ref[h*2+1]=1.0f/(1.0f+expf(-br[h])); }
+        ds4_gpu_tensor *alb=ds4_gpu_tensor_alloc(NH*4),*dtb=ds4_gpu_tensor_alloc(NH*4),*agb=ds4_gpu_tensor_alloc(NH*4),*brb=ds4_gpu_tensor_alloc(NH*4),*ob=ds4_gpu_tensor_alloc(NH*2*4);
+        bool ok = alb&&dtb&&agb&&brb&&ob;
+        if (ok){ ds4_gpu_tensor_write(alb,0,al,NH*4); ds4_gpu_tensor_write(dtb,0,dt,NH*4); ds4_gpu_tensor_write(agb,0,ag,NH*4); ds4_gpu_tensor_write(brb,0,br,NH*4);
+            id<MTLComputePipelineState> p=ds4_gpu_get_pipeline("kernel_dnet_gate_f32"); ok=p!=nil;
+            if (ok){ int owned=0; id<MTLCommandBuffer> cb=ds4_gpu_command_buffer(&owned); ok=cb!=nil;
+                if (ok){ id<MTLComputeCommandEncoder> enc=ds4_gpu_compute_encoder(cb); [enc setComputePipelineState:p];
+                    [enc setBytes:&NH length:sizeof(NH) atIndex:0];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(alb) offset:ds4_gpu_tensor_offset(alb) atIndex:1];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(dtb) offset:ds4_gpu_tensor_offset(dtb) atIndex:2];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(agb) offset:ds4_gpu_tensor_offset(agb) atIndex:3];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(brb) offset:ds4_gpu_tensor_offset(brb) atIndex:4];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(ob)  offset:ds4_gpu_tensor_offset(ob)  atIndex:5];
+                    [enc dispatchThreadgroups:MTLSizeMake((NH+63u)/64u,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+                    ds4_gpu_end_compute_encoder(cb,enc); ok=ds4_gpu_finish_command_buffer(cb,owned,"selftest dnet_gate"); } } }
+        if (ok) ds4_gpu_tensor_read(ob,0,got,NH*2*4);
+        ds4_gpu_tensor_free(alb);ds4_gpu_tensor_free(dtb);ds4_gpu_tensor_free(agb);ds4_gpu_tensor_free(brb);ds4_gpu_tensor_free(ob);
+        float me=0; if (ok) for(uint32_t i=0;i<NH*2;i++){float e=fabsf(got[i]-ref[i]);if(e>me)me=e;}
+        if (!ok){ if(errlen)snprintf(err,errlen,"dnet_gate GPU run failed"); goto free_gpu; }
+        if (me>=1e-5f){ if(errlen)snprintf(err,errlen,"dnet_gate max err %.6g >= 1e-5",(double)me); goto free_gpu; }
+    }
+
     rc = 0;   /* all cases passed */
 free_gpu:
     ds4_gpu_tensor_free(wf32);
