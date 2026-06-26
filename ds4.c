@@ -4147,7 +4147,11 @@ static void config_build_qwen3next_shape(const ds4_model *m) {
     model_get_u32_ns(m, ns, "ssm.group_count",          &s.ssm_n_group);
     model_get_u32_ns(m, ns, "full_attention_interval",  &s.full_attn_interval);
     if (s.full_attn_interval == 0) s.full_attn_interval = 4;   /* qwen3_next default */
-    s.n_head_dim = (s.n_head ? s.n_embd / s.n_head : 0);
+    /* full-attention head dim = key_length (256), NOT n_embd/n_head; rope dim = 64 */
+    if (!model_get_u32_ns(m, ns, "attention.key_length", &s.n_head_dim) || s.n_head_dim == 0)
+        s.n_head_dim = (s.n_head ? s.n_embd / s.n_head : 0);
+    model_get_u32_ns(m, ns, "rope.dimension_count", &s.n_rot);
+    if (s.n_rot == 0) s.n_rot = s.n_head_dim;
     model_get_f32_ns(m, ns, "attention.layer_norm_rms_epsilon", &s.rms_eps);
     if (s.rms_eps == 0.0f) s.rms_eps = 1e-6f;
     model_get_f32_ns(m, ns, "rope.freq_base", &s.rope_freq_base);
@@ -23964,6 +23968,13 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
     (void)g; (void)desc; (void)token; (void)pos; (void)logits; return 1;
 }
 
+ds4_q3n_gpu *ds4_q3n_gpu_create(const ds4_q3n_model_desc *desc) { (void)desc; return NULL; }
+void ds4_q3n_gpu_free(ds4_q3n_gpu *g) { (void)g; }
+int ds4_q3n_gpu_forward(ds4_q3n_gpu *g, const ds4_q3n_model_desc *desc,
+                        int token, unsigned pos, float *logits) {
+    (void)g; (void)desc; (void)token; (void)pos; (void)logits; return 1;
+}
+
 int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
                           const int *tokens, unsigned M, unsigned start_pos,
                           float *last_logits, float *all_logits) {
@@ -25972,6 +25983,66 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
         L->ffn_gate    = dense_wdesc_of(model, lw->ffn_gate);
         L->ffn_up      = dense_wdesc_of(model, lw->ffn_up);
         L->ffn_down    = dense_wdesc_of(model, lw->ffn_down);
+    }
+}
+
+/* Build a qwen3_next forward descriptor from the open model + bound weights. Mirrors
+ * dense_build_desc; fills full-attention, Gated-DeltaNet and MoE tensors per layer plus
+ * the derived DeltaNet dims. Caller owns desc->layers (xcalloc'd; free after use). */
+DS4_MAYBE_UNUSED
+static void build_q3n_desc(ds4_q3n_model_desc *desc, const ds4_model *model,
+                          const ds4_weights *weights, uint32_t n_ctx) {
+    memset(desc, 0, sizeof(*desc));
+    desc->n_layer = DS4_N_LAYER; desc->n_embd = DS4_N_EMBD; desc->n_vocab = DS4_N_VOCAB; desc->n_ctx = n_ctx;
+    desc->n_head = DS4_N_HEAD; desc->n_kv = DS4_N_HEAD_KV; desc->head_dim = DS4_N_HEAD_DIM; desc->n_rot = DS4_N_ROT;
+    desc->n_expert = g_ds4_shape.n_expert; desc->n_expert_used = g_ds4_shape.n_expert_used; desc->n_ff_exp = g_ds4_shape.n_ff_exp;
+    desc->rms_eps = DS4_RMS_EPS; desc->rope_base = DS4_ROPE_FREQ_BASE;
+    desc->full_attn_interval = g_ds4_shape.full_attn_interval ? g_ds4_shape.full_attn_interval : 4u;
+    /* DeltaNet derived dims */
+    desc->dn_n_v_heads  = g_ds4_shape.ssm_dt_rank;                 /* 32 */
+    desc->dn_n_k_heads  = g_ds4_shape.ssm_n_group;                 /* 16 */
+    desc->dn_head_v     = g_ds4_shape.ssm_state_size;              /* 128 */
+    desc->dn_head_k     = g_ds4_shape.ssm_state_size;              /* 128 */
+    desc->dn_value_dim  = g_ds4_shape.ssm_inner_size;              /* 4096 */
+    desc->dn_key_dim    = desc->dn_n_k_heads * desc->dn_head_k;    /* 2048 */
+    desc->dn_conv_kernel = g_ds4_shape.ssm_conv_kernel;            /* 4 */
+    desc->dn_conv_dim   = desc->dn_key_dim * 2u + desc->dn_value_dim;  /* 8192 */
+    desc->model_base = model->map; desc->model_size = model->size;
+    desc->token_embd  = dense_wdesc_of(model, weights->token_embd);
+    desc->output_norm = dense_wdesc_of(model, weights->output_norm);
+    desc->output      = dense_wdesc_of(model, weights->output);
+    desc->layers = xcalloc(DS4_N_LAYER, sizeof(desc->layers[0]));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *lw = &weights->layer[il];
+        ds4_q3n_layer_desc *L = &desc->layers[il];
+        L->is_full_attn  = ds4_q3n_layer_is_full_attn(il);
+        L->attn_norm     = dense_wdesc_of(model, lw->attn_norm);
+        L->post_attn_norm= dense_wdesc_of(model, lw->ffn_norm);   /* post_attention_norm */
+        if (L->is_full_attn) {
+            L->attn_q      = dense_wdesc_of(model, lw->attn_q);
+            L->attn_k      = dense_wdesc_of(model, lw->attn_k);
+            L->attn_v      = dense_wdesc_of(model, lw->attn_v);
+            L->attn_out    = dense_wdesc_of(model, lw->attn_out);
+            L->attn_q_norm = dense_wdesc_of(model, lw->attn_q_norm);
+            L->attn_k_norm = dense_wdesc_of(model, lw->attn_k_norm);
+        } else {
+            L->dn_in_proj  = dense_wdesc_of(model, lw->q3n_in_proj);
+            L->dn_gate     = dense_wdesc_of(model, lw->q3n_gate);
+            L->dn_conv1d   = dense_wdesc_of(model, lw->q3n_conv1d);
+            L->dn_ba       = dense_wdesc_of(model, lw->q3n_ba);
+            L->dn_dt_bias  = dense_wdesc_of(model, lw->q3n_dt_bias);
+            L->dn_a        = dense_wdesc_of(model, lw->q3n_a);
+            L->dn_ssm_norm = dense_wdesc_of(model, lw->q3n_ssm_norm);
+            L->dn_out_proj = dense_wdesc_of(model, lw->q3n_out_proj);
+        }
+        L->ffn_gate_inp       = dense_wdesc_of(model, lw->ffn_gate_inp);
+        L->ffn_gate_exps      = dense_wdesc_of(model, lw->ffn_gate_exps);
+        L->ffn_up_exps        = dense_wdesc_of(model, lw->ffn_up_exps);
+        L->ffn_down_exps      = dense_wdesc_of(model, lw->ffn_down_exps);
+        L->ffn_gate_inp_shexp = dense_wdesc_of(model, lw->ffn_gate_inp_shexp);
+        L->ffn_gate_shexp     = dense_wdesc_of(model, lw->ffn_gate_shexp);
+        L->ffn_up_shexp       = dense_wdesc_of(model, lw->ffn_up_shexp);
+        L->ffn_down_shexp     = dense_wdesc_of(model, lw->ffn_down_shexp);
     }
 }
 

@@ -213,6 +213,44 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
 int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict,
                        char *err, size_t errlen);
 
+/* ---- qwen3_next forward (hybrid Gated-DeltaNet + 512-expert MoE) ----------- *
+ * Each layer is full-attention (is_full_attn) or Gated-DeltaNet; MoE FFN on every
+ * layer. Weights are mmap pointers (ds4_dense_wdesc). The expert tensors are the full
+ * [n_embd, n_ff_exp, n_expert] blocks; the driver slices the active experts per token. */
+typedef struct {
+    int is_full_attn;
+    ds4_dense_wdesc attn_norm, post_attn_norm;
+    /* full-attention layer: attn_q packs [query|gate] interleaved per head */
+    ds4_dense_wdesc attn_q, attn_k, attn_v, attn_out, attn_q_norm, attn_k_norm;
+    /* Gated-DeltaNet layer */
+    ds4_dense_wdesc dn_in_proj, dn_gate, dn_conv1d, dn_ba, dn_dt_bias, dn_a, dn_ssm_norm, dn_out_proj;
+    /* MoE (every layer): router, routed experts (3D), shared expert */
+    ds4_dense_wdesc ffn_gate_inp, ffn_gate_exps, ffn_up_exps, ffn_down_exps;
+    ds4_dense_wdesc ffn_gate_inp_shexp, ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp;
+} ds4_q3n_layer_desc;
+
+typedef struct {
+    unsigned n_layer, n_embd, n_vocab, n_ctx;
+    unsigned n_head, n_kv, head_dim, n_rot;        /* full-attention */
+    unsigned n_expert, n_expert_used, n_ff_exp;    /* MoE */
+    /* DeltaNet dims: key/value heads + per-head dims, conv width + packed conv dim */
+    unsigned dn_n_k_heads, dn_n_v_heads, dn_head_k, dn_head_v;
+    unsigned dn_conv_kernel, dn_conv_dim, dn_key_dim, dn_value_dim;
+    unsigned full_attn_interval;
+    float    rms_eps, rope_base;
+    ds4_dense_wdesc       token_embd, output_norm, output;
+    ds4_q3n_layer_desc   *layers;     /* [n_layer] */
+    const void           *model_base; /* mmap base */
+    unsigned long long    model_size;
+} ds4_q3n_model_desc;
+
+typedef struct ds4_q3n_gpu ds4_q3n_gpu;
+ds4_q3n_gpu *ds4_q3n_gpu_create(const ds4_q3n_model_desc *desc);
+void ds4_q3n_gpu_free(ds4_q3n_gpu *g);
+/* One-token forward at position pos; writes desc->n_vocab logits. 0 on success. */
+int ds4_q3n_gpu_forward(ds4_q3n_gpu *g, const ds4_q3n_model_desc *desc,
+                        int token, unsigned pos, float *logits);
+
 /* Interactive multi-turn ChatML chat REPL for dense models. Keeps the KV cache
  * across turns and generates until <|im_end|>/EOS (no token limit). ctx_size<=0
  * defaults to 4096; system may be NULL. Reads stdin until "/exit" or EOF. */
