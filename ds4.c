@@ -26130,11 +26130,25 @@ static char *dense_chat_gen_response(ds4_dense_gpu *g, const ds4_dense_model_des
 static bool dense_tool_find_call(const char *text, char *name, size_t name_cap,
                                  char *args, size_t args_cap) {
     const char *open = NULL, *p = text;
-    while ((p = strstr(p, "<tool_call>")) != NULL) { open = p; p += 11; }   /* last one */
-    if (!open) return false;
-    const char *close = strstr(open, "</tool_call>");
-    const char *body = open + 11;
-    const char *end = close ? close : body + strlen(body);
+    while ((p = strstr(p, "<tool_call>")) != NULL) { open = p; p += 11; }   /* last <tool_call> */
+    const char *body, *end;
+    if (open) {
+        const char *close = strstr(open, "</tool_call>");
+        body = open + 11;
+        end = close ? close : body + strlen(body);
+    } else {
+        /* Lenient fallback: small models often wrap the call in a ```tool_call fence or
+         * drop the tags. Find the last {"name":..,"arguments":{..}} object by locating the
+         * last "arguments" key and backtracking to the '{' that opens its object. */
+        const char *a = NULL; p = text;
+        while ((p = strstr(p, "\"arguments\"")) != NULL) { a = p; p += 11; }
+        if (!a) return false;
+        const char *b = a;
+        while (b > text && *b != '{') b--;
+        if (*b != '{') return false;
+        body = b;
+        end = body + strlen(body);
+    }
     /* name: "name"\s*:\s*"..." */
     const char *n = strstr(body, "\"name\"");
     if (!n || n >= end) return false;
@@ -26442,9 +26456,11 @@ static const char *DENSE_TOOLS_PROMPT =
     "directory, search code, run a command, or look something up online, you MUST actually "
     "PERFORM the action by calling the matching tool — do NOT merely describe the steps, give "
     "manual instructions, or print code for the user to copy. To create a file, call write_file "
-    "with its full content; to run something, call bash; and so on. Emit the <tool_call> right "
-    "after your reasoning. Only reply in prose when the request needs no action. After a "
-    "<tool_response> returns, give the final answer (and confirm what you did).";
+    "with its full content; to run something, call bash; and so on. Emit the call right after "
+    "your reasoning using the literal <tool_call> and </tool_call> tags — NEVER inside a ``` "
+    "code fence — and emit ONE call then stop (do not also paste the code). Only reply in prose "
+    "when the request needs no action. After a <tool_response> returns, give the final answer "
+    "(and confirm what you did).";
 
 /* Interactive multi-turn chat REPL for dense (Qwen2-style ChatML) models. Keeps
  * the KV cache across turns (only the new tokens of each turn are prefilled) and
@@ -26457,14 +26473,13 @@ static const char *DENSE_TOOLS_PROMPT =
 /* Repeat a UTF-8 glyph n times. */
 static void dense_rep(const char *s, int n) { for (int i = 0; i < n; i++) fputs(s, stdout); }
 
-/* Usable terminal width for the banner box (clamped to [68,120]). */
+/* Real terminal width. NOT clamped to a max: the box must match the width at which the
+ * terminal wraps typed text, otherwise (on wide terminals) text would overflow the box. */
 static int dense_term_width(void) {
     struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col >= 30) {
-        int w = ws.ws_col; return w > 120 ? 120 : w;
-    }
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col >= 30) return ws.ws_col;
     const char *c = getenv("COLUMNS");
-    if (c && atoi(c) >= 30) { int w = atoi(c); return w > 120 ? 120 : w; }
+    if (c && atoi(c) >= 30) return atoi(c);
     return 80;
 }
 
