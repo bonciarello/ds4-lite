@@ -26437,8 +26437,14 @@ static const char *DENSE_TOOLS_PROMPT =
     "- grep: arguments {\"pattern\": string, \"path\": string} — searches file contents recursively.\n"
     "- bash: arguments {\"command\": string} — runs a shell command, returns its output.\n"
     "- web_fetch: arguments {\"url\": string} — fetches a web page's text (Playwright).\n"
-    "- web_search: arguments {\"query\": string} — web search results (Playwright/DuckDuckGo).\n"
-    "Call a tool only when needed; otherwise answer directly. After tools return, give the final answer.";
+    "- web_search: arguments {\"query\": string} — web search results (Playwright/Bing).\n"
+    "IMPORTANT: when the user asks you to create, write, edit, read or find a file, list a "
+    "directory, search code, run a command, or look something up online, you MUST actually "
+    "PERFORM the action by calling the matching tool — do NOT merely describe the steps, give "
+    "manual instructions, or print code for the user to copy. To create a file, call write_file "
+    "with its full content; to run something, call bash; and so on. Emit the <tool_call> right "
+    "after your reasoning. Only reply in prose when the request needs no action. After a "
+    "<tool_response> returns, give the final answer (and confirm what you did).";
 
 /* Interactive multi-turn chat REPL for dense (Qwen2-style ChatML) models. Keeps
  * the KV cache across turns (only the new tokens of each turn are prefilled) and
@@ -26469,9 +26475,10 @@ static int dense_term_width(void) {
 static void dense_print_banner(const char *model_path, uint32_t n_ctx,
                                const char *device_str, const char *init_text) {
     const char *B = "\033[1;34m", *W = "\033[1;37m", *Z = "\033[0m", *C = "\033[36m", *D = "\033[2m";
-    /* leave a 1-column right margin: a line exactly the terminal width triggers the
-     * right-margin auto-wrap (+ our '\n' = a blank line) inside linenoise's raw mode. */
-    int TW = dense_term_width() - 1; if (TW < 35) TW = 35;
+    /* full terminal width: the resize redraw re-enables ONLCR, so a line exactly the
+     * terminal width is safe, and it makes typed text (which the terminal wraps at the
+     * real width) wrap exactly at the input-box border. */
+    int TW = dense_term_width(); if (TW < 35) TW = 35;
     /* logo column needs 27; commands prefer 34 but shrink (and truncate) on narrow
      * terminals so the box always fits within TW. */
     int WL = TW - 7 - 34; if (WL < 27) WL = 27;   /* left (logo/info) column */
@@ -26545,8 +26552,8 @@ static void dense_fmt_tok(uint32_t n, char *b, size_t cap) {
     else snprintf(b, cap, "%.1fk", (double)n / 1000.0);
 }
 
-/* Input-box width = banner-box width (terminal width - 1). */
-static int dense_box_w(void) { int w = dense_term_width() - 1; return w < 24 ? 24 : w; }
+/* Input-box width = banner-box width = full terminal width. */
+static int dense_box_w(void) { int w = dense_term_width(); return w < 24 ? 24 : w; }
 
 /* Top border of the input box, '\r\n'-terminated by the caller. */
 static void dense_print_topbar(void) {
@@ -26651,6 +26658,7 @@ static char *dense_readline(const char *prompt, const char *model_path,
             dense_print_banner(model_path, n_ctx, device_str, init_text);
             if (have_t) tcsetattr(STDOUT_FILENO, TCSANOW, &traw);
             dense_print_topbar(); fputs("\r\n", stdout);          /* input-box top border */
+            ls.cols = (size_t)dense_term_width();                 /* linenoise: follow new width */
             dense_ctx_status(stbuf, sizeof stbuf, used, n_ctx);   /* bar/box width follows resize */
             linenoiseEditSetStatus(&ls, stbuf, NULL, NULL);
             linenoiseShow(&ls);
