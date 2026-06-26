@@ -114,11 +114,18 @@ n_v_heads → `ggml_gated_linear_attn(q,v,k,gate=α',β,state)` → RMSNorm(`ssm
 **Full-attn layer** (`qwen3next.cpp:206-284`): q-proj gives [q | gate]; RMSNorm q,k; RoPE
 (NeoX); softmax attention; `out *= sigmoid(gate)`; out-proj.
 
-**ssm_scan recurrence** (`ggml-metal.metal:2274`, `ggml.c:ssm_scan`): per token,
-`dt' = softplus(dt)`, `dA = exp(dt'·A)`, `s = s·dA + B·x·dt'`, `y = Σ_state(s·C)`.
-**gated_linear_attn** (`ggml-cpu/ops.cpp:10342`): `kv = v·k; tmp = kv + state·g;
-y += tmp·(q·scale); state = tmp` (per head, per state-cell). These are the two kernels
-to port to Metal (`ggml-metal.metal`: `kernel_ssm_conv_*`, `kernel_ssm_scan*`, gated-LA).
+**DeltaNet recurrence — CORRECTED (important).** qwen3_next does **not** use a fused
+`ggml_ssm_scan` or `ggml_gated_linear_attn` op. `src/models/qwen3next.cpp` calls only
+`ggml_ssm_conv` (line 443); the whole delta-rule lives in `src/models/delta-net-base.cpp`
+(606 lines) as the **chunkwise gated delta rule** built from *standard* ops:
+`ggml_mul_mat`, `ggml_cumsum` (prefix-sum along the chunk), `ggml_pad`, `ggml_mul`,
+`ggml_transpose`, `ggml_cont`, `ggml_view`/`reshape`, plus a triangular mask. So the only
+**exotic kernels** ds4 lacks are:
+1. **`ssm_conv`** — causal depthwise 1-D conv. ✅ **landed + validated** (see §6).
+2. **`cumsum`** — segmented prefix-sum along a chunk axis. ⬜ small, easy to port + test.
+Everything else (the chunked matmuls, masking, gating) is expressible with ds4's existing
+dense matvec/elementwise kernels. This is **more tractable** than the original
+"port a selective-scan recurrence" framing — no numerically-delicate sequential scan kernel.
 
 **llama.cpp files**: `src/models/qwen3next.cpp`, `src/models/delta-net-base.cpp`,
 `src/llama-arch.cpp`, `src/llama-hparams.{h,cpp}`, `ggml/src/ggml.c`,
@@ -130,4 +137,16 @@ to port to Metal (`ggml-metal.metal`: `kernel_ssm_conv_*`, `kernel_ssm_scan*`, g
   expert_count / context_length under the `qwen3next` namespace and sets the family.
 - `config_validate_model` dispatches `general.architecture == "qwen3next"` to it.
 - The dense chat/generate entry points reject it cleanly with a pointer to this doc
-  (instead of crashing or loading garbage). Next: Phase 1 (loader + full-attn path).
+  (instead of crashing or loading garbage).
+
+## 7. Kernel work landed (Phase 3, partial)
+- **`kernel_dense_ssm_conv_f32`** in `metal/dense.metal`: causal depthwise 1-D conv
+  (`out[t,c] = Σ_k sx[t+k,c]·w[k,c]`, history prepended → causal window). The first of
+  the two exotic kernels qwen3_next needs.
+- **Validated on-device** (M1 Max) as Case 14 of `./ds4 --metal-dense-selftest`: GPU vs
+  CPU reference, max err < 1e-5, PASS. Uses ds4's standard dispatch path
+  (`ds4_gpu_run`/buffers/pipeline), so it slots straight into the eventual DeltaNet graph.
+- **Remaining for a runnable model**: `cumsum` kernel (+ test); the chunked delta-rule
+  graph (matmuls/mask/gate via existing kernels); 512-expert MoE + shared expert; hybrid
+  per-layer dispatch + the recurrent conv/SSM **state cache**; end-to-end greedy match vs
+  llama.cpp — which needs the ~38 GB Qwen3-Coder-Next GGUF to validate.

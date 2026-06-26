@@ -5414,6 +5414,61 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         if (!ok) goto free_gpu;
     }
 
+    /* --- Case 14: qwen3_next causal depthwise conv (kernel_dense_ssm_conv_f32) --- */
+    {
+        const uint32_t C = 48u, K = 4u, T = 7u;   /* channels, conv width, tokens */
+        const uint32_t rows = T + K - 1u;          /* sx carries K-1 history rows */
+        float *sx = malloc((size_t)rows*C*sizeof(float));
+        float *wc = malloc((size_t)K*C*sizeof(float));
+        float *cref = malloc((size_t)T*C*sizeof(float));
+        float *cgot = malloc((size_t)T*C*sizeof(float));
+        bool ok = sx && wc && cref && cgot;
+        ds4_gpu_tensor *sxb=0,*wcb=0,*ob=0;
+        if (ok) {
+            for (uint32_t i=0;i<rows*C;i++) sx[i] = 0.01f*(float)(((i*7u)%23u)) - 0.11f;
+            for (uint32_t i=0;i<K*C;i++)    wc[i] = 0.02f*(float)(((i*5u)%13u)) - 0.13f;
+            /* CPU reference: out[t,c] = sum_k sx[(t+k),c] * w[k,c] */
+            for (uint32_t t=0;t<T;t++) for (uint32_t c=0;c<C;c++) {
+                double s=0; for (uint32_t k=0;k<K;k++) s += (double)sx[(size_t)(t+k)*C+c]*wc[(size_t)k*C+c];
+                cref[(size_t)t*C+c] = (float)s;
+            }
+            sxb=ds4_gpu_tensor_alloc((uint64_t)rows*C*sizeof(float));
+            wcb=ds4_gpu_tensor_alloc((uint64_t)K*C*sizeof(float));
+            ob =ds4_gpu_tensor_alloc((uint64_t)T*C*sizeof(float));
+            ok = sxb && wcb && ob;
+        }
+        if (ok) {
+            ds4_gpu_tensor_write(sxb,0,sx,(uint64_t)rows*C*sizeof(float));
+            ds4_gpu_tensor_write(wcb,0,wc,(uint64_t)K*C*sizeof(float));
+            struct __attribute__((packed)) { uint32_t C,K,T; } ca = { C, K, T };
+            id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dense_ssm_conv_f32");
+            ok = p != nil;
+            if (ok) {
+                int owned=0; id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+                ok = cb != nil;
+                if (ok) {
+                    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                    [enc setComputePipelineState:p];
+                    [enc setBytes:&ca length:sizeof(ca) atIndex:0];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(sxb) offset:ds4_gpu_tensor_offset(sxb) atIndex:1];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(wcb) offset:ds4_gpu_tensor_offset(wcb) atIndex:2];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(ob)  offset:ds4_gpu_tensor_offset(ob)  atIndex:3];
+                    const NSUInteger total = (NSUInteger)C*T, tg = 64;
+                    [enc dispatchThreadgroups:MTLSizeMake((total+tg-1)/tg,1,1) threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
+                    ds4_gpu_end_compute_encoder(cb, enc);
+                    ok = ds4_gpu_finish_command_buffer(cb, owned, "selftest ssm_conv");
+                }
+            }
+        }
+        if (ok) ds4_gpu_tensor_read(ob,0,cgot,(uint64_t)T*C*sizeof(float));
+        ds4_gpu_tensor_free(sxb); ds4_gpu_tensor_free(wcb); ds4_gpu_tensor_free(ob);
+        float maxerr = 0.0f;
+        if (ok) for (uint32_t i=0;i<T*C;i++){ float e=fabsf(cgot[i]-cref[i]); if(e>maxerr)maxerr=e; }
+        free(sx); free(wc); free(cref); free(cgot);
+        if (!ok) { if (errlen) snprintf(err, errlen, "ssm_conv GPU run failed"); goto free_gpu; }
+        if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "ssm_conv max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
+    }
+
     rc = 0;   /* all cases passed */
 free_gpu:
     ds4_gpu_tensor_free(wf32);

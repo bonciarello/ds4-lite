@@ -2801,3 +2801,29 @@ kernel void kernel_dense_mul_mv_q6_K_f32_sg(
         if (tiisg == 0) dst[first_row + row] = s;
     }
 }
+
+/* ---- qwen3_next building blocks ------------------------------------------- *
+ * Causal depthwise 1-D convolution (ggml_ssm_conv semantics). The Gated-DeltaNet
+ * layer of qwen3_next runs the projected q/k/v through this short conv before the
+ * delta-rule. Per channel c and output token t:
+ *     out[t, c] = sum_{k=0..K-1} sx[t+k, c] * w[k, c]
+ * sx carries the (K-1)-token conv history prepended, so it has T+K-1 rows; the
+ * window is therefore causal. Row-major: sx[(T+K-1), C], w[K, C], out[T, C].
+ * Pure conv only — the SiLU that follows in the graph is a separate kernel. */
+struct dense_ssm_conv_args { uint C; uint K; uint T; };
+kernel void kernel_dense_ssm_conv_f32(
+        constant dense_ssm_conv_args & a [[buffer(0)]],
+        device const float * sx  [[buffer(1)]],   /* [(T+K-1), C] row-major */
+        device const float * w   [[buffer(2)]],   /* [K, C]       row-major */
+        device       float * out [[buffer(3)]],   /* [T, C]       row-major */
+        uint gid [[thread_position_in_grid]]) {
+    const uint total = a.C * a.T;
+    if (gid >= total) return;
+    const uint t = gid / a.C;
+    const uint c = gid % a.C;
+    float s = 0.0f;
+    for (uint k = 0; k < a.K; ++k) {
+        s += sx[(t + k) * a.C + c] * w[k * a.C + c];
+    }
+    out[t * a.C + c] = s;
+}
