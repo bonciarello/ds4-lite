@@ -26800,11 +26800,70 @@ static const char *dense_model_script_path(void) {
     return path[0] ? path : NULL;
 }
 
+/* Interactive first-run / no-model picker: lists local GGUFs in ./gguf and whichllm's
+ * hardware-ranked models, reads a choice from stdin, downloads the picked model if
+ * needed, and writes the chosen path to `out`. Returns false if the user quits. */
+static bool dense_pick_model(char *out, size_t cap) {
+    const char *script = dense_model_script_path();
+    glob_t gl; memset(&gl, 0, sizeof gl);
+    glob("gguf/*.gguf", 0, NULL, &gl);
+    printf("\n\033[1mLocal models (./gguf):\033[0m\n");
+    if (gl.gl_pathc == 0) printf("  \033[2m(none)\033[0m\n");
+    for (size_t i = 0; i < gl.gl_pathc; i++)
+        printf("  \033[36mL%zu\033[0m %s\n", i + 1, gl.gl_pathv[i]);
+    if (script) {
+        printf("\n\033[2m(querying whichllm…)\033[0m\n");
+        char cmd[PATH_MAX + 32]; snprintf(cmd, sizeof cmd, "python3 '%s' list 12 2>&1", script);
+        FILE *fp = popen(cmd, "r");
+        if (fp) { char b[4096]; size_t r; while ((r = fread(b, 1, sizeof b, fp)) > 0) fwrite(b, 1, r, stdout); pclose(fp); }
+    }
+    printf("\n\033[1mChoose a model:\033[0m  \033[36m<n>\033[0m download recommended · "
+           "\033[36mL<n>\033[0m use a local file · \033[36mq\033[0m quit\n> ");
+    fflush(stdout);
+    char line[128];
+    if (!fgets(line, sizeof line, stdin)) { globfree(&gl); return false; }
+    char *p = line; while (*p == ' ' || *p == '\t') p++;
+    size_t L = strlen(p); while (L && (p[L-1]=='\n'||p[L-1]=='\r'||p[L-1]==' ')) p[--L] = '\0';
+    if (p[0] == '\0' || p[0] == 'q' || p[0] == 'Q') { globfree(&gl); return false; }
+    if (p[0] == 'L' || p[0] == 'l') {
+        int idx = atoi(p + 1); bool ok = (idx >= 1 && (size_t)idx <= gl.gl_pathc);
+        if (ok) snprintf(out, cap, "%s", gl.gl_pathv[idx - 1]);
+        globfree(&gl); return ok;
+    }
+    globfree(&gl);
+    const int sel = atoi(p);
+    if (sel <= 0 || !script) return false;
+    char cmd[PATH_MAX + 32]; snprintf(cmd, sizeof cmd, "python3 '%s' get %d 2>&1", script, sel);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return false;
+    char capb[8192]; size_t cl = 0, r; char b[4096];
+    while ((r = fread(b, 1, sizeof b, fp)) > 0) {
+        fwrite(b, 1, r, stdout); fflush(stdout);
+        size_t cp = r; if (cl + cp >= sizeof capb) cp = sizeof capb - 1 - cl;
+        if (cp) { memcpy(capb + cl, b, cp); cl += cp; }
+    }
+    pclose(fp); capb[cl] = '\0';
+    const char *dp = strstr(capb, "done: "); if (!dp) dp = strstr(capb, "already present: ");
+    if (!dp) return false;
+    dp = strchr(dp, ':') + 1; while (*dp == ' ') dp++;
+    size_t k = 0; while (*dp && *dp != '\n' && *dp != '\033' && *dp != '\r' && k + 1 < cap) out[k++] = *dp++;
+    out[k] = '\0';
+    return k > 0;
+}
+
 int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                    char *err, size_t errlen) {
     ds4_model model;
     ds4_vocab vocab;
     ds4_weights weights;
+    char picked[PATH_MAX];
+    if (!model_path || !model_path[0]) {           /* no model given: open the picker */
+        if (!dense_pick_model(picked, sizeof picked)) {
+            if (errlen) snprintf(err, errlen, "no model selected");
+            return 0;                              /* user quit — not an error */
+        }
+        model_path = picked;
+    }
     model_open(&model, model_path, false, true);
     config_validate_model(&model);
     if (ds4_arch_is_deepseek()) {

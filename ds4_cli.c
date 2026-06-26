@@ -1470,7 +1470,7 @@ static cli_config parse_options(int argc, char **argv) {
             const char *mp  = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[++i] : NULL;
             const int   ctx = (i + 1 < argc && argv[i + 1][0] != '-') ? atoi(argv[++i]) : 0;
             const char *sys = (i + 1 < argc) ? argv[++i] : NULL;
-            if (!mp || !mp[0]) { fprintf(stderr, "ds4: --metal-dense-chat needs MODEL [CTX] [SYSTEM]\n"); exit(1); }
+            /* MODEL is optional: when omitted, ds4_dense_chat opens the whichllm picker. */
             char st_err[256] = {0};
             const int rc = ds4_dense_chat(mp, sys, ctx, st_err, sizeof(st_err));
             if (rc != 0) fprintf(stderr, "ds4: dense chat failed: %s\n", st_err);
