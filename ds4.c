@@ -26552,7 +26552,7 @@ static void dense_winch_handler(int sig) {
  * width) when the terminal is resized. Falls back to blocking linenoise() when stdin
  * is not a tty or the self-pipe is unavailable. Returns a malloc'd line or NULL (EOF). */
 static char *dense_readline(const char *prompt, const char *model_path,
-                            uint32_t n_ctx, const char *device_str) {
+                            uint32_t n_ctx, const char *device_str, const char *init_text) {
     if (!isatty(STDIN_FILENO) || g_winch_pipe[0] < 0) return linenoise(prompt);
     static char linebuf[8192];
     struct linenoiseState ls;
@@ -26584,7 +26584,7 @@ static char *dense_readline(const char *prompt, const char *model_path,
             struct termios traw; int have_t = (tcgetattr(STDOUT_FILENO, &traw) == 0);
             if (have_t) { struct termios tc = traw; tc.c_oflag |= (OPOST | ONLCR);
                           tcsetattr(STDOUT_FILENO, TCSANOW, &tc); }
-            dense_print_banner(model_path, n_ctx, device_str, NULL);
+            dense_print_banner(model_path, n_ctx, device_str, init_text);
             if (have_t) tcsetattr(STDOUT_FILENO, TCSANOW, &traw);
             linenoiseShow(&ls);
         }
@@ -26738,7 +26738,8 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     char *line = NULL;
     while (rc == 0) {
         linenoiseFree(line);
-        line = dense_readline("> ", model_path, n_ctx, dev_str[0] ? dev_str : NULL);
+        line = dense_readline("> ", model_path, n_ctx, dev_str[0] ? dev_str : NULL,
+                              init_log[0] ? init_log : NULL);
         if (!line) { printf("\n"); break; }             /* EOF / Ctrl-D */
         size_t nr = strlen(line);   /* non-const: /read replaces line+nr */
         if (nr == 0) continue;
