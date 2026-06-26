@@ -26534,9 +26534,7 @@ static void dense_print_banner(const char *model_path, uint32_t n_ctx,
         }
     }
     printf("╰"); dense_rep("─", Wbox - 2); printf("╯\n");
-    const char *foot = (Wbox >= 62) ? "reflection on · 8 tools on · arrows: edit/history · auto-slide"
-                     : (Wbox >= 44) ? "reflection · 8 tools · arrows · auto-slide"
-                                    : "reflection · tools on";
+    const char *foot = "arrows: edit/history";
     printf("%s%s%s\n\n", D, foot, Z);
     fflush(stdout);
 }
