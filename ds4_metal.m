@@ -4189,9 +4189,12 @@ static bool dense_attn(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *q,
     if (getenv("DS4_ATTN_SCALAR"))  /* A/B: the old 28-thread kernel */
         return ds4_gpu_run_simple("kernel_dense_attn_decode_f32", &a, sizeof(a), bufs, 4, nh, "fwd attn");
 
-    /* Split the KV into ~512-key chunks for parallelism; combine the partials.
-     * Small contexts stay single-simdgroup-per-head (no combine overhead). */
-    uint32_t S = (nctx + 511u) / 512u;
+    /* Split the KV into chunks for parallelism; combine the partials. Small
+     * contexts stay single-simdgroup-per-head (no combine overhead). The chunk
+     * (keys per split) is tunable via DS4_ATTN_CHUNK; smaller = more parallelism. */
+    uint32_t chunk_target = 32u;   /* tuned sweet spot (max parallelism vs combine cost) */
+    { const char *e = getenv("DS4_ATTN_CHUNK"); if (e && atoi(e) > 0) chunk_target = (uint32_t)atoi(e); }
+    uint32_t S = (nctx + chunk_target - 1u) / chunk_target;
     if (S > DS4_ATTN_SPLIT_MAX) S = DS4_ATTN_SPLIT_MAX;
     if (S <= 1u || getenv("DS4_ATTN_NOSPLIT") || !g->pm)
         return ds4_gpu_run_grid("kernel_dense_attn_decode_f32_sg", &a, sizeof(a), bufs, 4,
