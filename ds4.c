@@ -26388,10 +26388,17 @@ static void dense_tool_exec(const char *name, const char *args,
     if (*out_len == 0) dense_sbuf_append(out, out_len, out_cap, "(no output)", 11);
 }
 
-/* Pretty-print a tool call + a preview of its result as a bordered block. */
+static int dense_term_width(void);   /* fwd: current terminal width (clamped) */
+
+/* Pretty-print a tool call + a preview of its result as a bordered block. Reads the
+ * terminal width at render time, so previews adapt to the CURRENT terminal size. */
 static void dense_tool_render(const char *name, const char *args, const char *res, size_t rl) {
-    /* header: 🔧 name  (args dimmed) */
-    printf("\n\033[1;36m\xf0\x9f\x94\xa7 %s\033[0m \033[2m%s\033[0m\n", name, args ? args : "{}");
+    const int tw = dense_term_width();
+    int maxw = tw - 2; if (maxw < 20) maxw = 20;   /* "│ " + line */
+    /* header: 🔧 name  (args dimmed, clipped to width) */
+    int argroom = maxw - (int)strlen(name) - 4; if (argroom < 4) argroom = 4;
+    printf("\n\033[1;36m\xf0\x9f\x94\xa7 %s\033[0m \033[2m%.*s\033[0m\n",
+           name, argroom, args ? args : "{}");
     if (!res || rl == 0) { printf("\033[2m\xe2\x94\x82\033[0m \033[2m(nessun output)\033[0m\n"); fflush(stdout); return; }
     int total = 0;
     for (size_t i = 0; i < rl; i++) if (res[i] == '\n') total++;
@@ -26401,7 +26408,7 @@ static void dense_tool_render(const char *name, const char *args, const char *re
     while (shown < MAXL && (size_t)(p - res) < rl) {
         const char *nl = memchr(p, '\n', rl - (size_t)(p - res));
         size_t len = nl ? (size_t)(nl - p) : rl - (size_t)(p - res);
-        size_t clip = len > 200 ? 200 : len;
+        size_t clip = len > (size_t)maxw ? (size_t)maxw : len;
         printf("\033[36m\xe2\x94\x82\033[0m ");          /* cyan left border */
         fwrite(p, 1, clip, stdout);
         if (clip < len) printf("\033[2m\xe2\x80\xa6\033[0m");
@@ -26444,11 +26451,11 @@ static void dense_rep(const char *s, int n) { for (int i = 0; i < n; i++) fputs(
 /* Usable terminal width for the banner box (clamped to [68,120]). */
 static int dense_term_width(void) {
     struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col >= 40) {
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col >= 30) {
         int w = ws.ws_col; return w > 120 ? 120 : w;
     }
     const char *c = getenv("COLUMNS");
-    if (c && atoi(c) >= 40) { int w = atoi(c); return w > 120 ? 120 : (w < 68 ? 68 : w); }
+    if (c && atoi(c) >= 30) { int w = atoi(c); return w > 120 ? 120 : w; }
     return 80;
 }
 
@@ -26459,10 +26466,12 @@ static int dense_term_width(void) {
 static void dense_print_banner(const char *model_path, uint32_t n_ctx,
                                const char *device_str, const char *init_text) {
     const char *B = "\033[1;34m", *W = "\033[1;37m", *Z = "\033[0m", *C = "\033[36m", *D = "\033[2m";
-    const int TW = dense_term_width();
-    const int WR = 34;                       /* right (commands) column */
-    int WL = TW - 7 - WR; if (WL < 27) WL = 27;
-    const int Wbox = WL + WR + 7;            /* actual box width */
+    int TW = dense_term_width(); if (TW < 35) TW = 35;
+    /* logo column needs 27; commands prefer 34 but shrink (and truncate) on narrow
+     * terminals so the box always fits exactly within TW. */
+    int WL = TW - 7 - 34; if (WL < 27) WL = 27;   /* left (logo/info) column */
+    int WR = TW - 7 - WL; if (WR < 1) WR = 1;     /* right (commands) column */
+    const int Wbox = WL + WR + 7;            /* == TW */
     const int FC = WL + WR + 3;              /* full-width content cells */
     static const char *dg[6] = {"██████╗ ","██╔══██╗","██║  ██║","██║  ██║","██████╔╝","╚═════╝ "};
     static const char *sg[6] = {"███████╗","██╔════╝","███████╗","╚════██║","███████║","╚══════╝"};
@@ -26502,9 +26511,9 @@ static void dense_print_banner(const char *model_path, uint32_t n_ctx,
         if (i < 6) {
             printf("│    %s%s%s%s%s%s", B, dg[i], sg[i], W, fg[i], Z);
             for (int s = 0; s < WL - 27; s++) putchar(' ');     /* pad logo(24)+indent(3) to WL */
-            printf(" │ %s%-*s%s │\n", C, WR, cmd[i], Z);
+            printf(" │ %s%-*.*s%s │\n", C, WR, WR, cmd[i], Z);
         } else {
-            printf("│ %s%-*s%s │ %s%-*s%s │\n", D, WL, lrows[i-6], Z, C, WR, cmd[i], Z);
+            printf("│ %s%-*.*s%s │ %s%-*.*s%s │\n", D, WL, WL, lrows[i-6], Z, C, WR, WR, cmd[i], Z);
         }
     }
     /* full-width init-log section */
