@@ -3147,6 +3147,21 @@ typedef struct {
     ds4_tensor *ffn_gate;
     ds4_tensor *ffn_up;
     ds4_tensor *ffn_down;
+    /* qwen3_next. DeltaNet layers (i%full_attn_interval != interval-1) use the SSM block
+     * below; full-attention layers reuse attn_q/k/v/out above (attn_q is [q|gate]) plus
+     * the per-head q/k norms. MoE (every layer) reuses ffn_gate/up/down_exps + shexp;
+     * attn_norm = input norm, ffn_norm = post_attention_norm, ffn_gate_inp = router. */
+    ds4_tensor *q3n_in_proj;     /* blk.%u.attn_qkv  — [n_embd, 2*key_dim+value_dim] */
+    ds4_tensor *q3n_gate;        /* blk.%u.attn_gate — DeltaNet z gate [n_embd, value_dim] */
+    ds4_tensor *q3n_conv1d;      /* blk.%u.ssm_conv1d — [conv_kernel, conv_dim] */
+    ds4_tensor *q3n_ba;          /* blk.%u.ssm_ba    — beta|alpha [n_embd, 2*n_v_heads] */
+    ds4_tensor *q3n_dt_bias;     /* blk.%u.ssm_dt.bias — [n_v_heads] */
+    ds4_tensor *q3n_a;           /* blk.%u.ssm_a     — [n_v_heads] */
+    ds4_tensor *q3n_ssm_norm;    /* blk.%u.ssm_norm  — RMSNorm over head_v_dim */
+    ds4_tensor *q3n_out_proj;    /* blk.%u.ssm_out   — [value_dim, n_embd] */
+    ds4_tensor *attn_q_norm;     /* blk.%u.attn_q_norm — full-attn per-head q RMSNorm */
+    ds4_tensor *attn_k_norm;     /* blk.%u.attn_k_norm — full-attn per-head k RMSNorm */
+    ds4_tensor *ffn_gate_inp_shexp; /* blk.%u.ffn_gate_inp_shexp — shared-expert sigmoid gate */
 } ds4_layer_weights;
 
 typedef struct {
@@ -4440,6 +4455,53 @@ static void weights_bind_dense(ds4_weights *w, const ds4_model *m, bool load_sli
     weights_validate_layout_dense(w, start, end, require_token_embd, require_output);
 }
 
+/* qwen3_next: a layer is full-attention when (il % interval == interval-1), else it is a
+ * Gated-DeltaNet (linear-attention) layer. interval defaults to 4. */
+static inline bool ds4_q3n_layer_is_full_attn(uint32_t il) {
+    const uint32_t iv = g_ds4_shape.full_attn_interval ? g_ds4_shape.full_attn_interval : 4u;
+    return (il % iv) == (iv - 1u);
+}
+
+static void weights_bind_layer_qwen3next(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->ffn_norm  = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);  /* pre-MoE norm */
+    if (ds4_q3n_layer_is_full_attn(il)) {
+        /* standard GQA attention; attn_q packs [q|gate]; per-head q/k RMSNorm */
+        l->attn_q      = required_tensorf(m, "blk.%u.attn_q.weight", il);
+        l->attn_k      = required_tensorf(m, "blk.%u.attn_k.weight", il);
+        l->attn_v      = required_tensorf(m, "blk.%u.attn_v.weight", il);
+        l->attn_out    = required_tensorf(m, "blk.%u.attn_output.weight", il);
+        l->attn_q_norm = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+        l->attn_k_norm = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+    } else {
+        /* Gated-DeltaNet linear-attention block */
+        l->q3n_in_proj  = required_tensorf(m, "blk.%u.attn_qkv.weight", il);
+        l->q3n_gate     = required_tensorf(m, "blk.%u.attn_gate.weight", il);
+        l->q3n_conv1d   = required_tensorf(m, "blk.%u.ssm_conv1d.weight", il);
+        l->q3n_ba       = required_tensorf(m, "blk.%u.ssm_ba.weight", il);
+        l->q3n_dt_bias  = required_tensorf(m, "blk.%u.ssm_dt.bias", il);
+        l->q3n_a        = required_tensorf(m, "blk.%u.ssm_a", il);
+        l->q3n_ssm_norm = required_tensorf(m, "blk.%u.ssm_norm.weight", il);
+        l->q3n_out_proj = required_tensorf(m, "blk.%u.ssm_out.weight", il);
+    }
+    /* MoE FFN on every layer: router + 512 routed experts + shared expert */
+    l->ffn_gate_inp       = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+    l->ffn_gate_exps      = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+    l->ffn_up_exps        = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+    l->ffn_down_exps      = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    l->ffn_gate_inp_shexp = required_tensorf(m, "blk.%u.ffn_gate_inp_shexp.weight", il);
+    l->ffn_gate_shexp     = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+    l->ffn_up_shexp       = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+    l->ffn_down_shexp     = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+}
+
+static void weights_bind_qwen3next(ds4_weights *w, const ds4_model *m, bool require_output) {
+    memset(w, 0, sizeof(*w));
+    weights_bind_output_dense(w, m, true, require_output);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        weights_bind_layer_qwen3next(&w->layer[il], m, il);
+}
+
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
  * where stringly GGUF metadata becomes direct model-specific pointers. */
 static void weights_bind(
@@ -4450,6 +4512,10 @@ static void weights_bind(
         uint32_t         load_layer_end,
         bool             require_output,
         bool             optional_output) {
+    if (ds4_arch_is_qwen3next()) {
+        weights_bind_qwen3next(w, m, require_output || !load_slice);
+        return;
+    }
     if (!ds4_arch_is_deepseek()) {
         weights_bind_dense(w, m, load_slice, load_layer_start, load_layer_end,
                            require_output);
@@ -27013,12 +27079,20 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         return 1;
     }
     if (ds4_arch_is_qwen3next()) {
+        /* Phase 1: bind the tensors (verifies the full GGUF tensor map against the real
+         * model) and report, then reject — the forward (Gated-DeltaNet + 512-expert MoE
+         * over SSD streaming) is still being built. See docs/QWEN3NEXT_PLAN.md. */
+        vocab_load(&vocab, &model);
+        weights_bind(&weights, &model, false, 0, 0, true, false);
+        uint32_t nfull = 0;
+        for (uint32_t i = 0; i < DS4_N_LAYER; i++) if (ds4_q3n_layer_is_full_attn(i)) nfull++;
         fprintf(stderr,
-            "ds4: qwen3_next detected (%u layers, %u experts) — this architecture is not yet\n"
-            "     runnable: it needs the Gated-DeltaNet linear-attention kernels + 512-expert\n"
-            "     MoE. Implementation is scaffolded; see docs/QWEN3NEXT_PLAN.md.\n",
-            (unsigned)DS4_N_LAYER, (unsigned)DS4_N_EXPERT);
-        if (errlen) snprintf(err, errlen, "qwen3_next not yet supported (see docs/QWEN3NEXT_PLAN.md)");
+            "ds4: qwen3_next weights bound OK — %u layers (%u full-attn, %u DeltaNet), "
+            "%u experts (top-%u) + shared.\n"
+            "     forward not yet implemented; see docs/QWEN3NEXT_PLAN.md.\n",
+            (unsigned)DS4_N_LAYER, nfull, (unsigned)DS4_N_LAYER - nfull,
+            (unsigned)DS4_N_EXPERT, (unsigned)g_ds4_shape.n_expert_used);
+        if (errlen) snprintf(err, errlen, "qwen3_next forward not yet implemented (weights bind OK)");
         model_close(&model);
         return 1;
     }

@@ -219,3 +219,19 @@ shape: `ssm.{conv_kernel,inner_size,state_size,time_step_rank,group_count}`,
 `attention.layer_norm_rms_epsilon`, `rope.freq_base`, and `n_head_dim = n_embd/n_head`.
 New `ds4_shape` fields: `ssm_conv_kernel/ssm_inner_size/ssm_state_size/ssm_dt_rank/
 ssm_n_group/full_attn_interval`. This is what the forward + the streaming router will read.
+
+## 10. Tensor binding landed (Phase 1) — VALIDATED on the real model
+`weights_bind_qwen3next` + `weights_bind_layer_qwen3next` map every GGUF tensor into the
+fixed layer layout, branching per layer type via `ds4_q3n_layer_is_full_attn(il)`
+(`il % interval == interval-1`):
+- DeltaNet layers → new `ds4_layer_weights` fields `q3n_in_proj` (attn_qkv), `q3n_gate`
+  (attn_gate), `q3n_conv1d`, `q3n_ba`, `q3n_dt_bias`, `q3n_a`, `q3n_ssm_norm`, `q3n_out_proj`.
+- full-attn layers → reuse `attn_q/k/v/out` (+ new `attn_q_norm`, `attn_k_norm`).
+- MoE (all layers) → reuse `ffn_gate_inp` + `ffn_{gate,up,down}_exps` + `*_shexp`, plus new
+  `ffn_gate_inp_shexp`; `attn_norm` = input norm, `ffn_norm` = `post_attention_norm`.
+`weights_bind` routes `qwen3next` here. **Validated**: binding the real 48-layer/512-expert
+Q4_K_M model reports "weights bound OK — 48 layers (12 full-attn, 36 DeltaNet), 512 experts
+(top-10) + shared" with no missing tensor (all 843 mapped). The chat entry binds + reports,
+then still rejects (forward pending). **Next**: Phase 2/3 forward — full-attn layer (reuse
+dense GQA + q/k-norm + sigmoid gate), DeltaNet (conv→delta-rule→norm→gate→out), MoE over
+streaming, hybrid dispatch + state cache, validate vs llama.cpp.
