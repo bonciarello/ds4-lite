@@ -26162,12 +26162,20 @@ static bool dense_tool_find_call(const char *text, char *name, size_t name_cap,
     if (a && a < end) {
         const char *brace = strchr(a, '{');
         if (brace && brace < end) {
+            /* Brace-match the {...} object, but ignore braces INSIDE JSON strings
+             * (and \-escapes), so content like Python code with {} doesn't truncate it. */
             int depth = 0; size_t j = 0; const char *q = brace;
+            bool instr = false, esc = false;
             for (; q < end && j + 1 < args_cap; q++) {
-                if (*q == '{') depth++;
-                else if (*q == '}') { depth--; }
-                args[j++] = *q;
-                if (depth == 0) break;
+                const char c = *q;
+                args[j++] = c;
+                if (esc) { esc = false; continue; }
+                if (c == '\\') { esc = true; continue; }
+                if (c == '"') { instr = !instr; continue; }
+                if (!instr) {
+                    if (c == '{') depth++;
+                    else if (c == '}' && --depth == 0) break;
+                }
             }
             args[j] = '\0';
         }
@@ -26691,6 +26699,25 @@ static char *dense_readline(const char *prompt, const char *model_path,
     return (res == linenoiseEditMore) ? NULL : res;
 }
 
+/* Claude-Code-style "thinking" spinner shown between sending a message and the first
+ * response token (the prefill wait). Runs on its own thread; the main thread sets
+ * g_spin_run = 0 and joins when output is about to stream. */
+static volatile sig_atomic_t g_spin_run = 0;
+static void *dense_spinner_thread(void *arg) {
+    (void)arg;
+    static const char *fr[10] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
+    const double t0 = now_sec();
+    for (int i = 0; g_spin_run; i++) {
+        printf("\r\033[36m%s\033[0m \033[2mthinking… %.1fs\033[0m\033[K",
+               fr[i % 10], now_sec() - t0);
+        fflush(stdout);
+        usleep(90000);
+    }
+    printf("\r\033[K");                  /* clear the spinner line */
+    fflush(stdout);
+    return NULL;
+}
+
 int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                    char *err, size_t errlen) {
     ds4_model model;
@@ -27022,11 +27049,22 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
          * directive + the answer without the <think> reasoning). */
         const uint32_t pos_user_start = pos;
 
+        /* loading spinner while we prefill + prime <think>, until output streams. The
+         * first frame is drawn synchronously (so it shows even when the work is faster
+         * than the spinner thread gets scheduled); the thread then animates it. */
+        pthread_t spin; int spin_on = 0;
+        if (isatty(STDOUT_FILENO)) {
+            printf("\r\033[36m⠋\033[0m \033[2mthinking…\033[0m\033[K"); fflush(stdout);
+            g_spin_run = 1;
+            if (pthread_create(&spin, NULL, dense_spinner_thread, NULL) == 0) spin_on = 1;
+            else g_spin_run = 0;
+        }
+
         /* prefill this turn's new tokens (KV from prior turns is reused) */
         for (uint32_t i = 0; i < (uint32_t)t.len && rc == 0; i++)
             if (ds4_dense_gpu_forward(g, &desc, t.v[i], pos++, logits) != 0) rc = 1;
         token_vec_free(&t);
-        if (rc) break;
+        if (rc) { if (spin_on) { g_spin_run = 0; pthread_join(spin, NULL); } break; }
 
         /* reflection: prime "<think>" + the language-id label so the model first
          * identifies the user's language, then reasons. */
@@ -27036,8 +27074,9 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             for (uint32_t i = 0; i < (uint32_t)th.len && pos < n_ctx - 1u && rc == 0; i++)
                 if (ds4_dense_gpu_forward(g, &desc, th.v[i], pos++, logits) != 0) rc = 1;
             token_vec_free(&th);
-            if (rc) break;
+            if (rc) { if (spin_on) { g_spin_run = 0; pthread_join(spin, NULL); } break; }
         }
+        if (spin_on) { g_spin_run = 0; pthread_join(spin, NULL); }   /* stop: output streams now */
 
         /* Generate until <|im_end|>/EOS or context full (no token limit). A byte
          * filter holds back the most recent bytes so the "<think>"/"</think>"
