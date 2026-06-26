@@ -35,6 +35,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#include <glob.h>
 
 #include "ds4.h"
 #include "ds4_distributed.h"
@@ -26153,15 +26154,111 @@ static bool dense_json_str(const char *json, const char *key, char *out, size_t 
     if (*v != '"') return false;
     v++; size_t i = 0;
     while (*v && *v != '"' && i + 1 < cap) {
-        if (*v == '\\' && v[1]) v++;   /* unescape */
-        out[i++] = *v++;
+        if (*v == '\\' && v[1]) {
+            v++;
+            char e = *v++;
+            switch (e) {
+                case 'n': out[i++] = '\n'; break;
+                case 't': out[i++] = '\t'; break;
+                case 'r': out[i++] = '\r'; break;
+                case 'b': out[i++] = '\b'; break;
+                case 'f': out[i++] = '\f'; break;
+                case '/': out[i++] = '/';  break;
+                case '"': out[i++] = '"';  break;
+                case '\\': out[i++] = '\\'; break;
+                case 'u': {   /* \uXXXX -> UTF-8 (BMP only) */
+                    if (v[0] && v[1] && v[2] && v[3]) {
+                        char hx[5] = { v[0], v[1], v[2], v[3], 0 };
+                        long cp = strtol(hx, NULL, 16); v += 4;
+                        if (cp < 0x80) { out[i++] = (char)cp; }
+                        else if (cp < 0x800 && i + 2 < cap) {
+                            out[i++] = (char)(0xC0 | (cp >> 6));
+                            out[i++] = (char)(0x80 | (cp & 0x3F));
+                        } else if (i + 3 < cap) {
+                            out[i++] = (char)(0xE0 | (cp >> 12));
+                            out[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            out[i++] = (char)(0x80 | (cp & 0x3F));
+                        }
+                    }
+                    break;
+                }
+                default: out[i++] = e; break;
+            }
+        } else {
+            out[i++] = *v++;
+        }
     }
     out[i] = '\0';
     return true;
 }
 
+/* Single-quote a string for safe POSIX-shell use: ' -> '\'' */
+static void dense_shq(const char *s, char *out, size_t cap) {
+    size_t j = 0;
+    if (j + 1 < cap) out[j++] = '\'';
+    for (; *s && j + 4 < cap; s++) {
+        if (*s == '\'') { out[j++]='\''; out[j++]='\\'; out[j++]='\''; out[j++]='\''; }
+        else out[j++] = *s;
+    }
+    if (j + 1 < cap) out[j++] = '\'';
+    out[j] = '\0';
+}
+
+/* web_fetch/web_search shell out to this embedded Playwright (Python) script,
+ * written to a temp file on first use. Setup (once):
+ *   pip3 install playwright && python3 -m playwright install chromium */
+static const char *DENSE_WEB_PY =
+    "import sys\n"
+    "try:\n"
+    "    from playwright.sync_api import sync_playwright\n"
+    "except Exception:\n"
+    "    print('error: playwright missing. Run: pip3 install playwright && python3 -m playwright install chromium'); sys.exit(0)\n"
+    "from urllib.parse import quote\n"
+    "def fetch(url):\n"
+    "    with sync_playwright() as p:\n"
+    "        b=p.chromium.launch(headless=True); pg=b.new_page()\n"
+    "        pg.goto(url, wait_until='domcontentloaded', timeout=30000)\n"
+    "        el=pg.query_selector('body')\n"
+    "        t=(el.inner_text() or '').strip() if el else ''\n"
+    "        if not t and el: t=(el.text_content() or '').strip()\n"
+    "        b.close(); print(t[:8000])\n"
+    "def search(q):\n"
+    "    with sync_playwright() as p:\n"
+    "        b=p.chromium.launch(headless=True); pg=b.new_page()\n"
+    "        pg.goto('https://www.bing.com/search?q='+quote(q), wait_until='domcontentloaded', timeout=30000)\n"
+    "        rs=pg.query_selector_all('li.b_algo')\n"
+    "        if not rs: print('(no results)')\n"
+    "        for r in rs[:8]:\n"
+    "            h=r.query_selector('h2'); c=r.query_selector('.b_caption p')\n"
+    "            t=(h.text_content() or '').strip() if h else ''\n"
+    "            s=(c.text_content() or '').strip() if c else ''\n"
+    "            if t: print('- '+t)\n"
+    "            if s: print('  '+s)\n"
+    "        b.close()\n"
+    "if __name__=='__main__':\n"
+    "    m=sys.argv[1] if len(sys.argv)>1 else ''\n"
+    "    a=sys.argv[2] if len(sys.argv)>2 else ''\n"
+    "    try:\n"
+    "        (fetch if m=='fetch' else search)(a)\n"
+    "    except Exception as e:\n"
+    "        print('error: '+str(e))\n";
+
+/* Write the embedded script to a temp file once; return its path (or NULL). */
+static const char *dense_web_script_path(void) {
+    static char path[PATH_MAX]; static int done = 0;
+    if (!done) {
+        const char *tmp = getenv("TMPDIR"); if (!tmp || !*tmp) tmp = "/tmp";
+        snprintf(path, sizeof(path), "%s/ds4_web_playwright.py", tmp);
+        FILE *fp = fopen(path, "wb");
+        if (fp) { fputs(DENSE_WEB_PY, fp); fclose(fp); done = 1; }
+        else path[0] = '\0';
+    }
+    return path[0] ? path : NULL;
+}
+
 /* Execute a tool by name with JSON arguments; append the result text to *out
- * (a growable buffer). Tools mirror Claude Code's Read / LS / Bash. */
+ * (a growable buffer). Tools mirror Claude Code's Read/Write/Edit/Glob/Grep/Bash
+ * plus web_fetch/web_search via Playwright. */
 static void dense_tool_exec(const char *name, const char *args,
                             char **out, size_t *out_len, size_t *out_cap) {
     char buf[8192];
@@ -26190,6 +26287,86 @@ static void dense_tool_exec(const char *name, const char *args,
         size_t total = 0, rd;
         while ((rd = fread(buf, 1, sizeof(buf), fp)) > 0 && total < 65536) { dense_sbuf_append(out, out_len, out_cap, buf, rd); total += rd; }
         pclose(fp);
+    } else if (!strcmp(name, "write_file")) {
+        char path[PATH_MAX];
+        if (!dense_json_str(args, "path", path, sizeof(path))) { dense_sbuf_append(out, out_len, out_cap, "error: missing path", 19); return; }
+        char *content = malloc(65536); if (!content) return;
+        if (!dense_json_str(args, "content", content, 65536)) content[0] = '\0';
+        FILE *fp = fopen(path, "wb");
+        if (!fp) { int n = snprintf(buf, sizeof(buf), "error: cannot write %s", path); dense_sbuf_append(out, out_len, out_cap, buf, (size_t)n); free(content); return; }
+        size_t cl = strlen(content); fwrite(content, 1, cl, fp); fclose(fp); free(content);
+        int n = snprintf(buf, sizeof(buf), "wrote %zu bytes to %s", cl, path);
+        dense_sbuf_append(out, out_len, out_cap, buf, (size_t)n);
+    } else if (!strcmp(name, "edit_file")) {
+        char path[PATH_MAX];
+        if (!dense_json_str(args, "path", path, sizeof(path))) { dense_sbuf_append(out, out_len, out_cap, "error: missing path", 19); return; }
+        char *olds = malloc(65536), *news = malloc(65536);
+        if (!olds || !news) { free(olds); free(news); return; }
+        if (!dense_json_str(args, "old_string", olds, 65536)) { dense_sbuf_append(out, out_len, out_cap, "error: missing old_string", 25); free(olds); free(news); return; }
+        if (!dense_json_str(args, "new_string", news, 65536)) news[0] = '\0';
+        FILE *fp = fopen(path, "rb");
+        if (!fp) { int n = snprintf(buf, sizeof(buf), "error: cannot open %s", path); dense_sbuf_append(out, out_len, out_cap, buf, (size_t)n); free(olds); free(news); return; }
+        fseek(fp, 0, SEEK_END); long fsz = ftell(fp); fseek(fp, 0, SEEK_SET);
+        if (fsz < 0) fsz = 0;
+        char *fc = malloc((size_t)fsz + 1);
+        size_t got = fc ? fread(fc, 1, (size_t)fsz, fp) : 0; fclose(fp);
+        if (!fc) { free(olds); free(news); return; }
+        fc[got] = '\0';
+        char *hit = strstr(fc, olds);
+        if (!hit) { int n = snprintf(buf, sizeof(buf), "error: old_string not found in %s", path); dense_sbuf_append(out, out_len, out_cap, buf, (size_t)n); }
+        else {
+            FILE *wf = fopen(path, "wb");
+            if (!wf) { dense_sbuf_append(out, out_len, out_cap, "error: cannot rewrite file", 26); }
+            else {
+                size_t ol = strlen(olds), nl = strlen(news);
+                fwrite(fc, 1, (size_t)(hit - fc), wf);
+                fwrite(news, 1, nl, wf);
+                fwrite(hit + ol, 1, got - (size_t)(hit - fc) - ol, wf);
+                fclose(wf);
+                int n = snprintf(buf, sizeof(buf), "edited %s (replaced first occurrence)", path);
+                dense_sbuf_append(out, out_len, out_cap, buf, (size_t)n);
+            }
+        }
+        free(fc); free(olds); free(news);
+    } else if (!strcmp(name, "glob")) {
+        char pattern[PATH_MAX];
+        if (!dense_json_str(args, "pattern", pattern, sizeof(pattern))) { dense_sbuf_append(out, out_len, out_cap, "error: missing pattern", 22); return; }
+        glob_t gl; memset(&gl, 0, sizeof(gl));
+        int r = glob(pattern, GLOB_MARK | GLOB_NOSORT, NULL, &gl);
+        if (r != 0 || gl.gl_pathc == 0) { dense_sbuf_append(out, out_len, out_cap, "(no matches)", 12); }
+        else {
+            size_t shown = gl.gl_pathc > 200 ? 200 : gl.gl_pathc;
+            for (size_t k = 0; k < shown; k++) {
+                dense_sbuf_append(out, out_len, out_cap, gl.gl_pathv[k], strlen(gl.gl_pathv[k]));
+                dense_sbuf_append(out, out_len, out_cap, "\n", 1);
+            }
+        }
+        globfree(&gl);
+    } else if (!strcmp(name, "grep")) {
+        char pattern[1024], path[PATH_MAX];
+        if (!dense_json_str(args, "pattern", pattern, sizeof(pattern))) { dense_sbuf_append(out, out_len, out_cap, "error: missing pattern", 22); return; }
+        if (!dense_json_str(args, "path", path, sizeof(path))) snprintf(path, sizeof(path), ".");
+        char qp[2100], qpath[PATH_MAX + 16];
+        dense_shq(pattern, qp, sizeof(qp)); dense_shq(path, qpath, sizeof(qpath));
+        char cmd[PATH_MAX + 2200]; snprintf(cmd, sizeof(cmd), "grep -rnI -e %s %s 2>&1 | head -200", qp, qpath);
+        FILE *fp = popen(cmd, "r");
+        if (!fp) { dense_sbuf_append(out, out_len, out_cap, "error: grep failed", 18); return; }
+        size_t total = 0, rd; while ((rd = fread(buf, 1, sizeof(buf), fp)) > 0 && total < 65536) { dense_sbuf_append(out, out_len, out_cap, buf, rd); total += rd; }
+        pclose(fp);
+    } else if (!strcmp(name, "web_fetch") || !strcmp(name, "web_search")) {
+        const char *mode = name[4] == 'f' ? "fetch" : "search";
+        const char *argkey = name[4] == 'f' ? "url" : "query";
+        char arg[2048];
+        if (!dense_json_str(args, argkey, arg, sizeof(arg))) { int n = snprintf(buf, sizeof(buf), "error: missing %s", argkey); dense_sbuf_append(out, out_len, out_cap, buf, (size_t)n); return; }
+        const char *script = dense_web_script_path();
+        if (!script) { dense_sbuf_append(out, out_len, out_cap, "error: cannot create web script", 31); return; }
+        char qarg[2100], qscript[PATH_MAX + 4];
+        dense_shq(arg, qarg, sizeof(qarg)); dense_shq(script, qscript, sizeof(qscript));
+        char cmd[PATH_MAX + 2300]; snprintf(cmd, sizeof(cmd), "python3 %s %s %s 2>&1", qscript, mode, qarg);
+        FILE *fp = popen(cmd, "r");
+        if (!fp) { dense_sbuf_append(out, out_len, out_cap, "error: web tool failed", 22); return; }
+        size_t total = 0, rd; while ((rd = fread(buf, 1, sizeof(buf), fp)) > 0 && total < 65536) { dense_sbuf_append(out, out_len, out_cap, buf, rd); total += rd; }
+        pclose(fp);
     } else {
         int n = snprintf(buf, sizeof(buf), "error: unknown tool '%s'", name);
         dense_sbuf_append(out, out_len, out_cap, buf, (size_t)n);
@@ -26203,8 +26380,14 @@ static const char *DENSE_TOOLS_PROMPT =
     "<tool_call>\n{\"name\": \"<tool>\", \"arguments\": {<args>}}\n</tool_call>\n"
     "and stop. The result will be returned to you in a <tool_response>. Available tools:\n"
     "- read_file: arguments {\"path\": string} — returns the file's contents.\n"
+    "- write_file: arguments {\"path\": string, \"content\": string} — creates/overwrites a file.\n"
+    "- edit_file: arguments {\"path\": string, \"old_string\": string, \"new_string\": string} — replaces the first occurrence of old_string.\n"
     "- list_dir: arguments {\"path\": string} — lists a directory (ls -la).\n"
+    "- glob: arguments {\"pattern\": string} — lists files matching a glob (e.g. src/**/*.c).\n"
+    "- grep: arguments {\"pattern\": string, \"path\": string} — searches file contents recursively.\n"
     "- bash: arguments {\"command\": string} — runs a shell command, returns its output.\n"
+    "- web_fetch: arguments {\"url\": string} — fetches a web page's text (Playwright).\n"
+    "- web_search: arguments {\"query\": string} — web search results (Playwright/DuckDuckGo).\n"
     "Call a tool only when needed; otherwise answer directly. After tools return, give the final answer.";
 
 /* Interactive multi-turn chat REPL for dense (Qwen2-style ChatML) models. Keeps
@@ -26518,11 +26701,12 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
          * Active only when tools are enabled (DS4_DENSE_TOOLS). */
         bool tool_used = false;
         if (tools_on && rc == 0) {
+            char *tn_args = xmalloc(65536);   /* large: Write/Edit content can be big */
             for (int round = 0; round < 8; round++) {
-                char tn_name[64], tn_args[4096];
+                char tn_name[64];
                 const char *at = ans ? ans : "";
                 while (*at==' '||*at=='\n'||*at=='\r'||*at=='\t') at++;
-                if (!dense_tool_find_call(at, tn_name, sizeof(tn_name), tn_args, sizeof(tn_args))) break;
+                if (!dense_tool_find_call(at, tn_name, sizeof(tn_name), tn_args, 65536)) break;
                 tool_used = true;
                 /* close the assistant turn that emitted the call */
                 token_vec cl = {0}; token_vec_push(&cl, im_end); bpe_tokenize_text(&vocab, "\n", &cl);
@@ -26552,6 +26736,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                                               think_turn, temp, top_p, top_k, &rng, &rc);
                 if (rc) break;
             }
+            free(tn_args);
         }
 
         /* Trim leading whitespace from the captured answer text. */
