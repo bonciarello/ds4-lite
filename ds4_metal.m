@@ -4614,7 +4614,8 @@ static bool dense_attn_prefill(ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_t
  * forward (matmuls via kernel_mul_mm). Writes the KV cache and returns the LAST
  * token's logits (the only ones prefill needs). */
 int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
-                          const int *tokens, uint32_t M, uint32_t start_pos, float *last_logits) {
+                          const int *tokens, uint32_t M, uint32_t start_pos,
+                          float *last_logits, float *all_logits) {
     @autoreleasepool {
         if (M == 0) return 1;
         if (d->token_embd.type != 12) return 2;
@@ -4677,7 +4678,13 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
             ds4_gpu_tensor_free(kview); ds4_gpu_tensor_free(vview);
         }
 
-        if (ok) {   /* last token: final norm + output projection */
+        ds4_gpu_tensor *allT = NULL;
+        if (ok && all_logits) {       /* logits for ALL M tokens (speculative verify) */
+            allT = ds4_gpu_tensor_alloc((uint64_t)M*d->n_vocab*4);
+            ok = allT
+              && dense_rms_batch(g, Hb, Xb, &d->output_norm, M, ne, eps)
+              && dense_matmul_w(g, &d->output, Hb, allT, M);
+        } else if (ok) {              /* last token only: final norm + output projection */
             ds4_gpu_tensor *xlast = ds4_gpu_tensor_view(Xb, (uint64_t)(M-1)*ne*4, (uint64_t)ne*4);
             ok = xlast
               && dense_rms(g, Hrow, xlast, &d->output_norm, ne, eps)
@@ -4689,7 +4696,13 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
             g_batch_serialize = false;
             if (!ended) ok = false;
         }
-        if (ok) ds4_gpu_tensor_read(logitsT, 0, last_logits, (uint64_t)d->n_vocab*4);
+        if (ok && all_logits) {
+            ds4_gpu_tensor_read(allT, 0, all_logits, (uint64_t)M*d->n_vocab*4);
+            if (last_logits) memcpy(last_logits, all_logits + (uint64_t)(M-1)*d->n_vocab, (size_t)d->n_vocab*4);
+        } else if (ok && last_logits) {
+            ds4_gpu_tensor_read(logitsT, 0, last_logits, (uint64_t)d->n_vocab*4);
+        }
+        ds4_gpu_tensor_free(allT);
 
         ds4_gpu_tensor_free(Xb); ds4_gpu_tensor_free(Hb); ds4_gpu_tensor_free(Ob);
         ds4_gpu_tensor_free(Qb); ds4_gpu_tensor_free(attb); ds4_gpu_tensor_free(gateb);
