@@ -37,6 +37,7 @@
 #include <unistd.h>
 #include <glob.h>
 #include <sys/ioctl.h>
+#include <sys/sysctl.h>
 #include <sys/select.h>
 #include <signal.h>
 #include <termios.h>
@@ -26822,7 +26823,32 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         return 1;
     }
 
-    uint32_t n_ctx = ctx_size > 0 ? (uint32_t)ctx_size : 4096u;
+    /* Context window: explicit if given (>0), else AUTO — fit it to this machine.
+     * The KV cache is f16: bytes/token = n_layer * n_kv * head_dim * 2(K+V) * 2(f16).
+     * Budget ~70% of system RAM minus the model weights and ~1 GB scratch/overhead;
+     * the resulting token count is capped at the model's native context length. */
+    uint32_t n_ctx;
+    if (ctx_size > 0) {
+        n_ctx = (uint32_t)ctx_size;
+    } else {
+        const uint64_t native = (DS4_ROPE_ORIG_CTX > 0) ? DS4_ROPE_ORIG_CTX : 8192ull;
+        const uint64_t kv_per_tok = (uint64_t)DS4_N_LAYER * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 4ull;
+        uint64_t ram = 0; size_t rlen = sizeof ram;
+        if (sysctlbyname("hw.memsize", &ram, &rlen, NULL, 0) != 0 || ram == 0) ram = 16ull << 30;
+        const uint64_t budget   = (uint64_t)((double)ram * 0.70);
+        const uint64_t overhead = 1024ull << 20;
+        const uint64_t model_sz = (uint64_t)model.size;
+        const uint64_t avail    = (budget > model_sz + overhead) ? budget - model_sz - overhead : 0;
+        uint64_t c = kv_per_tok ? avail / kv_per_tok : native;
+        if (c > native) c = native;                 /* never exceed the model's native ctx */
+        c = (c / 1024ull) * 1024ull;                /* round down to a multiple of 1024 */
+        if (c < 2048ull) c = 2048ull;               /* sane floor */
+        if (c > native) c = native;
+        n_ctx = (uint32_t)c;
+        printf("\033[2mauto context: %u tok  (model native %llu, KV %.1f KB/tok, %.0f GB RAM)\033[0m\n",
+               n_ctx, (unsigned long long)native, (double)kv_per_tok / 1024.0, (double)ram / 1e9);
+        fflush(stdout);
+    }
     ds4_dense_model_desc desc;
     dense_build_desc(&desc, &model, &weights, n_ctx);
 
@@ -27080,9 +27106,9 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
 #ifdef __APPLE__
                     { uint32_t bs = sizeof exe; if (_NSGetExecutablePath(exe, &bs) != 0) snprintf(exe, sizeof exe, "%s", "ds4"); }
 #endif
-                    char ctxs[16]; snprintf(ctxs, sizeof ctxs, "%u", n_ctx);
+                    /* "auto" -> the new model recomputes its context for this machine */
                     printf("\033[36m↻ switching to %s …\033[0m\n", newp); fflush(stdout);
-                    char *eargv[] = { exe, (char *)"--metal-dense-chat", newp, ctxs, NULL };
+                    char *eargv[] = { exe, (char *)"--metal-dense-chat", newp, (char *)"auto", NULL };
                     execv(exe, eargv);
                     printf("\033[2m(could not relaunch automatically; run: %s --metal-dense-chat %s %u)\033[0m\n",
                            exe, newp, n_ctx);
