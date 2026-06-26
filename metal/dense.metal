@@ -1909,6 +1909,136 @@ kernel void kernel_dense_attn_prefill_f32(
     for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) oh[d] = acc[j]*inv; }
 }
 
+// Tiled flash-attention prefill (FlashAttention-2, simdgroup matrices). One
+// threadgroup = one simdgroup (32 lanes) computes 8 query rows for one head. The
+// key sequence is streamed in tiles of 8; S=Q.K^T and O+=P.V use the matrix units,
+// with a per-row online softmax. f16 KV cache, causal mask, GQA. head_dim<=128.
+// Grid=(n_head, M/8, 1) tpg=(32,1,1) — only FULL 8-row blocks; the host runs the
+// scalar kernel for the M%8 tail. O lives in threadgroup memory so it can be
+// rescaled per row across key tiles. Reference kernel above stays the default.
+kernel void kernel_dense_flash_prefill_f32(
+        constant ds4_dense_attn_args & a [[buffer(0)]],
+        device const float * q      [[buffer(1)]],   // [M, n_head*head_dim] f32
+        device const half  * kcache [[buffer(2)]],   // [n_ctx, n_kv*head_dim] f16
+        device const half  * vcache [[buffer(3)]],
+        device       float * out    [[buffer(4)]],   // [M, n_head*head_dim] f32
+        constant uint & start_pos   [[buffer(5)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]]) {
+    const uint hq = tgpig.x;
+    const uint qb = tgpig.y;                 // query-block (8 rows)
+    if (hq >= a.n_head) return;
+    const uint hd  = a.head_dim;             // <= 128
+    const uint group = a.n_head / a.n_kv;
+    const uint hkv = hq / group;
+    const uint kvdim = a.n_kv * hd;
+    const uint qd  = a.n_head * hd;
+    const uint ndt = hd / 8u;                // depth tiles (<=16)
+    const uint q0  = qb * 8u;                // first query row of this block
+
+    threadgroup float Ksh[8*128];
+    threadgroup float Vsh[8*128];
+    threadgroup float Ssh[8*8];
+    threadgroup float Dsh[8*8];      // diagonal matrix (per-row rescale / 1/l)
+    threadgroup float mrow[8];
+    threadgroup float lrow[8];
+
+    for (uint i = lane; i < 8u; i += 32u) { mrow[i] = -INFINITY; lrow[i] = 0.0f; }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Q tile and O accumulator stay in registers (ndt matrices of 8 rows x 8 cols)
+    simdgroup_float8x8 Qm[16];
+    simdgroup_float8x8 Om[16];
+    device const float * qbase = q + (ulong)q0*qd + hq*hd;
+    for (uint dt = 0; dt < ndt; dt++) {
+        simdgroup_load(Qm[dt], qbase + dt*8u, qd, 0, false);
+        Om[dt] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    const uint qpos_max = start_pos + q0 + 7u;   // causal bound of the last row
+    const uint n_keys   = qpos_max + 1u;         // keys [0, qpos_max]
+
+    for (uint kt = 0; kt < n_keys; kt += 8u) {
+        // cooperative f16 -> f32 load of this 8-key tile (K and V)
+        for (uint i = lane; i < 8u*hd; i += 32u) {
+            const uint kk = i / hd, dd = i % hd;
+            const uint key = kt + kk;
+            float kk_v = 0.0f, vv_v = 0.0f;
+            if (key < n_keys) {
+                kk_v = (float)kcache[(ulong)key*kvdim + hkv*hd + dd];
+                vv_v = (float)vcache[(ulong)key*kvdim + hkv*hd + dd];
+            }
+            Ksh[i] = kk_v; Vsh[i] = vv_v;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // S[8 rows, 8 keys] = Q . K^T  (K loaded transposed -> [depth, key])
+        simdgroup_float8x8 Sm = make_filled_simdgroup_matrix<float, 8>(0.f);
+        for (uint dt = 0; dt < ndt; dt++) {
+            simdgroup_float8x8 Ktm;
+            simdgroup_load(Ktm, Ksh + dt*8u, hd, 0, true);
+            simdgroup_multiply_accumulate(Sm, Qm[dt], Ktm, Sm);
+        }
+        simdgroup_store(Sm, Ssh, 8, 0, false);
+        for (uint i = lane; i < 64u; i += 32u) Dsh[i] = 0.0f;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // per-row online softmax (lanes 0..7 own rows 0..7). Writes P into Ssh and
+        // the per-row correction factor onto the diagonal of Dsh.
+        if (lane < 8u) {
+            const uint r = lane;
+            const uint qg = start_pos + q0 + r;       // this row's absolute position
+            float sc[8], rmax = -INFINITY;
+            for (uint j = 0; j < 8u; j++) {
+                const uint key = kt + j;
+                float s = Ssh[r*8u + j] * a.scale;
+                if (key > qg) s = -INFINITY;          // causal
+                sc[j] = s; rmax = max(rmax, s);
+            }
+            const float m_old = mrow[r];
+            const float m_new = max(m_old, rmax);
+            float corr = exp(m_old - m_new);
+            if (!isfinite(corr)) corr = 0.0f;
+            float lsum = 0.0f;
+            for (uint j = 0; j < 8u; j++) {
+                const float p = (sc[j] == -INFINITY) ? 0.0f : exp(sc[j] - m_new);
+                Ssh[r*8u + j] = p;
+                lsum += p;
+            }
+            lrow[r] = lrow[r]*corr + lsum;
+            mrow[r] = m_new;
+            Dsh[r*8u + r] = corr;                      // diagonal rescale factor
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // O = diag(corr) . O   (per-row rescale, in registers) ; then O += P . V
+        simdgroup_float8x8 Dm, Pm;
+        simdgroup_load(Dm, Dsh, 8, 0, false);
+        simdgroup_load(Pm, Ssh, 8, 0, false);
+        for (uint dt = 0; dt < ndt; dt++) {
+            simdgroup_float8x8 Vm, scaled;
+            simdgroup_multiply(scaled, Dm, Om[dt]);       // rescale rows of O
+            simdgroup_load(Vm, Vsh + dt*8u, hd, 0, false);
+            simdgroup_multiply_accumulate(scaled, Pm, Vm, scaled);
+            Om[dt] = scaled;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // finalize: O = diag(1/l) . O, then store rows to out
+    for (uint i = lane; i < 64u; i += 32u) Dsh[i] = 0.0f;
+    if (lane < 8u) Dsh[lane*8u + lane] = (lrow[lane] > 0.0f) ? 1.0f/lrow[lane] : 0.0f;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 Dinv;
+    simdgroup_load(Dinv, Dsh, 8, 0, false);
+    device float * obase = out + (ulong)q0*qd + hq*hd;
+    for (uint dt = 0; dt < ndt; dt++) {
+        simdgroup_float8x8 Of;
+        simdgroup_multiply(Of, Dinv, Om[dt]);
+        simdgroup_store(Of, obase + dt*8u, qd, 0, false);
+    }
+}
+
 // f32 -> f16 narrowing copy. Used to store the KV cache in half precision: K/V are
 // computed/biased/roped in f32 scratch, then converted into the f16 cache. Halves the
 // KV memory footprint and the attention read traffic. Dispatch n threads.

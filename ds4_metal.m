@@ -4613,7 +4613,7 @@ static bool dense_rope_batch(ds4_gpu_tensor *x, uint32_t nh, uint32_t hd, uint32
     return ds4_gpu_finish_command_buffer(cb, owned, "pf rope");
 }
 
-static bool dense_attn_prefill(ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_tensor *kc,
+static bool dense_attn_prefill_scalar(ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_tensor *kc,
                                ds4_gpu_tensor *vc, uint32_t nh, uint32_t nkv, uint32_t hd,
                                float scale, uint32_t M, uint32_t start_pos) {
     id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dense_attn_prefill_f32");
@@ -4633,6 +4633,59 @@ static bool dense_attn_prefill(ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_t
     [enc dispatchThreadgroups:MTLSizeMake(nh, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned, "pf attn");
+}
+
+/* Tiled flash-attention prefill (simdgroup matrices) over M rows (M must be a
+ * multiple of 8 — the host runs the scalar kernel for the tail). */
+static bool dense_flash_prefill_dispatch(ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_tensor *kc,
+                               ds4_gpu_tensor *vc, uint32_t nh, uint32_t nkv, uint32_t hd,
+                               float scale, uint32_t M, uint32_t start_pos) {
+    id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dense_flash_prefill_f32");
+    if (!p) return false;
+    struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; } a = { nh, nkv, hd, 0, scale };
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return false;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:p];
+    [enc setBytes:&a length:sizeof(a) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(q)   offset:ds4_gpu_tensor_offset(q)   atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(kc)  offset:ds4_gpu_tensor_offset(kc)  atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(vc)  offset:ds4_gpu_tensor_offset(vc)  atIndex:3];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:4];
+    [enc setBytes:&start_pos length:sizeof(start_pos) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(nh, M/8u, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "pf flash");
+}
+
+/* Prefill attention. Tiled flash-attention (simdgroup matrices) wins once the key
+ * count scanned (start_pos+M) is large; the scalar reference is faster for small
+ * prompts (low occupancy / matrix overhead not amortized). So flash is used
+ * ADAPTIVELY: when start_pos+M >= DS4_FLASH_PREFILL_MIN (default 2048). Flash runs
+ * the full 8-row blocks; the scalar kernel handles the M%8 tail. Force on/off with
+ * DS4_FLASH_PREFILL / DS4_NO_FLASH_PREFILL. Output is identical either way. */
+static bool dense_attn_prefill(ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_tensor *kc,
+                               ds4_gpu_tensor *vc, uint32_t nh, uint32_t nkv, uint32_t hd,
+                               float scale, uint32_t M, uint32_t start_pos) {
+    uint32_t thresh = 2048u;
+    { const char *e = getenv("DS4_FLASH_PREFILL_MIN"); if (e && atoi(e) >= 0) thresh = (uint32_t)atoi(e); }
+    const bool use_flash = !getenv("DS4_NO_FLASH_PREFILL") &&
+                           (getenv("DS4_FLASH_PREFILL") || (start_pos + M) >= thresh);
+    if (use_flash) {
+        const uint32_t qd = nh*hd, M8 = (M/8u)*8u;
+        bool ok = true;
+        if (M8 > 0)
+            ok = dense_flash_prefill_dispatch(out, q, kc, vc, nh, nkv, hd, scale, M8, start_pos);
+        if (ok && M8 < M) {   /* tail rows [M8, M) via the scalar kernel on offset views */
+            ds4_gpu_tensor *qv = ds4_gpu_tensor_view(q,   (uint64_t)M8*qd*4, (uint64_t)(M - M8)*qd*4);
+            ds4_gpu_tensor *ov = ds4_gpu_tensor_view(out, (uint64_t)M8*qd*4, (uint64_t)(M - M8)*qd*4);
+            ok = qv && ov && dense_attn_prefill_scalar(ov, qv, kc, vc, nh, nkv, hd, scale, M - M8, start_pos + M8);
+            ds4_gpu_tensor_free(qv); ds4_gpu_tensor_free(ov);
+        }
+        return ok;
+    }
+    return dense_attn_prefill_scalar(out, q, kc, vc, nh, nkv, hd, scale, M, start_pos);
 }
 
 /* Process M prompt tokens at positions [start_pos, start_pos+M) in one batched
