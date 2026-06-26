@@ -2876,3 +2876,40 @@ kernel void kernel_dense_sigmoid_gate_f32(
     if (gid >= a.n) return;
     out[gid] = x[gid] * (1.0f / (1.0f + exp(-gate[gid])));
 }
+
+/* Gated-DeltaNet autoregressive (decode) step — the recurrent form of the linear
+ * attention, per head, for ONE token (no chunking / solve_tri). State S is [S, S] per
+ * head (row i = key dim, col j = value dim). With scalar gate g (GDA) and beta b:
+ *     S    *= exp(g)                       (decay)
+ *     sk[j] = sum_i S[i,j]*k[i]            (= Sᵀk)
+ *     d[j]  = b*(v[j] - sk[j])             (delta)
+ *     S[i,j] += k[i]*d[j]                  (rank-1 update)
+ *     o[j]  = sum_i S[i,j]*q[i]            (= Sᵀq, q pre-scaled by 1/sqrt(S))
+ * One thread per (head, column j): each thread owns column j of its head's state, so the
+ * decay/sk and update/o passes have no cross-thread dependency. Correctness-first. */
+struct dnet_ar_args { uint S; uint n_head; };
+kernel void kernel_dnet_ar_step_f32(
+        constant dnet_ar_args & a [[buffer(0)]],
+        device const float * q     [[buffer(1)]],   /* [n_head, S]  (already scaled) */
+        device const float * k     [[buffer(2)]],   /* [n_head, S] */
+        device const float * v     [[buffer(3)]],   /* [n_head, S] */
+        device const float * gb    [[buffer(4)]],   /* [n_head, 2] : g (log-decay), beta */
+        device       float * state [[buffer(5)]],   /* [n_head, S, S] in/out: i*S+j */
+        device       float * o     [[buffer(6)]],   /* [n_head, S] out */
+        uint gid [[thread_position_in_grid]]) {
+    const uint S = a.S;
+    if (gid >= a.n_head * S) return;
+    const uint h = gid / S, j = gid % S;
+    device const float * qh = q + (size_t)h*S;
+    device const float * kh = k + (size_t)h*S;
+    device const float * vh = v + (size_t)h*S;
+    device       float * Sh = state + (size_t)h*S*S;
+    const float G = exp(gb[(size_t)h*2 + 0]);
+    const float beta = gb[(size_t)h*2 + 1];
+    float sk = 0.0f;                                  /* decay column j + accumulate Sᵀk */
+    for (uint i = 0; i < S; ++i) { float s = Sh[(size_t)i*S + j] * G; Sh[(size_t)i*S + j] = s; sk += s * kh[i]; }
+    const float d = beta * (vh[j] - sk);
+    float oj = 0.0f;                                  /* rank-1 update column j + Sᵀq */
+    for (uint i = 0; i < S; ++i) { float s = Sh[(size_t)i*S + j] + kh[i]*d; Sh[(size_t)i*S + j] = s; oj += s * qh[i]; }
+    o[(size_t)h*S + j] = oj;
+}

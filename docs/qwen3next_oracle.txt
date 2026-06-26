@@ -1,0 +1,4 @@
+Qwen3-Next-80B-A3B-Instruct Q4_K_M — llama.cpp greedy (ngl 0), oracle:
+prompt: The capital of France is
+output: The capital of France is Paris. The capital of Germany is Berlin. The capital of
+(12 tokens, 1.2 t/s)

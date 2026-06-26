@@ -235,3 +235,23 @@ Q4_K_M model reports "weights bound OK — 48 layers (12 full-attn, 36 DeltaNet)
 then still rejects (forward pending). **Next**: Phase 2/3 forward — full-attn layer (reuse
 dense GQA + q/k-norm + sigmoid gate), DeltaNet (conv→delta-rule→norm→gate→out), MoE over
 streaming, hybrid dispatch + state cache, validate vs llama.cpp.
+
+## 11. DeltaNet decode = simple recurrence (KEY simplification) + more kernels landed
+Studying `delta-net-base.cpp`: the **chunked** path (prefill) uses heavy ops (`ggml_tri`,
+`ggml_exp`, **`ggml_solve_tri`** — a triangular solve, hard to port). BUT there is an
+**autoregressive path** (`build_delta_net_autoregressive`, n_tokens==1) — the recurrent
+form ds4's token-by-token decode needs, which avoids tri/solve_tri/cumsum entirely. Per
+head, state S is [S_k × S_v] (here 128×128); for one token with scalar gate g (GDA) + beta:
+`S *= exp(g)` → `sk = Sᵀk` → `d = β(v−sk)` → `S += k⊗d` → `o = Sᵀq` (q pre-scaled 1/√S_k).
+So DeltaNet decode is **one kernel**, not a chunked machine. Prefill can run the same
+recurrence token-by-token (correct, just sequential) — chunked/solve_tri only needed later
+for fast prefill.
+
+Validated kernels now in `metal/dense.metal` (all PASS in `--metal-dense-selftest`, <1e-5):
+ssm_conv (14), cumsum (15), **head RMSNorm (16)** + **sigmoid gate (17)** (full-attn layer),
+**`kernel_dnet_ar_step_f32` (18)** — the gated-delta recurrence (validates output AND the
+updated state). One thread per (head, state column) → no cross-thread deps.
+
+**Oracle** (`docs/qwen3next_oracle.txt`): llama.cpp greedy on the real model,
+"The capital of France is" → " Paris. The capital of Germany is Berlin. The capital of"
+(12 tokens). The ds4 forward must reproduce this.
