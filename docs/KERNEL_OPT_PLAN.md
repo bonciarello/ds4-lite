@@ -102,11 +102,15 @@ Stato decode: ~37 t/s (gap 1.2x). I limiti restanti, in ordine di impatto:
    già presente per il path DeepSeek). Impatto: TTFT su prompt lunghi (RAG, codice,
    long-context). È anche il lever che l'analisi iniziale indicava.
 
-2. **Attention per contesti lunghi.** L'attn decode (`kernel_dense_attn_decode_f32_sg`)
-   è O(n_ctx)/token e usa solo 28 simdgroup (1 per testa) → il decode rallenta da ~8K
-   token in su. Lavoro: split-KV / flash-decoding (più simdgroup per testa, riduzione
-   parziale + merge online-softmax). Impatto: usabilità reale di 16K–32K (la RAM regge
-   già: ~112 KiB/token, 32K = 3.5 GiB su 32GB). Vedi anche [[ds4-lite-dense-optimizations]].
+2. **Attention per contesti lunghi.** ✅ FATTO (branch perf/longctx-attention).
+   Split-KV / flash-decoding: la sequenza KV è divisa in chunk da ~512 chiavi, un
+   simdgroup per (testa, split) calcola un softmax online parziale (n_head*S simdgroup
+   invece di n_head), poi un kernel di combine fonde i parziali. Kernel
+   `kernel_dense_attn_decode_split_f32` + `_combine_f32`; scratch pm/pl/pacc nello
+   struct; attivo per n_ctx>512 (S = ceil(n_ctx/512), cap 64). A/B: DS4_ATTN_NOSPLIT.
+   Correttezza: greedy identico (md5 match su 540 token). **Decode a ctx ~990 (S=2):
+   8.57 -> 14.86 t/s = 1.73x**; il beneficio cresce col contesto (più split). Piccoli
+   contesti restano single-simdgroup (nessun overhead di combine).
 
 3. **Gap decode residuo (~5 ms).** Tanti micro-dispatch (bias/rope/residual), ciascuno
    con una barriera, più lavoro CPU per-token (dequant embedding + readback logits 608KB).

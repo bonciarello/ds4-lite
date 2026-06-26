@@ -4088,7 +4088,10 @@ struct ds4_dense_gpu {
     const void *model_base;          /* mmap base for zero-copy weights */
     uint64_t    model_size;
     bool   zerocopy;                 /* wrap mmap weights instead of copying */
+    ds4_gpu_tensor *pm, *pl, *pacc;  /* split-KV attention partials [n_head, S_max(, hd)] */
 };
+
+#define DS4_ATTN_SPLIT_MAX 64u   /* max KV splits for long-context attention */
 
 static ds4_gpu_tensor *dense_cached_weight(ds4_dense_gpu *g, const void *data, uint64_t bytes) {
     NSNumber *key = @((unsigned long long)(uintptr_t)data);
@@ -4178,27 +4181,31 @@ static bool dense_swiglu(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tens
     return ds4_gpu_run_simple("kernel_dense_swiglu_f32", &n, sizeof(n), bufs, 3, n, "fwd swiglu");
 }
 
-static bool dense_attn(ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_tensor *kc, ds4_gpu_tensor *vc,
+static bool dense_attn(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *q,
+                       ds4_gpu_tensor *kc, ds4_gpu_tensor *vc,
                        uint32_t nh, uint32_t nkv, uint32_t hd, uint32_t nctx, float scale) {
     struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; } a = { nh, nkv, hd, nctx, scale };
     ds4_gpu_tensor *bufs[4] = { q, kc, vc, out };
-    if (getenv("DS4_ATTN_SCALAR"))  /* A/B fallback to the old 28-thread kernel */
+    if (getenv("DS4_ATTN_SCALAR"))  /* A/B: the old 28-thread kernel */
         return ds4_gpu_run_simple("kernel_dense_attn_decode_f32", &a, sizeof(a), bufs, 4, nh, "fwd attn");
-    /* Optimized: one simdgroup (32 lanes) per query head, online softmax.
-     * Dispatch n_head threadgroups of 32 threads. */
-    id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dense_attn_decode_f32_sg");
-    if (!p) return false;
-    int owned = 0;
-    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
-    if (!cb) return false;
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:p];
-    [enc setBytes:&a length:sizeof(a) atIndex:0];
-    for (int i = 0; i < 4; i++)
-        [enc setBuffer:ds4_gpu_tensor_buffer(bufs[i]) offset:ds4_gpu_tensor_offset(bufs[i]) atIndex:(NSUInteger)(i + 1)];
-    [enc dispatchThreadgroups:MTLSizeMake(nh, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-    ds4_gpu_end_compute_encoder(cb, enc);
-    return ds4_gpu_finish_command_buffer(cb, owned, "fwd attn sg");
+
+    /* Split the KV into ~512-key chunks for parallelism; combine the partials.
+     * Small contexts stay single-simdgroup-per-head (no combine overhead). */
+    uint32_t S = (nctx + 511u) / 512u;
+    if (S > DS4_ATTN_SPLIT_MAX) S = DS4_ATTN_SPLIT_MAX;
+    if (S <= 1u || getenv("DS4_ATTN_NOSPLIT") || !g->pm)
+        return ds4_gpu_run_grid("kernel_dense_attn_decode_f32_sg", &a, sizeof(a), bufs, 4,
+                                MTLSizeMake(nh, 1, 1), MTLSizeMake(32, 1, 1), "fwd attn sg");
+
+    const uint32_t chunk = (nctx + S - 1u) / S;
+    struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx, n_split, chunk; float scale; } sa =
+        { nh, nkv, hd, nctx, S, chunk, scale };
+    ds4_gpu_tensor *split_bufs[6]   = { q, kc, vc, g->pm, g->pl, g->pacc };
+    ds4_gpu_tensor *combine_bufs[4] = { g->pm, g->pl, g->pacc, out };
+    return ds4_gpu_run_grid("kernel_dense_attn_decode_split_f32", &sa, sizeof(sa), split_bufs, 6,
+                            MTLSizeMake(nh, S, 1), MTLSizeMake(32, 1, 1), "fwd attn split")
+        && ds4_gpu_run_grid("kernel_dense_attn_decode_combine_f32", &sa, sizeof(sa), combine_bufs, 4,
+                            MTLSizeMake(nh, 1, 1), MTLSizeMake(32, 1, 1), "fwd attn combine");
 }
 
 ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
@@ -4243,6 +4250,10 @@ ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
         g->kv[il].k = ds4_gpu_tensor_alloc((uint64_t)g->n_ctx*g->kvd*4);
         g->kv[il].v = ds4_gpu_tensor_alloc((uint64_t)g->n_ctx*g->kvd*4);
     }
+    /* split-KV attention partials: [n_head, S_max] and [n_head, S_max, head_dim] */
+    g->pm   = ds4_gpu_tensor_alloc((uint64_t)d->n_head*DS4_ATTN_SPLIT_MAX*4);
+    g->pl   = ds4_gpu_tensor_alloc((uint64_t)d->n_head*DS4_ATTN_SPLIT_MAX*4);
+    g->pacc = ds4_gpu_tensor_alloc((uint64_t)d->n_head*DS4_ATTN_SPLIT_MAX*d->head_dim*4);
     return g;
 }
 
@@ -4262,6 +4273,7 @@ void ds4_dense_gpu_free(ds4_dense_gpu *g) {
     ds4_gpu_tensor_free(g->att); ds4_gpu_tensor_free(g->k); ds4_gpu_tensor_free(g->v);
     ds4_gpu_tensor_free(g->gate); ds4_gpu_tensor_free(g->up); ds4_gpu_tensor_free(g->act);
     ds4_gpu_tensor_free(g->logits);
+    ds4_gpu_tensor_free(g->pm); ds4_gpu_tensor_free(g->pl); ds4_gpu_tensor_free(g->pacc);
     if (g->kv) for (uint32_t il = 0; il < g->n_layer; il++) { ds4_gpu_tensor_free(g->kv[il].k); ds4_gpu_tensor_free(g->kv[il].v); }
     free(g->kv); free(g->embedscratch); free(g->hostscratch);
     for (NSNumber *key in g->wcache) ds4_gpu_tensor_free((ds4_gpu_tensor *)[g->wcache[key] pointerValue]);
@@ -4311,7 +4323,7 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
               && dense_add_bias(g, vview, &L->attn_v_bias, kvd)
               && dense_rope(g->q,  nh,  hd, nrot, pos, base)
               && dense_rope(kview, nkv, hd, nrot, pos, base)
-              && dense_attn(g->att, g->q, kv->k, kv->v, nh, nkv, hd, pos+1, scale)
+              && dense_attn(g, g->att, g->q, kv->k, kv->v, nh, nkv, hd, pos+1, scale)
               && dense_matvec(g, &L->attn_out, g->att, g->o)
               && dense_add(g->x, g->o, ne);
             const double ta1 = g->profile ? ds4_gpu_now_ms() : 0.0;

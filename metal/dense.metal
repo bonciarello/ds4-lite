@@ -1919,6 +1919,89 @@ kernel void kernel_dense_add_bias_batch(
     x[gid] += bias[gid % a.x];
 }
 
+// ===========================================================================
+// Long-context attention: split-KV / flash-decoding. The key sequence is split
+// into n_split chunks; one simdgroup per (head, split) computes a partial online
+// softmax over its chunk (n_head*n_split simdgroups instead of n_head), then a
+// combine pass merges the partials. Restores parallelism and cuts the serial
+// per-token work at large context. head_dim <= 256.
+// ===========================================================================
+struct ds4_dense_attn_split_args {
+    uint  n_head, n_kv, head_dim, n_ctx, n_split, chunk;
+    float scale;
+};
+
+kernel void kernel_dense_attn_decode_split_f32(
+        constant ds4_dense_attn_split_args & a [[buffer(0)]],
+        device const float * q      [[buffer(1)]],
+        device const float * kcache [[buffer(2)]],
+        device const float * vcache [[buffer(3)]],
+        device       float * pm     [[buffer(4)]],   // [n_head, n_split]
+        device       float * pl     [[buffer(5)]],   // [n_head, n_split]
+        device       float * pacc   [[buffer(6)]],   // [n_head, n_split, head_dim]
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]]) {
+    const uint hq = tgpig.x;
+    const uint sp = tgpig.y;
+    if (hq >= a.n_head || sp >= a.n_split) return;
+    const uint group = a.n_head / a.n_kv;
+    const uint hkv = hq / group;
+    const uint hd = a.head_dim;
+    const uint kvdim = a.n_kv * hd;
+    device const float * qh = q + hq*hd;
+    const uint t0 = sp * a.chunk;
+    uint t1 = t0 + a.chunk; if (t1 > a.n_ctx) t1 = a.n_ctx;
+
+    const uint ndl = (hd + 31u) / 32u;
+    float qreg[8], acc[8];
+    for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; qreg[j] = (d < hd) ? qh[d] : 0.0f; acc[j] = 0.0f; }
+    float m = -INFINITY, l = 0.0f;
+    for (uint t = t0; t < t1; t++) {
+        device const float * kt = kcache + (ulong)t*kvdim + hkv*hd;
+        float p = 0.0f;
+        for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) p += qreg[j]*kt[d]; }
+        const float s = simd_sum(p) * a.scale;
+        const float m_new = max(m, s);
+        const float corr = exp(m - m_new), pe = exp(s - m_new);
+        l = l*corr + pe;
+        device const float * vt = vcache + (ulong)t*kvdim + hkv*hd;
+        for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) acc[j] = acc[j]*corr + pe*vt[d]; }
+        m = m_new;
+    }
+    const uint base = hq*a.n_split + sp;
+    if (lane == 0) { pm[base] = m; pl[base] = l; }
+    device float * po = pacc + (ulong)base*hd;
+    for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) po[d] = acc[j]; }
+}
+
+kernel void kernel_dense_attn_decode_combine_f32(
+        constant ds4_dense_attn_split_args & a [[buffer(0)]],
+        device const float * pm   [[buffer(1)]],
+        device const float * pl   [[buffer(2)]],
+        device const float * pacc [[buffer(3)]],
+        device       float * out  [[buffer(4)]],   // [n_head, head_dim]
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]]) {
+    const uint hq = tgpig.x;
+    if (hq >= a.n_head) return;
+    const uint hd = a.head_dim, S = a.n_split;
+    float M = -INFINITY;
+    for (uint s = 0; s < S; s++) M = max(M, pm[hq*S + s]);
+    float L = 0.0f;
+    for (uint s = 0; s < S; s++) L += exp(pm[hq*S + s] - M) * pl[hq*S + s];
+    const float inv = 1.0f / L;
+    device float * oh = out + hq*hd;
+    const uint ndl = (hd + 31u) / 32u;
+    for (uint j = 0; j < ndl; j++) {
+        const uint d = lane + 32u*j;
+        if (d < hd) {
+            float acc = 0.0f;
+            for (uint s = 0; s < S; s++) acc += exp(pm[hq*S + s] - M) * pacc[(ulong)(hq*S + s)*hd + d];
+            oh[d] = acc * inv;
+        }
+    }
+}
+
 // ---- Dense Q6_K matvec (Fase: Q6_K support) --------------------------------
 // out[row] = dot(dequant(W[row]), x). Canonical GGML Q6_K dequant inline. One
 // thread per output row (reference; optimize later). Block = 210 bytes:
