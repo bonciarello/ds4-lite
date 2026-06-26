@@ -151,7 +151,33 @@ Both reuse ds4's standard dispatch path (buffers/pipeline/encode), so they slot 
 into the eventual DeltaNet graph. Everything else the delta rule needs (chunked matmuls,
 triangular mask, gating) is already expressible with ds4's dense matvec/elementwise kernels.
 
-**Remaining for a runnable model** (all needs the ~38 GB Qwen3-Coder-Next GGUF to validate
-end-to-end, so deferred): wire the chunked delta-rule graph; 512-expert MoE + shared
-expert; hybrid per-layer dispatch (linear vs full attention every 4th); the recurrent
-conv/state **cache** (fixed-size per layer, not per-token); greedy match vs llama.cpp.
+**Remaining for a runnable model** (all needs the model GGUF to validate end-to-end):
+wire the chunked delta-rule graph; 512-expert MoE + shared expert; hybrid per-layer
+dispatch (linear vs full attention every 4th); the recurrent conv/state **cache**
+(fixed-size per layer, not per-token); greedy match vs llama.cpp.
+
+## 8. Running 80B on 32 GB — SSD streaming (the hardware unblock)
+
+qwen3_next only ships as **80B-A3B** (Q4_K_M ≈ 45 GB), which does not fit 32 GB RAM.
+But it is **80B total / ~3B active** — only 10 of 512 experts fire per token. That is
+exactly the sparse profile ds4's **DeepSeek SSD weight-streaming** was built for: experts
+live on SSD, and each token `pread`s only the routed experts into reusable GPU staging
+slabs (LRU, 16 slabs), overlapping I/O with compute.
+
+A subagent mapped the mechanism: it is **agnostic to expert count/distribution** — it just
+needs per-expert absolute byte offsets + routing that emits selected expert IDs/weights.
+The only DeepSeek coupling is the **router path** (compute routing on GPU → read back IDs →
+`pread`), which is adaptable to qwen3_next's plain top-10 + shared expert. So the streaming
+path is **reusable**; the work is: produce the qwen3_next expert offset table, swap in its
+router, and widen the 3 streaming gates (currently `ds4_arch_is_deepseek()`) to include it.
+Target model: single-file `lmstudio-community/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf`
+(48.5 GB, loadable by ds4's single-file loader). Decode is I/O-bound (~few tok/s) but it
+**runs on this 32 GB machine** — which makes the full implementation worth doing.
+
+## 9. Shape reader extended (Phase 1a)
+`config_build_qwen3next_shape` now also reads the Gated-DeltaNet + MoE hparams into the
+shape: `ssm.{conv_kernel,inner_size,state_size,time_step_rank,group_count}`,
+`full_attention_interval` (default 4), `expert_feed_forward_length` (+ shared-expert FFN),
+`attention.layer_norm_rms_epsilon`, `rope.freq_base`, and `n_head_dim = n_embd/n_head`.
+New `ds4_shape` fields: `ssm_conv_kernel/ssm_inner_size/ssm_state_size/ssm_dt_rank/
+ssm_n_group/full_attn_interval`. This is what the forward + the streaming router will read.

@@ -185,6 +185,13 @@ typedef struct {
     uint32_t n_indexer_top_k;
     uint32_t n_hc;
     uint32_t n_hc_sinkhorn_iter;
+    /* qwen3_next Gated-DeltaNet (linear-attention / SSM) hparams */
+    uint32_t ssm_conv_kernel;    /* qwen3next.ssm.conv_kernel  — causal conv width */
+    uint32_t ssm_inner_size;     /* qwen3next.ssm.inner_size */
+    uint32_t ssm_state_size;     /* qwen3next.ssm.state_size   — head k/v dim */
+    uint32_t ssm_dt_rank;        /* qwen3next.ssm.time_step_rank — n value heads */
+    uint32_t ssm_n_group;        /* qwen3next.ssm.group_count    — n key heads */
+    uint32_t full_attn_interval; /* qwen3next.full_attention_interval — full attn every Nth layer */
     float rms_eps;
     float hc_eps;
     float expert_weight_scale;
@@ -4114,6 +4121,22 @@ static void config_build_qwen3next_shape(const ds4_model *m) {
     model_get_u32_ns(m, ns, "vocab_size",               &s.n_vocab);
     model_get_u32_ns(m, ns, "expert_count",             &s.n_expert);
     model_get_u32_ns(m, ns, "expert_used_count",        &s.n_expert_used);
+    if (!model_get_u32_ns(m, ns, "expert_feed_forward_length", &s.n_ff_exp))
+        model_get_u32_ns(m, ns, "feed_forward_length", &s.n_ff_exp);           /* fallback */
+    model_get_u32_ns(m, ns, "expert_shared_feed_forward_length", &s.n_ff);     /* shared expert FFN */
+    /* Gated-DeltaNet (SSM) hparams */
+    model_get_u32_ns(m, ns, "ssm.conv_kernel",          &s.ssm_conv_kernel);
+    model_get_u32_ns(m, ns, "ssm.inner_size",           &s.ssm_inner_size);
+    model_get_u32_ns(m, ns, "ssm.state_size",           &s.ssm_state_size);
+    model_get_u32_ns(m, ns, "ssm.time_step_rank",       &s.ssm_dt_rank);
+    model_get_u32_ns(m, ns, "ssm.group_count",          &s.ssm_n_group);
+    model_get_u32_ns(m, ns, "full_attention_interval",  &s.full_attn_interval);
+    if (s.full_attn_interval == 0) s.full_attn_interval = 4;   /* qwen3_next default */
+    s.n_head_dim = (s.n_head ? s.n_embd / s.n_head : 0);
+    model_get_f32_ns(m, ns, "attention.layer_norm_rms_epsilon", &s.rms_eps);
+    if (s.rms_eps == 0.0f) s.rms_eps = 1e-6f;
+    model_get_f32_ns(m, ns, "rope.freq_base", &s.rope_freq_base);
+    if (s.rope_freq_base == 0.0f) s.rope_freq_base = 10000.0f;
     uint64_t ctx_train = 0;
     if (!model_get_u64_ns(m, ns, "context_length", &ctx_train) || ctx_train == 0)
         ctx_train = DS4_DEFAULT_ROPE_ORIG_CTX;
