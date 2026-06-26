@@ -26584,9 +26584,13 @@ static void dense_print_topbar(void) {
 static void dense_ctx_status(char *out, size_t cap, uint32_t used, uint32_t total) {
     const int W = dense_box_w();
     size_t o = 0;
-    o += (size_t)snprintf(out + o, cap - o, "\033[2m╰");                 /* bottom border */
-    for (int i = 0; i < W - 2 && o + 6 < cap; i++) o += (size_t)snprintf(out + o, cap - o, "─");
-    o += (size_t)snprintf(out + o, cap - o, "╯\033[0m\n");
+    /* Overflow-safe append: snprintf returns the WOULD-BE length, so without clamping o
+     * can exceed cap and the next (cap - o) underflows to a huge size_t -> OOB write. */
+#define SAPP(...) do { if (o < cap) { int _r = snprintf(out + o, cap - o, __VA_ARGS__); \
+        if (_r > 0) o += (size_t)_r; if (o >= cap) o = cap - 1; } } while (0)
+    SAPP("\033[2m╰");                                                    /* bottom border */
+    for (int i = 0; i < W - 2; i++) SAPP("─");
+    SAPP("╯\033[0m\n");
     char lu[16], lt[16];
     dense_fmt_tok(used, lu, sizeof lu); dense_fmt_tok(total, lt, sizeof lt);
     char left[48]; int lcells = snprintf(left, sizeof left, "context %s/%s", lu, lt);
@@ -26596,14 +26600,14 @@ static void dense_ctx_status(char *out, size_t cap, uint32_t used, uint32_t tota
     int filled = (int)(frac * barw + 0.5); if (filled > barw) filled = barw;
     char pctbuf[8]; int pl = snprintf(pctbuf, sizeof pctbuf, "%d%%", pct);
     int pad = W - lcells - (barw + 1 + pl); if (pad < 1) pad = 1;
-    o += (size_t)snprintf(out + o, cap - o, "\033[2m%s", left);
-    for (int i = 0; i < pad && o + 1 < cap; i++) out[o++] = ' ';
-    out[o] = '\0';
-    o += (size_t)snprintf(out + o, cap - o, "\033[36m");                 /* filled = cyan */
-    for (int i = 0; i < filled && o + 8 < cap; i++) o += (size_t)snprintf(out + o, cap - o, "█");
-    o += (size_t)snprintf(out + o, cap - o, "\033[2m");                  /* empty = dim  */
-    for (int i = filled; i < barw && o + 8 < cap; i++) o += (size_t)snprintf(out + o, cap - o, "░");
-    snprintf(out + o, cap - o, " %s\033[0m", pctbuf);
+    SAPP("\033[2m%s", left);
+    for (int i = 0; i < pad; i++) SAPP(" ");
+    SAPP("\033[36m");                                                    /* filled = cyan */
+    for (int i = 0; i < filled; i++) SAPP("█");
+    SAPP("\033[2m");                                                     /* empty = dim  */
+    for (int i = filled; i < barw; i++) SAPP("░");
+    SAPP(" %s\033[0m", pctbuf);
+#undef SAPP
 }
 
 /* Live status update: recompute used = base + ~tokens(typed) on every refresh so the
@@ -26613,7 +26617,7 @@ static int dense_layout_cb(struct linenoiseState *l, size_t pr, size_t sr, void 
     (void)pr; (void)sr;
     struct dense_ctx_priv *c = (struct dense_ctx_priv *)priv;
     const uint32_t est = c->base + (uint32_t)((l->len + 3) / 4);   /* ~4 bytes/token */
-    char st[640];
+    char st[4096];
     dense_ctx_status(st, sizeof st, est, c->total);
     linenoiseEditSetStatus(l, st, NULL, NULL);
     return 0;
@@ -26640,7 +26644,7 @@ static char *dense_readline(const char *prompt, const char *model_path,
         return linenoise(prompt);
     struct dense_ctx_priv cpriv = { used, n_ctx };
     linenoiseEditSetLayoutCallback(&ls, dense_layout_cb, &cpriv);  /* live update while typing */
-    char stbuf[640];
+    char stbuf[4096];
     dense_ctx_status(stbuf, sizeof stbuf, used, n_ctx);   /* bottom border + context bar */
     linenoiseEditSetStatus(&ls, stbuf, NULL, NULL);
     linenoiseShow(&ls);                                   /* render box + status now */
