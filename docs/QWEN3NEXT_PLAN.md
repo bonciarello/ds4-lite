@@ -156,6 +156,44 @@ wire the chunked delta-rule graph; 512-expert MoE + shared expert; hybrid per-la
 dispatch (linear vs full attention every 4th); the recurrent conv/state **cache**
 (fixed-size per layer, not per-token); greedy match vs llama.cpp.
 
+## 7b. GROUND TRUTH — real model dims (Qwen3-Next-80B-A3B-Instruct Q4_K_M)
+
+Dumped from the actual GGUF (843 tensors, 41 KV). This is the authoritative spec for the
+forward; supersedes the earlier derivations.
+
+**hparams**: block_count 48, embedding_length 2048, head_count 16, head_count_kv 2,
+key_length = value_length = 256, expert_count 512, expert_used_count 10,
+expert_feed_forward_length 512, expert_shared_feed_forward_length 512,
+feed_forward_length 5120, rope.dimension_count 64, rope.freq_base **1e7**,
+rms_eps 1e-6, context_length 262144. ssm: conv_kernel 4, group_count 16, inner_size 4096,
+state_size 128, time_step_rank 32. Layer i is **full-attn iff i % 4 == 3** (12 layers:
+3,7,…,47), else **DeltaNet** (36 layers).
+
+Derived DeltaNet dims: value_dim 4096, n_v_heads 32, head_v_dim 128 (= state_size);
+key_dim 2048, n_k_heads 16 (= group_count), head_k_dim 128; conv_dim 8192 (= key_dim·2 +
+value_dim); ba_dim 64 (= n_v_heads·2); dt_rank 32 (= n_v_heads).
+
+**DeltaNet layer tensors** (blk.0): `attn_norm`[2048] F32; `attn_qkv`[2048,8192] Q5_K
+(= q2048|k2048|v4096); `attn_gate`[2048,4096] Q4_K (z gate); `ssm_conv1d`[4,8192] F32
+(causal conv over q|k|v); `ssm_ba`[2048,64] Q4_K (β|α); `ssm_dt.bias`[32] F32; `ssm_a`[32]
+F32; `ssm_norm`[128] F32 (RMSNorm over head_v_dim); `ssm_out`[4096,2048] Q4_K;
+`post_attention_norm`[2048] F32.
+
+**Full-attn layer tensors** (blk.3): `attn_norm`[2048]; `attn_q`[2048,8192] Q4_K
+(= q4096|gate4096); `attn_k`[2048,512] Q4_K; `attn_v`[2048,512] Q6_K; `attn_q_norm`[256]
+F32; `attn_k_norm`[256] F32 (per-head RMSNorm, head_dim 256); `attn_output`[4096,2048] Q4_K;
+`post_attention_norm`[2048]. (q output is [q | gate]; final out *= sigmoid(gate).)
+
+**MoE tensors** (every layer): `ffn_gate_inp`[2048,512] F32 (router); `ffn_gate_exps`
+[2048,512,512] Q4_K, `ffn_up_exps`[2048,512,512] Q4_K, `ffn_down_exps`[512,2048,512] Q6_K
+(512 experts, hidden 512); shared expert `ffn_gate_inp_shexp`[2048] F16,
+`ffn_gate_shexp`[2048,512] Q4_K, `ffn_up_shexp`[2048,512] Q4_K, `ffn_down_shexp`[512,2048]
+Q6_K. **Global**: `token_embd`[2048,151936] Q4_K, `output_norm`[2048] F32,
+`output`[2048,151936] Q6_K.
+
+Forward order per layer: norm → (DeltaNet | full-attn) → residual →
+post_attention_norm → MoE (router top-10 experts + shared expert) → residual.
+
 ## 8. Running 80B on 32 GB — SSD streaming (the hardware unblock)
 
 qwen3_next only ships as **80B-A3B** (Q4_K_M ≈ 45 GB), which does not fit 32 GB RAM.
