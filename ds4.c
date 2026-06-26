@@ -26481,9 +26481,10 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
      * non-think turns answer directly (a system-wide instruction would make the
      * model reflect even when off). */
     static const char *think_directive =
-        "\n\n(Reason step by step inside <think> and </think> — you may think in any "
-        "language, keep it brief. Then, immediately after </think>, write a clear, "
-        "complete final answer in the SAME language as this message.)";
+        "\n\n(Inside <think>...</think>: FIRST identify the language of THIS message on a "
+        "line 'User's language: <language>', then reason step by step (briefly, in any "
+        "language). Immediately after </think>, write a clear, complete final answer in "
+        "that SAME language.)";
 
     uint32_t pos = 0;
     int rc = 0;
@@ -26716,10 +26717,11 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         token_vec_free(&t);
         if (rc) break;
 
-        /* reflection: prime "<think>\n" so the model opens its reasoning */
+        /* reflection: prime "<think>" + the language-id label so the model first
+         * identifies the user's language, then reasons. */
         if (think_turn) {
             token_vec th = {0};
-            bpe_tokenize_text(&vocab, "<think>\n", &th);
+            bpe_tokenize_text(&vocab, "<think>\nUser's language: ", &th);
             for (uint32_t i = 0; i < (uint32_t)th.len && pos < n_ctx - 1u && rc == 0; i++)
                 if (ds4_dense_gpu_forward(g, &desc, th.v[i], pos++, logits) != 0) rc = 1;
             token_vec_free(&th);
