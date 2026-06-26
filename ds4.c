@@ -26514,7 +26514,8 @@ static void dense_print_banner(const char *model_path, uint32_t n_ctx,
         "/help        all commands",   "/temp <v>    temperature",
         "/topp <v>    nucleus (top-p)", "/topk <n>    top-k sampling",
         "/ctx [N]     show/resize ctx", "/save /load  session file",
-        "/read <f>    file as message", "/exit        quit (Ctrl-D)", "" };
+        "/read <f>    file as message", "/model [n]   models (whichllm)",
+        "/exit        quit (Ctrl-D)" };
     /* model basename (drop .gguf) + cwd (~ for $HOME) + device, truncated to fit WL */
     const char *base = strrchr(model_path, '/'); base = base ? base + 1 : model_path;
     char bname[96]; snprintf(bname, sizeof bname, "%s", base);
@@ -26718,6 +26719,83 @@ static void *dense_spinner_thread(void *arg) {
     return NULL;
 }
 
+/* Embedded whichllm model picker/downloader (Python; written to a temp file on first
+ * use). 'list' shows whichllm's hardware-ranked models; 'get <n>' resolves a GGUF on
+ * HuggingFace and downloads it into ./gguf. Needs whichllm on PATH + python3. */
+static const char *DENSE_MODEL_PY =
+    "import sys, json, subprocess, os, urllib.request, urllib.error, urllib.parse\n"
+    "HF=\"https://huggingface.co\"; STATE=\"/tmp/ds4_whichllm_models.json\"\n"
+    "def run_whichllm(n):\n"
+    "    r=subprocess.run([\"whichllm\",\"--json\",\"--top\",str(n)],capture_output=True,text=True)\n"
+    "    if r.returncode!=0 or not r.stdout.strip():\n"
+    "        sys.stderr.write(\"whichllm failed: \"+r.stderr[:300]); sys.exit(1)\n"
+    "    return json.loads(r.stdout)\n"
+    "def cmd_list(n):\n"
+    "    d=run_whichllm(n); hw=d.get(\"hardware\",{})\n"
+    "    gpus=\", \".join(g[\"name\"] for g in hw.get(\"gpus\",[])) or \"CPU\"\n"
+    "    print(f\"\\033[1mwhichllm — best local models for your machine\\033[0m \\033[2m({gpus}, {hw.get('ram_bytes',0)/1e9:.0f}GB)\\033[0m\")\n"
+    "    models=d.get(\"models\",[])\n"
+    "    for m in models:\n"
+    "        sz=(m.get(\"file_size_bytes\") or 0)/1e9; tps=m.get(\"estimated_tok_per_sec\") or 0\n"
+    "        run=\"\\033[32m✓\\033[0m\" if m.get(\"can_run\") else \"\\033[2m·\\033[0m\"\n"
+    "        print(f\"  \\033[36m{m['rank']:>2}\\033[0m {run} {m['model_id']:<32} \\033[2m{(m.get('quant_type') or '?'):<7}{sz:>5.1f}GB ~{tps:>3.0f}t/s {m.get('fit_type','')}\\033[0m\")\n"
+    "    json.dump(models,open(STATE,\"w\")); print(\"\\033[2m/model <n> to download into gguf/\\033[0m\")\n"
+    "def hf_json(url):\n"
+    "    with urllib.request.urlopen(urllib.request.Request(url,headers={\"User-Agent\":\"ds4\"}),timeout=30) as r: return json.load(r)\n"
+    "def repo_ggufs(repo):\n"
+    "    try: info=hf_json(f\"{HF}/api/models/{repo}\")\n"
+    "    except Exception: return []\n"
+    "    return [s[\"rfilename\"] for s in info.get(\"siblings\",[]) if s.get(\"rfilename\",\"\").endswith(\".gguf\")]\n"
+    "def resolve(mid, quant):\n"
+    "    name=mid.split(\"/\")[-1]\n"
+    "    repos=[]\n"
+    "    if repo_ggufs(mid): repos.append(mid)\n"
+    "    try:\n"
+    "        res=hf_json(f\"{HF}/api/models?search={urllib.parse.quote(name)}&filter=gguf&sort=downloads&limit=8\")\n"
+    "        repos+= [r[\"id\"] for r in res]\n"
+    "    except Exception: pass\n"
+    "    for repo in repos:\n"
+    "        files=[f for f in repo_ggufs(repo) if \"-of-\" not in f.lower()]\n"
+    "        match=[f for f in files if quant and quant in f.lower()]\n"
+    "        if match: return repo, sorted(match,key=len)[0]\n"
+    "    for repo in repos:\n"
+    "        files=[f for f in repo_ggufs(repo) if \"-of-\" not in f.lower()]\n"
+    "        if files: return repo, sorted(files,key=len)[0]\n"
+    "    return None\n"
+    "def cmd_get(n):\n"
+    "    models=json.load(open(STATE)); m=models[n-1]; mid=m[\"model_id\"]; quant=(m.get(\"quant_type\") or \"\").lower()\n"
+    "    print(f\"finding a GGUF for {mid} ({quant})…\")\n"
+    "    r=resolve(mid,quant)\n"
+    "    if not r:\n"
+    "        print(f\"\\033[31mno downloadable GGUF found for {mid} (whichllm may list a future/base-only model).\\033[0m\"); return\n"
+    "    repo,fname=r; os.makedirs(\"gguf\",exist_ok=True); dst=os.path.join(\"gguf\",os.path.basename(fname))\n"
+    "    if os.path.exists(dst): print(f\"\\033[32malready present: {dst}\\033[0m\\nrelaunch: ./ds4 --metal-dense-chat {dst} 8192\"); return\n"
+    "    print(f\"\\033[2mrepo {repo}\\033[0m\\ndownloading {fname} -> {dst}\")\n"
+    "    def hook(b,bs,t):\n"
+    "        if t>0: sys.stdout.write(f\"\\r  {min(100,b*bs*100//t)}%  {b*bs/1e9:.1f}/{t/1e9:.1f} GB   \"); sys.stdout.flush()\n"
+    "    try: urllib.request.urlretrieve(f\"{HF}/{repo}/resolve/main/{urllib.parse.quote(fname)}\",dst,hook)\n"
+    "    except Exception as e:\n"
+    "        try: os.remove(dst)\n"
+    "        except Exception: pass\n"
+    "        print(f\"\\n\\033[31mdownload failed: {e}\\033[0m\"); return\n"
+    "    print(f\"\\n\\033[32mdone: {dst}\\033[0m\\nrelaunch: ./ds4 --metal-dense-chat {dst} 8192\")\n"
+    "if __name__==\"__main__\":\n"
+    "    c=sys.argv[1] if len(sys.argv)>1 else \"list\"\n"
+    "    if c==\"list\": cmd_list(int(sys.argv[2]) if len(sys.argv)>2 else 8)\n"
+    "    elif c==\"get\": cmd_get(int(sys.argv[2]))\n";
+
+static const char *dense_model_script_path(void) {
+    static char path[PATH_MAX]; static int done = 0;
+    if (!done) {
+        const char *tmp = getenv("TMPDIR"); if (!tmp || !*tmp) tmp = "/tmp";
+        snprintf(path, sizeof(path), "%s/ds4_whichllm.py", tmp);
+        FILE *fp = fopen(path, "wb");
+        if (fp) { fputs(DENSE_MODEL_PY, fp); fclose(fp); done = 1; }
+        else path[0] = '\0';
+    }
+    return path[0] ? path : NULL;
+}
+
 int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                    char *err, size_t errlen) {
     ds4_model model;
@@ -26877,6 +26955,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                    "  /load <file>  restore a saved conversation\n"
                    "  /read <file>  send a file's contents as the message\n"
                    "  /ctx [N]      show or resize the context (resize resets the chat)\n"
+                   "  /model [n]    list models for your machine (whichllm); /model <n> downloads it\n"
                    "  /help         show this\n"
                    "  /exit         quit\n");
             continue;
@@ -26959,6 +27038,23 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             fclose(fp);
             printf("\033[2m(loaded %u turns from %s%s)\033[0m\n", loaded, line + 6,
                    saved_ctx != n_ctx ? " — ctx differs" : "");
+            continue;
+        }
+        if (!strncmp(line, "/model", 6) && (line[6] == ' ' || line[6] == '\0')) {
+            /* whichllm-powered model picker: '/model' lists hardware-ranked models,
+             * '/model <n>' downloads that one's GGUF into ./gguf. */
+            const char *script = dense_model_script_path();
+            if (!script) { printf("\033[2m(cannot create model helper)\033[0m\n"); continue; }
+            const char *arg = line + 6; while (*arg == ' ') arg++;
+            const int sel = atoi(arg);
+            char mcmd[PATH_MAX + 96];
+            if (sel > 0) snprintf(mcmd, sizeof mcmd, "python3 '%s' get %d 2>&1", script, sel);
+            else         snprintf(mcmd, sizeof mcmd, "python3 '%s' list 10 2>&1", script);
+            FILE *mfp = popen(mcmd, "r");
+            if (!mfp) { printf("\033[2m(model helper failed — need whichllm + python3 on PATH)\033[0m\n"); continue; }
+            char mbuf[4096]; size_t mrd;
+            while ((mrd = fread(mbuf, 1, sizeof mbuf, mfp)) > 0) { fwrite(mbuf, 1, mrd, stdout); fflush(stdout); }
+            pclose(mfp);
             continue;
         }
         if (!strncmp(line, "/read ", 6)) {
