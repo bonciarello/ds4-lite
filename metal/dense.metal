@@ -1781,7 +1781,7 @@ kernel void kernel_dense_attn_decode_f32_sg(
     float l = 0.0f;
 
     for (uint t = 0; t < a.n_ctx; t++) {
-        device const float * kt = kcache + (ulong)t*kvdim + hkv*hd;
+        device const half * kt = (device const half *)kcache + (ulong)t*kvdim + hkv*hd;
         float p = 0.0f;
         for (uint j = 0; j < ndl; j++) {
             const uint d = lane + 32u*j;
@@ -1792,7 +1792,7 @@ kernel void kernel_dense_attn_decode_f32_sg(
         const float corr  = exp(m - m_new);     // first iter: exp(-inf)=0
         const float pe    = exp(s - m_new);
         l = l * corr + pe;
-        device const float * vt = vcache + (ulong)t*kvdim + hkv*hd;
+        device const half * vt = (device const half *)vcache + (ulong)t*kvdim + hkv*hd;
         for (uint j = 0; j < ndl; j++) {
             const uint d = lane + 32u*j;
             if (d < hd) acc[j] = acc[j]*corr + pe * vt[d];
@@ -1893,7 +1893,7 @@ kernel void kernel_dense_attn_prefill_f32(
     }
     float mx = -INFINITY, l = 0.0f;
     for (uint t = 0; t < n_causal; t++) {
-        device const float * kt = kcache + (ulong)t*kvdim + hkv*hd;
+        device const half * kt = (device const half *)kcache + (ulong)t*kvdim + hkv*hd;
         float p = 0.0f;
         for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) p += qreg[j]*kt[d]; }
         const float s = simd_sum(p) * a.scale;
@@ -1901,12 +1901,23 @@ kernel void kernel_dense_attn_prefill_f32(
         const float corr = exp(mx - m_new);
         const float pe   = exp(s - m_new);
         l = l*corr + pe;
-        device const float * vt = vcache + (ulong)t*kvdim + hkv*hd;
+        device const half * vt = (device const half *)vcache + (ulong)t*kvdim + hkv*hd;
         for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) acc[j] = acc[j]*corr + pe*vt[d]; }
         mx = m_new;
     }
     const float inv = 1.0f / l;
     for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) oh[d] = acc[j]*inv; }
+}
+
+// f32 -> f16 narrowing copy. Used to store the KV cache in half precision: K/V are
+// computed/biased/roped in f32 scratch, then converted into the f16 cache. Halves the
+// KV memory footprint and the attention read traffic. Dispatch n threads.
+kernel void kernel_dense_cvt_f32_to_f16(
+        constant uint & n [[buffer(0)]],
+        device const float * src [[buffer(1)]],
+        device       half  * dst [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < n) dst[gid] = (half)src[gid];
 }
 
 // Broadcast bias add over M rows: x[m,i] += bias[i]. args = {row_width, M*row_width}.
@@ -1957,14 +1968,14 @@ kernel void kernel_dense_attn_decode_split_f32(
     for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; qreg[j] = (d < hd) ? qh[d] : 0.0f; acc[j] = 0.0f; }
     float m = -INFINITY, l = 0.0f;
     for (uint t = t0; t < t1; t++) {
-        device const float * kt = kcache + (ulong)t*kvdim + hkv*hd;
+        device const half * kt = (device const half *)kcache + (ulong)t*kvdim + hkv*hd;
         float p = 0.0f;
         for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) p += qreg[j]*kt[d]; }
         const float s = simd_sum(p) * a.scale;
         const float m_new = max(m, s);
         const float corr = exp(m - m_new), pe = exp(s - m_new);
         l = l*corr + pe;
-        device const float * vt = vcache + (ulong)t*kvdim + hkv*hd;
+        device const half * vt = (device const half *)vcache + (ulong)t*kvdim + hkv*hd;
         for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) acc[j] = acc[j]*corr + pe*vt[d]; }
         m = m_new;
     }
