@@ -40,6 +40,9 @@
 #include <sys/select.h>
 #include <signal.h>
 #include <termios.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>   /* _NSGetExecutablePath (re-exec on model switch) */
+#endif
 
 #include "ds4.h"
 #include "ds4_distributed.h"
@@ -26769,7 +26772,7 @@ static const char *DENSE_MODEL_PY =
     "    if not r:\n"
     "        print(f\"\\033[31mno downloadable GGUF found for {mid} (whichllm may list a future/base-only model).\\033[0m\"); return\n"
     "    repo,fname=r; os.makedirs(\"gguf\",exist_ok=True); dst=os.path.join(\"gguf\",os.path.basename(fname))\n"
-    "    if os.path.exists(dst): print(f\"\\033[32malready present: {dst}\\033[0m\\nrelaunch: ./ds4 --metal-dense-chat {dst} 8192\"); return\n"
+    "    if os.path.exists(dst): print(f\"\\033[32malready present: {dst}\\033[0m\"); return\n"
     "    print(f\"\\033[2mrepo {repo}\\033[0m\\ndownloading {fname} -> {dst}\")\n"
     "    def hook(b,bs,t):\n"
     "        if t>0: sys.stdout.write(f\"\\r  {min(100,b*bs*100//t)}%  {b*bs/1e9:.1f}/{t/1e9:.1f} GB   \"); sys.stdout.flush()\n"
@@ -26778,7 +26781,7 @@ static const char *DENSE_MODEL_PY =
     "        try: os.remove(dst)\n"
     "        except Exception: pass\n"
     "        print(f\"\\n\\033[31mdownload failed: {e}\\033[0m\"); return\n"
-    "    print(f\"\\n\\033[32mdone: {dst}\\033[0m\\nrelaunch: ./ds4 --metal-dense-chat {dst} 8192\")\n"
+    "    print(f\"\\n\\033[32mdone: {dst}\\033[0m\")\n"
     "if __name__==\"__main__\":\n"
     "    c=sys.argv[1] if len(sys.argv)>1 else \"list\"\n"
     "    if c==\"list\": cmd_list(int(sys.argv[2]) if len(sys.argv)>2 else 8)\n"
@@ -27053,8 +27056,38 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             FILE *mfp = popen(mcmd, "r");
             if (!mfp) { printf("\033[2m(model helper failed — need whichllm + python3 on PATH)\033[0m\n"); continue; }
             char mbuf[4096]; size_t mrd;
-            while ((mrd = fread(mbuf, 1, sizeof mbuf, mfp)) > 0) { fwrite(mbuf, 1, mrd, stdout); fflush(stdout); }
+            char mcap[8192]; size_t mclen = 0;        /* capture to find the downloaded path */
+            while ((mrd = fread(mbuf, 1, sizeof mbuf, mfp)) > 0) {
+                fwrite(mbuf, 1, mrd, stdout); fflush(stdout);
+                size_t cp = mrd; if (mclen + cp >= sizeof mcap) cp = sizeof mcap - 1 - mclen;
+                if (cp > 0) { memcpy(mcap + mclen, mbuf, cp); mclen += cp; }
+            }
             pclose(mfp);
+            mcap[mclen] = '\0';
+            /* On a successful download/selection, switch model live by re-execing ds4
+             * with the new path (the KV cache is model-specific, so the session resets;
+             * the user does not have to relaunch). The helper prints "done: <path>" or
+             * "already present: <path>". */
+            const char *dp = strstr(mcap, "done: ");
+            if (!dp) dp = strstr(mcap, "already present: ");
+            if (sel > 0 && dp) {
+                dp = strchr(dp, ':') + 1; while (*dp == ' ') dp++;
+                char newp[PATH_MAX]; size_t k = 0;
+                while (*dp && *dp != '\n' && *dp != '\033' && *dp != '\r' && k + 1 < sizeof newp) newp[k++] = *dp++;
+                newp[k] = '\0';
+                if (k > 0) {
+                    char exe[PATH_MAX]; snprintf(exe, sizeof exe, "%s", "ds4");
+#ifdef __APPLE__
+                    { uint32_t bs = sizeof exe; if (_NSGetExecutablePath(exe, &bs) != 0) snprintf(exe, sizeof exe, "%s", "ds4"); }
+#endif
+                    char ctxs[16]; snprintf(ctxs, sizeof ctxs, "%u", n_ctx);
+                    printf("\033[36m↻ switching to %s …\033[0m\n", newp); fflush(stdout);
+                    char *eargv[] = { exe, (char *)"--metal-dense-chat", newp, ctxs, NULL };
+                    execv(exe, eargv);
+                    printf("\033[2m(could not relaunch automatically; run: %s --metal-dense-chat %s %u)\033[0m\n",
+                           exe, newp, n_ctx);
+                }
+            }
             continue;
         }
         if (!strncmp(line, "/read ", 6)) {
