@@ -26539,6 +26539,37 @@ static void dense_print_banner(const char *model_path, uint32_t n_ctx,
     fflush(stdout);
 }
 
+/* Compact token count: 123 -> "123", 1234 -> "1.2k". */
+static void dense_fmt_tok(uint32_t n, char *b, size_t cap) {
+    if (n < 1000u) snprintf(b, cap, "%u", n);
+    else snprintf(b, cap, "%.1fk", (double)n / 1000.0);
+}
+
+/* Claude-Code-style context status line shown under the prompt: left = used/total
+ * tokens, right = a progress bar + percentage, padded to the terminal width. Colors
+ * are inline (linenoise treats CSI as zero-width when measuring the status). */
+static void dense_ctx_status(char *out, size_t cap, uint32_t used, uint32_t total) {
+    int cols = dense_term_width(); if (cols < 28) cols = 28;
+    char lu[16], lt[16];
+    dense_fmt_tok(used, lu, sizeof lu); dense_fmt_tok(total, lt, sizeof lt);
+    char left[48]; int lcells = snprintf(left, sizeof left, "context %s/%s", lu, lt);
+    double frac = total ? (double)used / (double)total : 0.0; if (frac > 1.0) frac = 1.0;
+    const int pct = (int)(frac * 100.0 + 0.5);
+    const int barw = cols < 52 ? 10 : 18;
+    int filled = (int)(frac * barw + 0.5); if (filled > barw) filled = barw;
+    char pctbuf[8]; int pl = snprintf(pctbuf, sizeof pctbuf, "%d%%", pct);
+    int pad = cols - lcells - (barw + 1 + pl); if (pad < 1) pad = 1;
+    size_t o = 0;
+    o += (size_t)snprintf(out + o, cap - o, "\033[2m%s", left);
+    for (int i = 0; i < pad && o + 1 < cap; i++) out[o++] = ' ';
+    out[o] = '\0';
+    o += (size_t)snprintf(out + o, cap - o, "\033[36m");                 /* filled = cyan */
+    for (int i = 0; i < filled && o + 8 < cap; i++) o += (size_t)snprintf(out + o, cap - o, "█");
+    o += (size_t)snprintf(out + o, cap - o, "\033[2m");                  /* empty = dim  */
+    for (int i = filled; i < barw && o + 8 < cap; i++) o += (size_t)snprintf(out + o, cap - o, "░");
+    snprintf(out + o, cap - o, " %s\033[0m", pctbuf);
+}
+
 /* SIGWINCH -> self-pipe so the prompt's select() wakes on a terminal resize. */
 static int g_winch_pipe[2] = { -1, -1 };
 static void dense_winch_handler(int sig) {
@@ -26550,12 +26581,17 @@ static void dense_winch_handler(int sig) {
  * width) when the terminal is resized. Falls back to blocking linenoise() when stdin
  * is not a tty or the self-pipe is unavailable. Returns a malloc'd line or NULL (EOF). */
 static char *dense_readline(const char *prompt, const char *model_path,
-                            uint32_t n_ctx, const char *device_str, const char *init_text) {
+                            uint32_t n_ctx, const char *device_str, const char *init_text,
+                            uint32_t used) {
     if (!isatty(STDIN_FILENO) || g_winch_pipe[0] < 0) return linenoise(prompt);
     static char linebuf[8192];
     struct linenoiseState ls;
     if (linenoiseEditStart(&ls, STDIN_FILENO, STDOUT_FILENO, linebuf, sizeof linebuf, prompt) == -1)
         return linenoise(prompt);
+    char stbuf[320];
+    dense_ctx_status(stbuf, sizeof stbuf, used, n_ctx);   /* context-window bar under prompt */
+    linenoiseEditSetStatus(&ls, stbuf, NULL, NULL);
+    linenoiseShow(&ls);                                   /* render prompt + status now */
     char *res = NULL;
     const int wp = g_winch_pipe[0];
     for (;;) {
@@ -26584,6 +26620,8 @@ static char *dense_readline(const char *prompt, const char *model_path,
                           tcsetattr(STDOUT_FILENO, TCSANOW, &tc); }
             dense_print_banner(model_path, n_ctx, device_str, init_text);
             if (have_t) tcsetattr(STDOUT_FILENO, TCSANOW, &traw);
+            dense_ctx_status(stbuf, sizeof stbuf, used, n_ctx);   /* bar width follows resize */
+            linenoiseEditSetStatus(&ls, stbuf, NULL, NULL);
             linenoiseShow(&ls);
         }
         if (FD_ISSET(STDIN_FILENO, &rf)) {
@@ -26737,7 +26775,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     while (rc == 0) {
         linenoiseFree(line);
         line = dense_readline("> ", model_path, n_ctx, dev_str[0] ? dev_str : NULL,
-                              init_log[0] ? init_log : NULL);
+                              init_log[0] ? init_log : NULL, pos);
         if (!line) { printf("\n"); break; }             /* EOF / Ctrl-D */
         size_t nr = strlen(line);   /* non-const: /read replaces line+nr */
         if (nr == 0) continue;
