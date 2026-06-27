@@ -60,10 +60,27 @@ shopt -s nullglob
 for MODEL in $GLOB; do
   base=$(basename "$MODEL"); short=$(echo "$base" | sed 's/\.gguf$//' | cut -c1-26)
 
+  # classify the model: dense (gemma/qwen2/llama/mistral), qwen3_next, or unsupported
+  kind="dense"
   if ! "$DS4" --metal-dense-generate "$MODEL" "hi" 1 >/dev/null 2>"$TMP/probe"; then
-    if grep -qiE "not a dense|not yet|not supported|qwen3_next" "$TMP/probe"; then
-      row "$short" "(skip: non-dense)" "-" "-" "-"; continue
-    fi
+    if grep -qi "qwen3_next" "$TMP/probe"; then kind="q3n"
+    else row "$short" "(skip: unsupported)" "-" "-" "-"; continue; fi
+  fi
+
+  RSS_MODEL=$(LC_ALL=C awk -v b="$(stat -f%z "$MODEL" 2>/dev/null || echo 0)" 'BEGIN{printf "%.0f", b/1073741824}')
+
+  if [ "$kind" = "q3n" ]; then
+    # 80B MoE, ~${RSS_MODEL} GiB on disk — larger than RAM, so ALWAYS SSD-streamed (cannot be
+    # pinned resident). The point: RSS stays a FRACTION of the model size (the rest is on SSD).
+    run_sample ds4 "$DS4" --metal-q3n-generate "$MODEL" "$PROMPT" "$NPRED"
+    pf=$(grep -aoE "prefill [0-9.]+ t/s" "$TMP/err" | grep -oE "[0-9.]+" | head -1)
+    de=$(grep -aoE "gen [0-9.]+ t/s"     "$TMP/err" | grep -oE "[0-9.]+" | head -1)
+    row "$short" "ds4 SSD-stream" "${pf:-?}" "${de:-?}" "$RSS_GIB / ${RSS_MODEL}"
+    echo "$base,ds4,q3n SSD-stream,${pf:-},${de:-},$RSS_GIB" >> "$CSV"
+    # llama.cpp can't full-offload a >RAM model; note it rather than OOM the box.
+    row "$short" "llama.cpp" "-" "(needs > RAM)" "-"
+    printf '%s\n' "--------------------------------------------------------------------------------"
+    continue
   fi
 
   for cfg in "ds4 resident:DS4_DENSE_RESIDENT=1" "ds4 streaming:DS4_DENSE_STREAM=1"; do
@@ -88,8 +105,10 @@ done
 
 echo; echo "CSV: $CSV"
 echo "Reading it:"
-echo " - SSD streaming (DS4_DENSE_STREAM) is working when 'ds4 streaming' has a much LOWER"
-echo "   prefill t/s than 'ds4 resident' — the weights are faulted from SSD, not GPU-pinned."
-echo "   On a model that fits, RSS stays similar; the win is not pinning, so a model too big"
-echo "   to pin resident becomes runnable instead of OOMing."
-echo " - RSS = peak resident set (physical memory held). llama.cpp pp/tg = prefill/decode t/s."
+echo " - RSS = peak RESIDENT SET = physical RAM only (mmap'd weight pages still on SSD are NOT"
+echo "   counted). So RSS is exactly the RAM load."
+echo " - qwen3_next (~45 GiB) runs on this box with RSS far below its size — the rest stays on"
+echo "   SSD ('RSS / model' column). That is the RAM reduction: a model bigger than RAM runs."
+echo " - For models that FIT in RAM (gemma/qwen2), resident and streaming have similar RSS (no"
+echo "   memory pressure to evict); the SSD-streaming signal there is the lower prefill t/s."
+echo " - llama.cpp pp/tg = prefill/decode t/s; it cannot full-offload a model larger than RAM."

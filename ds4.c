@@ -26312,6 +26312,7 @@ int ds4_q3n_generate(const char *model_path, const char *prompt, int n_predict,
     const double t0 = now_sec();
     for (uint32_t i = 0; i < (uint32_t)toks.len && rc == 0; i++)
         if (ds4_q3n_gpu_forward(g, &desc, toks.v[i], pos++, logits) != 0) rc = 1;
+    const double t_pf = now_sec();               /* prefill done (TTFT) */
     printf("=== ds4 qwen3_next greedy (%d tokens) ===\n", n_predict);
     for (uint32_t i = 0; i < (uint32_t)toks.len; i++) dense_print_token(&vocab, toks.v[i]);
     int n_gen = 0;
@@ -26323,8 +26324,14 @@ int ds4_q3n_generate(const char *model_path, const char *prompt, int n_predict,
     }
     const double t1 = now_sec();
     printf("\n");
-    if (rc == 0) fprintf(stderr, "ds4: qwen3_next gen %d tokens in %.1fs (%.2f tok/s)\n",
-                         n_gen, t1 - t0, (t1 - t0) > 0 ? (double)(n_gen + (int)toks.len) / (t1 - t0) : 0.0);
+    if (rc == 0) {
+        const double pf_s = t_pf - t0, gen_s = t1 - t_pf;
+        const double pf_ts  = pf_s  > 0 ? (double)toks.len / pf_s  : 0.0;
+        const double gen_ts = gen_s > 0 ? (double)n_gen    / gen_s : 0.0;
+        /* same "prefill X t/s ... gen Z t/s" shape as the dense path so the benchmark parses it */
+        fprintf(stderr, "ds4 qwen3_next metrics: prompt=%u tok, prefill %.2f t/s (TTFT %.3f s), gen %.2f t/s (%d tok)\n",
+                (unsigned)toks.len, pf_ts, pf_s, gen_ts, n_gen);
+    }
     free(logits); ds4_q3n_gpu_free(g); free(desc.layers);
     token_vec_free(&toks); vocab_free(&vocab); model_close(&model);
     if (rc && errlen && !err[0]) snprintf(err, errlen, "qwen3_next forward failed");
