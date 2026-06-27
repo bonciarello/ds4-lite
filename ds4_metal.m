@@ -4337,6 +4337,7 @@ struct ds4_q3n_gpu {
     float *hostscratch;              /* n_vocab (f32 matvec readback) */
     NSMutableDictionary<NSNumber *, NSValue *> *wcache;
     const void *model_base; uint64_t model_size;
+    bool zerocopy;                   /* model map registered -> wrap weights instead of copying */
     /* DeltaNet recurrent state, HOST arrays (the linear-attn recurrence runs on the CPU
      * for correctness-first; only the 4 quantized projections are matvec'd on GPU). */
     float **conv_state;              /* [n_layer] conv window [(K-1)*conv_dim], NULL for full-attn */
@@ -4351,9 +4352,10 @@ static ds4_gpu_tensor *q3n_cached_weight(ds4_q3n_gpu *g, const void *data, uint6
     NSValue *v = g->wcache[key];
     if (v) return (ds4_gpu_tensor *)[v pointerValue];
     ds4_gpu_tensor *buf = NULL;
-    /* Zero-copy: wrap the mmap-backed weight as a GPU buffer (no 45GB of expert copies,
-     * no GPU-memory duplication; the GPU faults the pages on access). Fall back to a copy. */
-    if (g->model_base && data >= g->model_base && (const char *)data + bytes <= (const char *)g->model_base + g->model_size) {
+    /* Zero-copy: wrap the mmap-backed weight as a GPU buffer (no expert copies / no GPU-memory
+     * duplication; the GPU faults the pages on access). ONLY when the model map registered
+     * (g->zerocopy) — otherwise every wrap would fail + spam; just copy. Falls back to a copy. */
+    if (g->zerocopy && g->model_base && data >= g->model_base && (const char *)data + bytes <= (const char *)g->model_base + g->model_size) {
         const uint64_t offset = (uint64_t)((const char *)data - (const char *)g->model_base);
         uint64_t inner = 0;
         id<MTLBuffer> wb = ds4_gpu_wrap_model_range(g->model_base, g->model_size, offset, bytes, &inner);
@@ -4397,6 +4399,12 @@ ds4_q3n_gpu *ds4_q3n_gpu_create(const ds4_q3n_model_desc *d) {
     g->n_ctx = d->n_ctx; g->n_head = d->n_head; g->n_kv = d->n_kv; g->head_dim = d->head_dim;
     g->model_base = d->model_base; g->model_size = d->model_size;
     g->wcache = [NSMutableDictionary dictionary];
+    /* Register the model map so weights can be wrapped zero-copy instead of copied (no GPU
+     * duplication of the 45GB of experts). If it fails, q3n_cached_weight copies — quietly,
+     * no per-weight error spam. maxw = the largest single tensor we wrap (the output head). */
+    { uint64_t maxw = d->output.bytes; if (d->token_embd.bytes > maxw) maxw = d->token_embd.bytes;
+      g->zerocopy = ds4_gpu_set_model_map_range(d->model_base, d->model_size, 0, d->model_size, maxw) != 0;
+      fprintf(stderr, "ds4: qwen3_next weights %s\n", g->zerocopy ? "zero-copy (mmap-wrapped)" : "copied to GPU on demand"); }
     const uint32_t qd = d->n_head*d->head_dim, kvd = d->n_kv*d->head_dim;
     g->x = ds4_gpu_tensor_alloc((uint64_t)d->n_embd*4);
     g->h = ds4_gpu_tensor_alloc((uint64_t)d->n_embd*4);
