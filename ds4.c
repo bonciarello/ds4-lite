@@ -26554,6 +26554,82 @@ static void dense_chat_append_block(token_vec *t, const ds4_vocab *vocab,
     bpe_tokenize_text(vocab, "\n", t);
 }
 
+/* ---- Streaming markdown renderer (claude-code-style chat output) -----------
+ * Line-buffered: bytes are accumulated and each complete line is rendered when its
+ * newline arrives (md_flush emits a trailing partial line). Handles ``` fenced code
+ * blocks (left-bar box with a language label), # headers, dash/star/numbered bullets,
+ * and inline bold / italic / inline-code. Disabled (raw passthrough) when not a tty or
+ * DS4_NO_MARKDOWN is set. */
+typedef struct { char line[8192]; int llen; int in_code; int emitted_any; int enabled; } md_state;
+
+static void md_init(md_state *m) {
+    memset(m, 0, sizeof(*m));
+    m->enabled = (isatty(STDOUT_FILENO) || getenv("DS4_FORCE_MARKDOWN")) && getenv("DS4_NO_MARKDOWN") == NULL;
+}
+
+/* Emit one line's text applying inline **bold** / *italic* / `code`. */
+static void md_inline(const char *s, int n) {
+    int bold = 0, ital = 0, code = 0;
+    for (int i = 0; i < n; i++) {
+        if (!code && i + 1 < n && s[i] == '*' && s[i+1] == '*') {
+            bold = !bold; fputs(bold ? "\033[1m" : "\033[22m", stdout); i++; continue;
+        }
+        if (s[i] == '`') {
+            code = !code;
+            if (code) fputs("\033[36m", stdout);
+            else { fputs("\033[39m", stdout); }     /* default fg; keep bold/italic */
+            continue;
+        }
+        if (!code && s[i] == '*') { ital = !ital; fputs(ital ? "\033[3m" : "\033[23m", stdout); continue; }
+        putchar((unsigned char)s[i]);
+    }
+    fputs("\033[0m", stdout);
+}
+
+static void md_emit_line(md_state *m, const char *s, int n) {
+    while (n > 0 && s[n-1] == '\r') n--;
+    if (!m->enabled) { fwrite(s, 1, (size_t)n, stdout); return; }
+    /* skip leading blank lines before any content */
+    if (!m->emitted_any && !m->in_code) { int j = 0; while (j < n && (s[j]==' '||s[j]=='\t')) j++; if (j >= n) return; }
+    /* fenced code block ``` */
+    if (n >= 3 && s[0]=='`' && s[1]=='`' && s[2]=='`') {
+        if (!m->in_code) {
+            int li = 3; while (li < n && s[li]==' ') li++;
+            fputs("\033[2m\xe2\x95\xad\xe2\x94\x80", stdout);                 /* ╭─ */
+            if (li < n) { fputs(" \033[0m\033[2m", stdout); fwrite(s+li, 1, (size_t)(n-li), stdout); }
+            fputs("\033[0m", stdout); m->in_code = 1;
+        } else { fputs("\033[2m\xe2\x95\xb0\xe2\x94\x80\033[0m", stdout); m->in_code = 0; }   /* ╰─ */
+        m->emitted_any = 1; return;
+    }
+    if (m->in_code) {                                                        /* verbatim, left bar */
+        fputs("\033[2m\xe2\x94\x82 \033[0m\033[36m", stdout);                /* │ + cyan */
+        fwrite(s, 1, (size_t)n, stdout); fputs("\033[0m", stdout); m->emitted_any = 1; return;
+    }
+    m->emitted_any = 1;
+    if (n >= 1 && s[0] == '#') {                                            /* # header -> bold */
+        int h = 0; while (h < n && s[h]=='#') h++; int j = h; while (j < n && s[j]==' ') j++;
+        fputs("\033[1m", stdout); md_inline(s+j, n-j); return;
+    }
+    if (n >= 2 && (s[0]=='-'||s[0]=='*'||s[0]=='+') && s[1]==' ') {         /* bullet */
+        fputs("  \033[36m\xe2\x80\xa2\033[0m ", stdout); md_inline(s+2, n-2); return;
+    }
+    int d = 0; while (d < n && s[d]>='0' && s[d]<='9') d++;                  /* N. numbered */
+    if (d > 0 && d+1 < n && s[d]=='.' && s[d+1]==' ') {
+        fputs("  \033[36m", stdout); fwrite(s, 1, (size_t)(d+1), stdout); fputs("\033[0m ", stdout);
+        md_inline(s+d+2, n-(d+2)); return;
+    }
+    md_inline(s, n);                                                        /* plain + inline */
+}
+
+static void md_feed(md_state *m, const char *buf, int n) {
+    for (int i = 0; i < n; i++) {
+        char c = buf[i];
+        if (c == '\n') { md_emit_line(m, m->line, m->llen); putchar('\n'); m->llen = 0; }
+        else if (m->llen < (int)sizeof(m->line) - 1) m->line[m->llen++] = c;
+    }
+}
+static void md_flush(md_state *m) { if (m->llen > 0) { md_emit_line(m, m->line, m->llen); m->llen = 0; } }
+
 /* Generate one assistant response: stream tokens (sampling), render any
  * <think>...</think> reasoning dimmed with the markers suppressed, and return the
  * malloc'd answer text (everything after </think>). Advances *pos_io; sets *rc_io
@@ -26567,8 +26643,24 @@ static char *dense_chat_gen_response(int is_q3n, ds4_dense_gpu *g, const ds4_den
     bool in_think = think_turn, answer_started = false, in_toolcall = false;
     char pend[16]; int pend_len = 0;
     char *ans = NULL; size_t ans_len = 0, ans_cap = 0;
+    md_state md; md_init(&md);   /* claude-code-style markdown rendering of the answer */
+    /* Esc-to-interrupt: put the tty in raw, non-blocking mode for the duration of the
+     * generation so a single Esc keypress can stop it mid-stream (the line editor restores
+     * cooked mode for the next prompt). VMIN/VTIME=0 -> read() never blocks. */
+    struct termios it_old; int it_raw = 0;
+    if (isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &it_old) == 0) {
+        struct termios r = it_old;
+        r.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+        r.c_cc[VMIN] = 0; r.c_cc[VTIME] = 0;
+        if (tcsetattr(STDIN_FILENO, TCSANOW, &r) == 0) it_raw = 1;
+    }
+    bool interrupted = false;
     if (think_turn) { printf("\033[2m\xf0\x9f\x92\xad "); fflush(stdout); }
     while (pos < n_ctx - 1u) {
+        if (it_raw) {   /* drain pending input; Esc (0x1b) stops generation */
+            unsigned char ic; while (read(STDIN_FILENO, &ic, 1) == 1) if (ic == 0x1b) { interrupted = true; break; }
+            if (interrupted) break;
+        }
         const int next = dense_sample(logits, DS4_N_VOCAB, temp, top_p, top_k, rng);
         if (next == im_end || next == vocab->eos_id) break;
         char tb[96];
@@ -26577,25 +26669,26 @@ static char *dense_chat_gen_response(int is_q3n, ds4_dense_gpu *g, const ds4_den
             if (pend_len < (int)sizeof(pend)) pend[pend_len++] = tb[k];
             if (pend_len >= 8 && memcmp(pend + pend_len - 8, "</think>", 8) == 0) {
                 const int pre = pend_len - 8;
-                if (pre > 0) { fwrite(pend, 1, (size_t)pre, stdout);
-                               if (!in_think) dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); }
+                if (pre > 0) { if (in_think) fwrite(pend, 1, (size_t)pre, stdout);
+                               else { md_feed(&md, pend, pre); dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); } }
                 pend_len = 0;
                 if (in_think) { printf("\033[0m\n"); in_think = false; }
             } else if (pend_len >= 7 && memcmp(pend + pend_len - 7, "<think>", 7) == 0) {
                 const int pre = pend_len - 7;
-                if (pre > 0) { fwrite(pend, 1, (size_t)pre, stdout);
-                               if (!in_think) dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); }
+                if (pre > 0) { if (in_think) fwrite(pend, 1, (size_t)pre, stdout);
+                               else { md_feed(&md, pend, pre); dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); } }
                 pend_len = 0;
                 if (!in_think) { printf("\033[2m"); in_think = true; }
             } else if (pend_len >= 11 && memcmp(pend + pend_len - 11, "<tool_call>", 11) == 0) {
                 /* tool call: stop echoing the raw JSON (it's rendered as a box by the
                  * tool loop) but keep it in `ans` so the parser still finds it. */
                 const int pre = pend_len - 11;
-                if (pre > 0) { fwrite(pend, 1, (size_t)pre, stdout);
-                               if (!in_think) dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); }
+                if (pre > 0) { if (in_think) fwrite(pend, 1, (size_t)pre, stdout);
+                               else { md_feed(&md, pend, pre); dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); } }
                 pend_len = 0;
                 if (in_think) { printf("\033[0m\n"); in_think = false; }
                 in_toolcall = true;
+                md_flush(&md); if (md.emitted_any) putchar('\n');
                 dense_sbuf_append(&ans, &ans_len, &ans_cap, "<tool_call>", 11);
                 printf("\033[2m\xe2\x80\xa6\033[0m"); fflush(stdout);
             } else if (pend_len > 11) {
@@ -26605,7 +26698,7 @@ static char *dense_chat_gen_response(int is_q3n, ds4_dense_gpu *g, const ds4_den
                 else {
                     dense_sbuf_append(&ans, &ans_len, &ans_cap, &b, 1);
                     if (answer_started || (b != ' ' && b != '\n' && b != '\r' && b != '\t')) {
-                        answer_started = true; fwrite(&b, 1, 1, stdout);
+                        answer_started = true; md_feed(&md, &b, 1);
                     }
                 }
                 memmove(pend, pend + 1, (size_t)(--pend_len));
@@ -26622,10 +26715,13 @@ static char *dense_chat_gen_response(int is_q3n, ds4_dense_gpu *g, const ds4_den
             dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pend_len);
             int s = 0;
             if (!answer_started) while (s < pend_len && (pend[s]==' '||pend[s]=='\n'||pend[s]=='\r'||pend[s]=='\t')) s++;
-            if (pend_len - s > 0) { answer_started = true; fwrite(pend + s, 1, (size_t)(pend_len - s), stdout); }
+            if (pend_len - s > 0) { answer_started = true; md_feed(&md, pend + s, pend_len - s); }
         }
     }
+    md_flush(&md);                  /* emit the last partial answer line */
     if (in_think) printf("\033[0m");
+    if (it_raw) tcsetattr(STDIN_FILENO, TCSANOW, &it_old);   /* restore cooked mode */
+    if (interrupted) printf("\n\033[2m[interrotto]\033[0m");
     *pos_io = pos;
     return ans;
 }
