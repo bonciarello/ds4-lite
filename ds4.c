@@ -26562,69 +26562,109 @@ static void dense_chat_append_block(token_vec *t, const ds4_vocab *vocab,
  * DS4_NO_MARKDOWN is set. */
 typedef struct { char line[8192]; int llen; int in_code; int emitted_any; int enabled; } md_state;
 
+static int dense_term_width(void);   /* defined later (TIOCGWINSZ) */
+#define DENSE_MARGIN 2               /* left/right terminal padding for chat content */
+
 static void md_init(md_state *m) {
     memset(m, 0, sizeof(*m));
     m->enabled = (isatty(STDOUT_FILENO) || getenv("DS4_FORCE_MARKDOWN")) && getenv("DS4_NO_MARKDOWN") == NULL;
 }
 
-/* Emit one line's text applying inline **bold** / *italic* / `code`. */
-static void md_inline(const char *s, int n) {
+/* Emit text s[0..n) (may contain ANSI escapes + UTF-8) with a DENSE_MARGIN left margin;
+ * when wrap!=0, word-wrap to (term width - 2*margin) visible columns, re-applying the
+ * margin on each wrapped line. Ends the logical line with a newline. ANSI escapes and
+ * UTF-8 continuation bytes count as zero width. Shared by markdown + tool rendering. */
+static void dense_emit_wrapped(const char *s, int n, int wrap) {
+    int cw = dense_term_width() - 2*DENSE_MARGIN; if (cw < 16) cw = 16;
+    int ls = 0, col = 0, lastsp = -1;
+#define MARG() do { for (int _m = 0; _m < DENSE_MARGIN; _m++) putchar(' '); } while (0)
+    for (int i = 0; i <= n; i++) {
+        if (i == n || s[i] == '\n') {                       /* logical line end */
+            MARG(); fwrite(s + ls, 1, (size_t)(i - ls), stdout); putchar('\n');
+            ls = i + 1; col = 0; lastsp = -1;
+            if (i == n) break; else continue;
+        }
+        unsigned char c = (unsigned char)s[i];
+        if (c == 0x1b) { while (i + 1 < n && !((s[i]>='a'&&s[i]<='z')||(s[i]>='A'&&s[i]<='Z'))) i++; continue; }  /* ANSI: 0 width */
+        if ((c & 0xC0) == 0x80) continue;                   /* UTF-8 continuation: 0 width */
+        col++;
+        if (c == ' ') lastsp = i;
+        if (wrap && col > cw) {                             /* wrap: break at last space, else hard */
+            int brk = (lastsp > ls) ? lastsp : i;
+            MARG(); fwrite(s + ls, 1, (size_t)(brk - ls), stdout); putchar('\n');
+            ls = (brk == lastsp) ? brk + 1 : brk;
+            col = 0; lastsp = -1;                           /* recount the carried-over remainder */
+            for (int j = ls; j <= i; j++) {
+                unsigned char d = (unsigned char)s[j];
+                if (d == 0x1b) { while (j + 1 < n && !((s[j]>='a'&&s[j]<='z')||(s[j]>='A'&&s[j]<='Z'))) j++; continue; }
+                if ((d & 0xC0) == 0x80) continue;
+                col++; if (d == ' ') lastsp = j;
+            }
+        }
+    }
+#undef MARG
+}
+
+/* Build inline **bold** / *italic* / `code` into buffer fb (returns new length). */
+static int md_inline_buf(char *fb, int fl, int cap, const char *s, int n) {
+#define SAPP(str) do { const char *_p = (str); while (*_p && fl < cap - 1) fb[fl++] = *_p++; } while (0)
     int bold = 0, ital = 0, code = 0;
     for (int i = 0; i < n; i++) {
-        if (!code && i + 1 < n && s[i] == '*' && s[i+1] == '*') {
-            bold = !bold; fputs(bold ? "\033[1m" : "\033[22m", stdout); i++; continue;
-        }
-        if (s[i] == '`') {
-            code = !code;
-            if (code) fputs("\033[36m", stdout);
-            else { fputs("\033[39m", stdout); }     /* default fg; keep bold/italic */
-            continue;
-        }
-        if (!code && s[i] == '*') { ital = !ital; fputs(ital ? "\033[3m" : "\033[23m", stdout); continue; }
-        putchar((unsigned char)s[i]);
+        if (!code && i + 1 < n && s[i] == '*' && s[i+1] == '*') { bold = !bold; SAPP(bold ? "\033[1m" : "\033[22m"); i++; continue; }
+        if (s[i] == '`') { code = !code; SAPP(code ? "\033[36m" : "\033[39m"); continue; }
+        if (!code && s[i] == '*') { ital = !ital; SAPP(ital ? "\033[3m" : "\033[23m"); continue; }
+        if (fl < cap - 1) fb[fl++] = s[i];
     }
-    fputs("\033[0m", stdout);
+    SAPP("\033[0m");
+#undef SAPP
+    return fl;
 }
 
 static void md_emit_line(md_state *m, const char *s, int n) {
     while (n > 0 && s[n-1] == '\r') n--;
-    if (!m->enabled) { fwrite(s, 1, (size_t)n, stdout); return; }
+    if (!m->enabled) { fwrite(s, 1, (size_t)n, stdout); putchar('\n'); return; }
     /* skip leading blank lines before any content */
     if (!m->emitted_any && !m->in_code) { int j = 0; while (j < n && (s[j]==' '||s[j]=='\t')) j++; if (j >= n) return; }
+    char fb[16384]; int fl = 0;
+#define SAPP(str) do { const char *_p = (str); while (*_p && fl < (int)sizeof fb - 1) fb[fl++] = *_p++; } while (0)
     /* fenced code block ``` */
     if (n >= 3 && s[0]=='`' && s[1]=='`' && s[2]=='`') {
         if (!m->in_code) {
             int li = 3; while (li < n && s[li]==' ') li++;
-            fputs("\033[2m\xe2\x95\xad\xe2\x94\x80", stdout);                 /* ╭─ */
-            if (li < n) { fputs(" \033[0m\033[2m", stdout); fwrite(s+li, 1, (size_t)(n-li), stdout); }
-            fputs("\033[0m", stdout); m->in_code = 1;
-        } else { fputs("\033[2m\xe2\x95\xb0\xe2\x94\x80\033[0m", stdout); m->in_code = 0; }   /* ╰─ */
-        m->emitted_any = 1; return;
+            SAPP("\033[2m\xe2\x95\xad\xe2\x94\x80");                          /* ╭─ */
+            if (li < n) { SAPP(" "); for (int k = li; k < n && fl < (int)sizeof fb - 1; k++) fb[fl++] = s[k]; }
+            SAPP("\033[0m"); m->in_code = 1;
+        } else { SAPP("\033[2m\xe2\x95\xb0\xe2\x94\x80\033[0m"); m->in_code = 0; }   /* ╰─ */
+        m->emitted_any = 1; dense_emit_wrapped(fb, fl, 0); return;
     }
     if (m->in_code) {                                                        /* verbatim, left bar */
-        fputs("\033[2m\xe2\x94\x82 \033[0m\033[36m", stdout);                /* │ + cyan */
-        fwrite(s, 1, (size_t)n, stdout); fputs("\033[0m", stdout); m->emitted_any = 1; return;
+        SAPP("\033[2m\xe2\x94\x82 \033[0m\033[36m");                         /* │ + cyan */
+        for (int k = 0; k < n && fl < (int)sizeof fb - 1; k++) fb[fl++] = s[k];
+        SAPP("\033[0m"); m->emitted_any = 1; dense_emit_wrapped(fb, fl, 0); return;   /* no word-wrap for code */
     }
     m->emitted_any = 1;
     if (n >= 1 && s[0] == '#') {                                            /* # header -> bold */
         int h = 0; while (h < n && s[h]=='#') h++; int j = h; while (j < n && s[j]==' ') j++;
-        fputs("\033[1m", stdout); md_inline(s+j, n-j); return;
+        SAPP("\033[1m"); fl = md_inline_buf(fb, fl, (int)sizeof fb, s+j, n-j);
+    } else if (n >= 2 && (s[0]=='-'||s[0]=='*'||s[0]=='+') && s[1]==' ') {   /* bullet */
+        SAPP("\033[36m\xe2\x80\xa2\033[0m "); fl = md_inline_buf(fb, fl, (int)sizeof fb, s+2, n-2);
+    } else {
+        int d = 0; while (d < n && s[d]>='0' && s[d]<='9') d++;              /* N. numbered */
+        if (d > 0 && d+1 < n && s[d]=='.' && s[d+1]==' ') {
+            SAPP("\033[36m"); for (int k = 0; k <= d && fl < (int)sizeof fb - 1; k++) fb[fl++] = s[k];
+            SAPP("\033[0m "); fl = md_inline_buf(fb, fl, (int)sizeof fb, s+d+2, n-(d+2));
+        } else {
+            fl = md_inline_buf(fb, fl, (int)sizeof fb, s, n);               /* plain + inline */
+        }
     }
-    if (n >= 2 && (s[0]=='-'||s[0]=='*'||s[0]=='+') && s[1]==' ') {         /* bullet */
-        fputs("  \033[36m\xe2\x80\xa2\033[0m ", stdout); md_inline(s+2, n-2); return;
-    }
-    int d = 0; while (d < n && s[d]>='0' && s[d]<='9') d++;                  /* N. numbered */
-    if (d > 0 && d+1 < n && s[d]=='.' && s[d+1]==' ') {
-        fputs("  \033[36m", stdout); fwrite(s, 1, (size_t)(d+1), stdout); fputs("\033[0m ", stdout);
-        md_inline(s+d+2, n-(d+2)); return;
-    }
-    md_inline(s, n);                                                        /* plain + inline */
+#undef SAPP
+    dense_emit_wrapped(fb, fl, 1);   /* prose: word-wrap to the content width */
 }
 
 static void md_feed(md_state *m, const char *buf, int n) {
     for (int i = 0; i < n; i++) {
         char c = buf[i];
-        if (c == '\n') { md_emit_line(m, m->line, m->llen); putchar('\n'); m->llen = 0; }
+        if (c == '\n') { md_emit_line(m, m->line, m->llen); m->llen = 0; }
         else if (m->llen < (int)sizeof(m->line) - 1) m->line[m->llen++] = c;
     }
 }
@@ -26898,6 +26938,51 @@ static const char *dense_web_script_path(void) {
     return path[0] ? path : NULL;
 }
 
+/* Snapshot of the last write_file/edit_file change (old + new whole-file content), captured
+ * by dense_tool_exec BEFORE the file is overwritten so dense_tool_render can show a diff. */
+static char  g_tdiff_path[PATH_MAX] = "";
+static char *g_tdiff_old = NULL, *g_tdiff_new = NULL;
+
+static void dense_tool_diff_set(const char *path, const char *oldc, const char *newc) {
+    free(g_tdiff_old); free(g_tdiff_new);
+    snprintf(g_tdiff_path, sizeof g_tdiff_path, "%s", path ? path : "");
+    g_tdiff_old = strdup(oldc ? oldc : "");
+    g_tdiff_new = strdup(newc ? newc : "");
+}
+static void dense_tool_diff_capture(const char *path, const char *new_content) {
+    char *oldc = NULL;
+    FILE *f = fopen(path, "rb");
+    if (f) { fseek(f, 0, SEEK_END); long z = ftell(f); fseek(f, 0, SEEK_SET); if (z < 0) z = 0;
+             oldc = malloc((size_t)z + 1); size_t g = oldc ? fread(oldc, 1, (size_t)z, f) : 0; if (oldc) oldc[g] = '\0'; fclose(f); }
+    dense_tool_diff_set(path, oldc ? oldc : "", new_content);
+    free(oldc);
+}
+static void dense_tool_diff_clear(void) { free(g_tdiff_old); free(g_tdiff_new); g_tdiff_old = g_tdiff_new = NULL; g_tdiff_path[0] = '\0'; }
+
+/* Render a line diff old -> new (claude-code style): dim context, red '-' removals,
+ * green '+' additions, with the chat left margin. Common prefix/suffix lines are skipped. */
+static void dense_render_diff(const char *oldc, const char *newc) {
+    if (!oldc) oldc = ""; if (!newc) newc = "";
+    enum { MAXDL = 4096 };
+    const char *ol[MAXDL]; int oll[MAXDL]; int on = 0;
+    const char *nw[MAXDL]; int nwl[MAXDL]; int nn = 0;
+    for (const char *p = oldc; *p && on < MAXDL; ) { const char *e = strchr(p, '\n'); int L = e ? (int)(e - p) : (int)strlen(p); ol[on] = p; oll[on] = L; on++; if (!e) break; p = e + 1; }
+    for (const char *p = newc; *p && nn < MAXDL; ) { const char *e = strchr(p, '\n'); int L = e ? (int)(e - p) : (int)strlen(p); nw[nn] = p; nwl[nn] = L; nn++; if (!e) break; p = e + 1; }
+    int pre = 0; while (pre < on && pre < nn && oll[pre] == nwl[pre] && memcmp(ol[pre], nw[pre], (size_t)oll[pre]) == 0) pre++;
+    int suf = 0; while (suf < on - pre && suf < nn - pre && oll[on-1-suf] == nwl[nn-1-suf] && memcmp(ol[on-1-suf], nw[nn-1-suf], (size_t)oll[on-1-suf]) == 0) suf++;
+    char lb[8192]; int shown = 0; const int CAP = 60, CTX = 2;
+#define DLINE(fmt, L, S) do { int _l = snprintf(lb, sizeof lb, fmt, (L), (S)); if (_l >= (int)sizeof lb) _l = (int)sizeof lb - 1; dense_emit_wrapped(lb, _l, 0); } while (0)
+    int cstart = pre - CTX; if (cstart < 0) cstart = 0;
+    for (int i = cstart; i < pre && shown < CAP; i++)     { DLINE("\033[2m  %.*s\033[0m", oll[i], ol[i]); shown++; }
+    for (int i = pre; i < on - suf && shown < CAP; i++)   { DLINE("\033[31m- %.*s\033[0m", oll[i], ol[i]); shown++; }
+    for (int i = pre; i < nn - suf && shown < CAP; i++)   { DLINE("\033[32m+ %.*s\033[0m", nwl[i], nw[i]); shown++; }
+    int aend = on - suf + CTX; if (aend > on) aend = on;
+    for (int i = on - suf; i < aend && shown < CAP; i++)  { DLINE("\033[2m  %.*s\033[0m", oll[i], ol[i]); shown++; }
+#undef DLINE
+    if (pre >= on && pre >= nn) { const char *t = "\033[2m  (nessuna modifica)\033[0m"; dense_emit_wrapped(t, (int)strlen(t), 0); }
+    if (shown >= CAP) { const char *t = "\033[2m  … (diff troncato)\033[0m"; dense_emit_wrapped(t, (int)strlen(t), 0); }
+}
+
 /* Execute a tool by name with JSON arguments; append the result text to *out
  * (a growable buffer). Tools mirror Claude Code's Read/Write/Edit/Glob/Grep/Bash
  * plus web_fetch/web_search via Playwright. */
@@ -26934,6 +27019,7 @@ static void dense_tool_exec(const char *name, const char *args,
         if (!dense_json_str(args, "path", path, sizeof(path))) { dense_sbuf_append(out, out_len, out_cap, "error: missing path", 19); return; }
         char *content = malloc(65536); if (!content) return;
         if (!dense_json_str(args, "content", content, 65536)) content[0] = '\0';
+        dense_tool_diff_capture(path, content);   /* snapshot old (file) + new for the diff render */
         FILE *fp = fopen(path, "wb");
         if (!fp) { int n = snprintf(buf, sizeof(buf), "error: cannot write %s", path); dense_sbuf_append(out, out_len, out_cap, buf, (size_t)n); free(content); return; }
         size_t cl = strlen(content); fwrite(content, 1, cl, fp); fclose(fp); free(content);
@@ -26965,6 +27051,14 @@ static void dense_tool_exec(const char *name, const char *args,
                 fwrite(news, 1, nl, wf);
                 fwrite(hit + ol, 1, got - (size_t)(hit - fc) - ol, wf);
                 fclose(wf);
+                /* build the new whole-file content for the diff render (old = fc) */
+                size_t tail = got - (size_t)(hit - fc) - ol;
+                char *newfile = malloc((size_t)(hit - fc) + nl + tail + 1);
+                if (newfile) { size_t k = 0;
+                    memcpy(newfile + k, fc, (size_t)(hit - fc)); k += (size_t)(hit - fc);
+                    memcpy(newfile + k, news, nl); k += nl;
+                    memcpy(newfile + k, hit + ol, tail); k += tail; newfile[k] = '\0';
+                    dense_tool_diff_set(path, fc, newfile); free(newfile); }
                 int n = snprintf(buf, sizeof(buf), "edited %s (replaced first occurrence)", path);
                 dense_sbuf_append(out, out_len, out_cap, buf, (size_t)n);
             }
@@ -27022,30 +27116,36 @@ static int dense_term_width(void);   /* fwd: current terminal width (clamped) */
  * terminal width at render time, so previews adapt to the CURRENT terminal size. */
 static void dense_tool_render(const char *name, const char *args, const char *res, size_t rl) {
     const int tw = dense_term_width();
-    int maxw = tw - 2; if (maxw < 20) maxw = 20;   /* "│ " + line */
-    /* header: 🔧 name  (args dimmed, clipped to width) */
-    int argroom = maxw - (int)strlen(name) - 4; if (argroom < 4) argroom = 4;
-    printf("\n\033[1;36m\xf0\x9f\x94\xa7 %s\033[0m \033[2m%.*s\033[0m\n",
-           name, argroom, args ? args : "{}");
-    if (!res || rl == 0) { printf("\033[2m\xe2\x94\x82\033[0m \033[2m(nessun output)\033[0m\n"); fflush(stdout); return; }
+    int maxw = tw - 2 - 2*DENSE_MARGIN; if (maxw < 16) maxw = 16;   /* margin + "│ " + line */
+    /* header: (margin) 🔧 name  (args dimmed, clipped to width) */
+    char hdr[4096]; int argroom = maxw - (int)strlen(name) - 2; if (argroom < 4) argroom = 4;
+    int hl = snprintf(hdr, sizeof hdr, "\033[1;36m\xf0\x9f\x94\xa7 %s\033[0m \033[2m%.*s\033[0m", name, argroom, args ? args : "{}");
+    if (hl >= (int)sizeof hdr) hl = (int)sizeof hdr - 1;
+    putchar('\n'); dense_emit_wrapped(hdr, hl, 0);
+    /* write_file/edit_file: render the captured diff instead of the plain result */
+    if ((!strcmp(name, "write_file") || !strcmp(name, "edit_file")) && (g_tdiff_old || g_tdiff_new)) {
+        dense_render_diff(g_tdiff_old ? g_tdiff_old : "", g_tdiff_new ? g_tdiff_new : "");
+        dense_tool_diff_clear(); fflush(stdout); return;
+    }
+    if (!res || rl == 0) { const char *e = "\033[36m\xe2\x94\x82\033[0m \033[2m(nessun output)\033[0m"; dense_emit_wrapped(e, (int)strlen(e), 0); fflush(stdout); return; }
     int total = 0;
     for (size_t i = 0; i < rl; i++) if (res[i] == '\n') total++;
     if (rl > 0 && res[rl-1] != '\n') total++;
-    const int MAXL = 8;
-    const char *p = res; int shown = 0;
+    const int MAXL = 12;
+    const char *p = res; int shown = 0; char lb[8192];
     while (shown < MAXL && (size_t)(p - res) < rl) {
         const char *nl = memchr(p, '\n', rl - (size_t)(p - res));
         size_t len = nl ? (size_t)(nl - p) : rl - (size_t)(p - res);
         size_t clip = len > (size_t)maxw ? (size_t)maxw : len;
-        printf("\033[36m\xe2\x94\x82\033[0m ");          /* cyan left border */
-        fwrite(p, 1, clip, stdout);
-        if (clip < len) printf("\033[2m\xe2\x80\xa6\033[0m");
-        printf("\n");
+        int l = snprintf(lb, sizeof lb, "\033[36m\xe2\x94\x82\033[0m %.*s%s",
+                         (int)clip, p, clip < len ? "\033[2m\xe2\x80\xa6\033[0m" : "");
+        if (l >= (int)sizeof lb) l = (int)sizeof lb - 1;
+        dense_emit_wrapped(lb, l, 0);
         shown++;
         if (!nl) break;
         p = nl + 1;
     }
-    if (total > shown) printf("\033[36m\xe2\x94\x82\033[0m \033[2m\xe2\x80\xa6 +%d righe\033[0m\n", total - shown);
+    if (total > shown) { char t[80]; int l = snprintf(t, sizeof t, "\033[36m\xe2\x94\x82\033[0m \033[2m\xe2\x80\xa6 +%d righe\033[0m", total - shown); dense_emit_wrapped(t, l, 0); }
     fflush(stdout);
 }
 
@@ -27870,6 +27970,20 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         if (!line) { printf("\n"); break; }             /* EOF / Ctrl-D */
         size_t nr = strlen(line);   /* non-const: /read replaces line+nr */
         if (nr == 0) continue;
+        /* Slash autocomplete: Enter on a partial command expands the first word to the
+         * first matching command (the one highlighted in the live menu), keeping args. */
+        if (line[0] == '/') {
+            size_t wl = 0; while (line[wl] && line[wl] != ' ') wl++;
+            for (size_t i = 0; i < sizeof(DENSE_CMDS)/sizeof(DENSE_CMDS[0]); i++) {
+                if (strncasecmp(DENSE_CMDS[i].cmd, line, wl) != 0) continue;
+                if (strlen(DENSE_CMDS[i].cmd) != wl) {           /* not already complete */
+                    char *nl = malloc(strlen(DENSE_CMDS[i].cmd) + (nr - wl) + 1);
+                    if (nl) { strcpy(nl, DENSE_CMDS[i].cmd); strcat(nl, line + wl);
+                              linenoiseFree(line); line = nl; nr = strlen(line); }
+                }
+                break;                                           /* first match only */
+            }
+        }
         linenoiseHistoryAdd(line);
         linenoiseHistorySave(histpath);
         if (!strcmp(line, "/exit") || !strcmp(line, "/quit")) break;
