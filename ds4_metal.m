@@ -5083,11 +5083,9 @@ static bool q3n_moe_ffn(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d, const ds4_q
 int ds4_q3n_gpu_forward(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d,
                         int token, unsigned pos, float *logits) {
     @autoreleasepool {
-        /* embedding: dequant token_embd row `token` (Q4_K) and upload */
-        if (d->token_embd.type != 12) return 2;
+        /* embedding: dequant token_embd row `token` (any K-quant) and upload */
         const uint32_t ne = d->n_embd, nblk = ne/256u;
-        const uint8_t *row = (const uint8_t *)d->token_embd.data + (size_t)token*nblk*144u;
-        for (uint32_t b = 0; b < nblk; b++) ds4_q4k_dequant_block(row + (size_t)b*144u, g->embedscratch + b*256);
+        if (!ds4_dense_embed_row(d->token_embd.type, d->token_embd.data, (uint32_t)token, nblk, g->embedscratch)) return 2;
         ds4_gpu_tensor_write(g->x, 0, g->embedscratch, (uint64_t)ne*4);
 
         const bool dbg = getenv("DS4_Q3N_DBG") != NULL;
