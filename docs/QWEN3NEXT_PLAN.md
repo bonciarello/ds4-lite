@@ -1,9 +1,15 @@
 # qwen3_next support in ds4 — implementation plan
 
-Status: **planning + skeleton**. This documents how to bring the Qwen3-Next architecture
-(`general.architecture = "qwen3next"`, e.g. *Qwen3-Coder-Next*) to the ds4 Metal engine.
-A full, validated implementation is a multi-week effort; this plan breaks it into phases
-so the hard parts are isolated.
+Status: **✅ WORKING — forward validated greedy-identical to llama.cpp.**
+`./ds4 --metal-q3n-generate gguf/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf "The capital of
+France is" 12` → " Paris. The capital of Germany is Berlin. The capital of" — byte-identical
+to the oracle (`docs/qwen3next_oracle.txt`). The full hybrid forward (36 Gated-DeltaNet +
+12 full-attention layers, each + 512-expert MoE) runs on a 32 GB Mac at ~1 tok/s
+(correctness-first: quantized matvecs on GPU; DeltaNet recurrence + MoE routing on CPU;
+experts copied to GPU on demand). Remaining work is **speed** (move the recurrence + MoE
+to the already-validated GPU kernels; SSD-stream experts) and wiring into the /model chat.
+
+The sections below document the architecture + the phased path that got here.
 
 ## 1. What qwen3_next is
 
