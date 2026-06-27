@@ -200,6 +200,13 @@ llama-simple** ("1, 2, 3, 4, 5, 6, 7," → " 8, 9, 10, 11, 12, 13"); chat rispon
     residency. (gemma 16GB su 32GB → 16<19.2 → resident, comportamento invariato.)
 - **Limite noto**: il prefill gemma è token-by-token (no matmul batchato) → O(ctx²), lento su prompt
   lunghi (~10 t/s, TTFT 191s su 1942 token). Follow-up: aggiungere il prefill batchato gemma.
+- **Benchmark vs llama.cpp** (`tests/bench_vs_llama.sh [N_PREDICT] [GLOB]`): solo sui GGUF già
+  scaricati in `gguf/` (non scarica nulla), per ciascuno misura prefill/decode t/s + peak RSS in 3
+  config: **ds4 resident**, **ds4 streaming** (`DS4_DENSE_STREAM`), **llama.cpp** (`llama-bench`).
+  Salta i modelli non-dense (q3n/DeepSeek). Lo streaming è validato dal **calo del prefill t/s**
+  (pesi faultati dall'SSD, non pinnati); il decode è invariato (pagine in cache). Misure M1 Max 32GB:
+  decode ds4 ≈ **89% di llama.cpp** (gemma 10.6 vs 11.9; qwen2 39 vs 44), prefill più lento (gemma
+  10.8 vs 70 per il token-by-token; qwen2 201 vs 260), RSS leggermente inferiore a llama. Output: tabella + CSV.
 - Dettagli + status in [[gemma3-support]].
 
 ## Chat CLI (stile Claude Code) — `--metal-dense-chat`
