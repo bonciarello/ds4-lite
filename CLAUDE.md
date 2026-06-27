@@ -178,4 +178,19 @@ llama-simple** ("1, 2, 3, 4, 5, 6, 7," → " 8, 9, 10, 11, 12, 13"); chat rispon
   off-by-one OOB su `ds4_weights.layer[]` che corrompeva lo stack adiacente (il vocab in chat;
   il generate usa `desc->layers` su heap quindi sembrava ok). Alzato a 64 + guardia runtime in
   `config_build_dense_shape`. Riguardava ogni modello denso ≥62 layer.
+- **Ottimizzazioni RAM**:
+  - **KV cache sliding-window (ring buffer)**: i layer locali (52/62) cappano la cache a
+    `swa_window`=1024 slot e la riusano come ring (scrivi a `pos%cap`, attendi `[0, min(pos+1,cap))`;
+    la softmax è order-invariant e ogni K è già ropato alla sua pos assoluta). Solo i ~10 layer
+    globali tengono la cache piena. `dense_kv_cap()` + `g->swa_window/swa_pattern` in
+    `ds4_dense_gpu`. Riduzione KV ~3× a 4K ctx, ~5–6× a 32K–128K (es. 32K: 15.4→2.9 GiB).
+    Validato byte-corretto a 1942 token (ring in wrap). L'auto-context gemma conta solo i layer
+    globali (f16) → contesti molto più ampi (es. ~16K→128K+ su 32GB).
+  - **SSD streaming dei pesi**: se `model_size > 0.60×RAM`, `ds4_dense_gpu_create` salta il pin di
+    residency (`setenv DS4_METAL_NO_RESIDENCY`) → le pagine dei pesi mmap si caricano on-demand
+    dall'SSD (RAM wired minore, decode più lento) invece di andare in OOM. Override con
+    `DS4_DENSE_STREAM` / `DS4_DENSE_RESIDENT`. Il wrapping zero-copy è invariato; si gata solo la
+    residency. (gemma 16GB su 32GB → 16<19.2 → resident, comportamento invariato.)
+- **Limite noto**: il prefill gemma è token-by-token (no matmul batchato) → O(ctx²), lento su prompt
+  lunghi (~10 t/s, TTFT 191s su 1942 token). Follow-up: aggiungere il prefill batchato gemma.
 - Dettagli + status in [[gemma3-support]].

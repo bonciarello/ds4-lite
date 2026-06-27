@@ -4102,6 +4102,8 @@ typedef struct { ds4_gpu_tensor *k, *v; } ds4_dense_kv_layer;
 
 struct ds4_dense_gpu {
     uint32_t n_layer, n_embd, n_ff, qd, kvd, n_vocab, n_ctx;
+    uint32_t swa_window, swa_pattern;   /* gemma sliding window: local layers cap their KV
+                                         * cache at swa_window slots (ring buffer); 0 = off */
     ds4_gpu_tensor *x, *h, *h2, *q, *k, *v, *att, *o, *gate, *up, *act, *down, *logits;
     ds4_dense_kv_layer *kv;          /* [n_layer] */
     float *embedscratch;             /* n_embd */
@@ -4118,6 +4120,18 @@ struct ds4_dense_gpu {
      * the per-call alloc/free overhead is paid once. Sized DS4_VERIFY_MAX rows. */
     ds4_gpu_tensor *vXb, *vHb, *vOb, *vQb, *vattb, *vgateb, *vupb, *vactb, *vAllT;
 };
+
+/* Per-layer KV cache capacity (in slots). gemma sliding-window layers (every one
+ * except il%pattern==pattern-1) only ever need the last `window` keys, so they cap
+ * their cache at min(window, n_ctx) and reuse it as a ring buffer; global layers and
+ * all plain-dense layers use the full n_ctx. */
+static inline uint32_t dense_kv_cap(const ds4_dense_gpu *g, uint32_t il) {
+    if (g->swa_window == 0) return g->n_ctx;
+    const uint32_t pat = g->swa_pattern ? g->swa_pattern : 6u;
+    const bool is_global = (il % pat) == (pat - 1u);
+    if (is_global) return g->n_ctx;
+    return g->swa_window < g->n_ctx ? g->swa_window : g->n_ctx;
+}
 
 #define DS4_ATTN_SPLIT_MAX 64u   /* max KV splits for long-context attention */
 #define DS4_VERIFY_MAX     32u    /* max tokens for the pre-allocated verify path */
@@ -4264,10 +4278,26 @@ ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
     g->n_layer = d->n_layer; g->n_embd = d->n_embd; g->n_ff = d->n_ff;
     g->qd = d->n_head*d->head_dim; g->kvd = d->n_kv*d->head_dim;
     g->n_vocab = d->n_vocab; g->n_ctx = d->n_ctx;
+    g->swa_window = d->gemma ? d->swa_window : 0u;   /* sliding-window KV only for gemma */
+    g->swa_pattern = d->swa_pattern;
     g->wcache = [NSMutableDictionary dictionary];
     g->profile = getenv("DS4_DENSE_PROFILE") != NULL;
     g->model_base = d->model_base; g->model_size = d->model_size;
     if (!getenv("DS4_DENSE_NO_ZEROCOPY") && d->model_base && d->model_size) {
+        /* SSD streaming for big models: requesting GPU residency for the whole model
+         * pins it (~model_size of RAM). When the model is large relative to RAM, skip
+         * the residency pin so the OS faults the mmap'd weight pages from SSD on demand
+         * (lower wired RAM, slower decode). zero-copy weight wrapping is unchanged — only
+         * the residency request is gated. Force on/off with DS4_DENSE_STREAM /
+         * DS4_DENSE_RESIDENT. Default threshold: model > 0.60 x RAM. */
+        uint64_t hwram = 0; { size_t rl = sizeof hwram; if (sysctlbyname("hw.memsize", &hwram, &rl, NULL, 0) != 0) hwram = 16ull<<30; }
+        const bool stream = !getenv("DS4_DENSE_RESIDENT") &&
+                            (getenv("DS4_DENSE_STREAM") || (double)d->model_size > 0.60 * (double)hwram);
+        if (stream) {
+            setenv("DS4_METAL_NO_RESIDENCY", "1", 1);   /* ds4_gpu_map_model_views skips requestResidency */
+            fprintf(stderr, "ds4: dense model %.1f GiB vs %.1f GiB RAM — SSD streaming (no residency pin; slower decode)\n",
+                    (double)d->model_size/(1024.0*1024*1024), (double)hwram/(1024.0*1024*1024));
+        }
         /* Map the whole model as overlapping shared buffers; overlap is sized to
          * the largest weight so no single tensor straddles a view boundary. */
         uint64_t maxw = 0;
@@ -4296,8 +4326,9 @@ ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
     g->act=ds4_gpu_tensor_alloc((uint64_t)g->n_ff*4); g->logits=ds4_gpu_tensor_alloc((uint64_t)g->n_vocab*4);
     g->kv = calloc(d->n_layer, sizeof(g->kv[0]));
     for (uint32_t il = 0; il < d->n_layer; il++) {
-        g->kv[il].k = ds4_gpu_tensor_alloc((uint64_t)g->n_ctx*g->kvd*2);  /* f16 KV cache */
-        g->kv[il].v = ds4_gpu_tensor_alloc((uint64_t)g->n_ctx*g->kvd*2);
+        const uint64_t cap = dense_kv_cap(g, il);   /* sliding layers cap at swa_window slots */
+        g->kv[il].k = ds4_gpu_tensor_alloc(cap*g->kvd*2);  /* f16 KV cache */
+        g->kv[il].v = ds4_gpu_tensor_alloc(cap*g->kvd*2);
     }
     /* split-KV attention partials: [n_head, S_max] and [n_head, S_max, head_dim] */
     g->pm   = ds4_gpu_tensor_alloc((uint64_t)d->n_head*DS4_ATTN_SPLIT_MAX*4);
@@ -4815,7 +4846,7 @@ static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d
         const uint32_t kvd=g->kvd, nrot=d->n_rot;
         const float eps=d->rms_eps;
         const float scale = d->attn_scale > 0.0f ? d->attn_scale : 1.0f/sqrtf((float)hd);
-        const uint32_t window = d->swa_window, pattern = d->swa_pattern ? d->swa_pattern : 6u;
+        const uint32_t pattern = d->swa_pattern ? d->swa_pattern : 6u;
 
         /* embedding row: dequant token_embd[token] (Q6_K=14 or Q4_K=12), scale ×sqrt(ne). */
         const uint32_t nblk = ne/256u;
@@ -4843,15 +4874,19 @@ static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d
             const bool is_global = (il % pattern) == (pattern - 1u);
             const float rbase  = is_global ? d->rope_base : d->rope_base_local;
             const float rscale = is_global ? d->rope_scale : d->rope_scale_local;
-            /* sliding window: local layers attend only to the last `window` keys, a
-             * contiguous slice of the cache (positions are appended in order). */
-            uint32_t kv_start = 0u, n_attn = n_keys;
-            if (!is_global && window && n_keys > window) { kv_start = n_keys - window; n_attn = window; }
+            /* Ring KV: sliding (local) layers cap their cache at `cap` slots, write the
+             * current key/value at slot pos%cap (overwriting the oldest), and attend the
+             * last min(pos+1, cap) keys at [0, n_attn). Softmax is order-invariant over
+             * keys and gemma roped each K at its absolute position before caching, so the
+             * physical (ring) order of the kept window does not matter. */
+            const uint32_t cap = dense_kv_cap(g, il);
+            const uint32_t wslot = pos % cap;
+            const uint32_t n_attn = (n_keys < cap) ? n_keys : cap;
 
-            ds4_gpu_tensor *kslot = ds4_gpu_tensor_view(kv->k, (uint64_t)pos*kvd*2, (uint64_t)kvd*2);
-            ds4_gpu_tensor *vslot = ds4_gpu_tensor_view(kv->v, (uint64_t)pos*kvd*2, (uint64_t)kvd*2);
-            ds4_gpu_tensor *kc = ds4_gpu_tensor_view(kv->k, (uint64_t)kv_start*kvd*2, (uint64_t)n_attn*kvd*2);
-            ds4_gpu_tensor *vc = ds4_gpu_tensor_view(kv->v, (uint64_t)kv_start*kvd*2, (uint64_t)n_attn*kvd*2);
+            ds4_gpu_tensor *kslot = ds4_gpu_tensor_view(kv->k, (uint64_t)wslot*kvd*2, (uint64_t)kvd*2);
+            ds4_gpu_tensor *vslot = ds4_gpu_tensor_view(kv->v, (uint64_t)wslot*kvd*2, (uint64_t)kvd*2);
+            ds4_gpu_tensor *kc = ds4_gpu_tensor_view(kv->k, 0, (uint64_t)n_attn*kvd*2);
+            ds4_gpu_tensor *vc = ds4_gpu_tensor_view(kv->v, 0, (uint64_t)n_attn*kvd*2);
             ok = kslot && vslot && kc && vc
               && gemma_rms(g, g->h, g->x, &L->attn_norm, ne, eps)
               && dense_matvec(g, &L->attn_q, g->h, g->q)

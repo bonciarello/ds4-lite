@@ -27565,6 +27565,15 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         uint32_t n_full = 0; for (uint32_t i = 0; i < DS4_N_LAYER; i++) if (ds4_q3n_layer_is_full_attn(i)) n_full++;
         n_ctx = ds4_auto_context(DS4_ROPE_ORIG_CTX, (uint64_t)n_full * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 4ull,
                                  (uint64_t)model.size, true, "qwen3_next");
+    } else if (is_gemma) {
+        /* gemma sliding window: only the global layers (il%6==5) keep a growing KV; the
+         * local layers are fixed at swa_window slots, so the per-token KV budget counts
+         * only the global layers (f16). This lets gemma reach far larger contexts. */
+        const uint32_t pat = 6u;   /* gemma global-attention interval */
+        uint32_t n_global = 0; for (uint32_t i = 0; i < DS4_N_LAYER; i++) if ((i % pat) == (pat - 1u)) n_global++;
+        if (n_global == 0) n_global = DS4_N_LAYER;   /* defensive */
+        n_ctx = ds4_auto_context(DS4_ROPE_ORIG_CTX, (uint64_t)n_global * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2ull,
+                                 (uint64_t)model.size, false, "gemma");
     } else
         n_ctx = ds4_auto_context(DS4_ROPE_ORIG_CTX, (uint64_t)DS4_N_LAYER * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 4ull,
                                  (uint64_t)model.size, false, "dense");
