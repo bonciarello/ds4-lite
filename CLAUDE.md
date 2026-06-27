@@ -209,6 +209,33 @@ llama-simple** ("1, 2, 3, 4, 5, 6, 7," → " 8, 9, 10, 11, 12, 13"); chat rispon
   10.8 vs 70 per il token-by-token; qwen2 201 vs 260), RSS leggermente inferiore a llama. Output: tabella + CSV.
 - Dettagli + status in [[gemma3-support]].
 
+## qwen3_next (MoE) — streaming esperti e carico RAM
+
+Il modello `Qwen3-Next-80B-A3B` (~48 GiB su disco, ~3B attivi: 6/512 esperti per layer per
+token) gira su 32 GB via `./ds4 --metal-q3n-generate <gguf> "..." N`. Driver `ds4_q3n_gpu_*`
+(non l'engine DeepSeek): copia/streamma gli esperti on-demand.
+
+- **Cap della cache esperti (lever RAM)** — `DS4_Q3N_EXPERT_CACHE_GIB=N`: gli esperti routati
+  passano da `q3n_cached_expert` (LRU O(1) su `NSMutableOrderedSet`); `q3n_prune_experts` libera
+  i più freddi dopo ogni layer MoE (esperto condiviso + pesi densi restano pinnati). Con il cap
+  attivo gli esperti vengono letti con **pread direttamente nel buffer GPU** (non memcpy dal mmap)
+  + prefetch **F_RDADVISE**. Default (env non settata) = illimitato = comportamento originale,
+  byte-identico.
+- **Metrica RAM corretta = "peak memory footprint" di `/usr/bin/time -l`** (= `phys_footprint`,
+  memoria privata NON riciclabile), **NON `ps -o rss`**. La ps-rss conta anche le pagine *clean*
+  file-backed (mmap/UBC, ~26.7 GiB qui, costanti) che il kernel ricicla per prime sotto pressione:
+  sovrastima enormemente il carico q3n ed è insensibile al cap. Il footprint **scala col cap**
+  (M1 Max, N=8): illimitato 7.37 / cap4 5.56 / cap2 3.57 / cap1 2.57 GiB ≈ base(~1.6)+cap. pread
+  è anche **più veloce** del baseline mmap (cap4 4.27 vs 3.25 t/s).
+- **Perché serve pread**: copiare dal mmap faulta le pagine dell'esperto nella RSS e su macOS quelle
+  pagine file-backed NON sono evictabili (`madvise DONTNEED` è un no-op per loro — stesso muro del
+  fallito "Via 2" denso). pread le tiene fuori dal footprint del processo (vanno nella buffer cache
+  riciclabile). Questo riquadra anche il denso: i pesi densi sono copie GPU private → lì
+  footprint≈rss≈dimensione modello (irriducibile); gli esperti MoE inattivi sono cache riciclabile
+  → il footprint reale del MoE è una frazione del modello.
+- **Benchmark**: `tests/bench_q3n_cache.sh [N] [MODEL]` fa lo sweep del cap e riporta footprint vs
+  maxRSS (+ t/s). Dettagli/stato in [[qwen3next-impl]].
+
 ## Chat CLI (stile Claude Code) — `--metal-dense-chat`
 
 La chat interattiva (`ds4_dense_chat`, condivisa da dense + gemma + q3n) replica le
