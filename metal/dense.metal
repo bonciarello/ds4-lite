@@ -2165,10 +2165,13 @@ kernel void kernel_dense_attn_decode_split_gqa_f32(
     const uint group = a.n_head / a.n_kv;
     const uint hd = a.head_dim, kvdim = a.n_kv * hd;
     const uint ndl = (hd + 31u) / 32u;       // <= 4 (head_dim <= 128)
-    float qreg[8][4], acc[8][4], m[8], l[8];
+    /* output accumulator in threadgroup memory (frees ~32 regs/lane -> less spilling); each
+     * lane owns dims d = lane + 32*j, so no cross-lane race and no barrier in the hot loop. */
+    threadgroup float acc[8][128];
+    float qreg[8][4], m[8], l[8];
     for (uint g = 0; g < group; g++) {
         device const float * qh = q + (hkv*group + g)*hd;
-        for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; qreg[g][j] = (d < hd) ? qh[d] : 0.0f; acc[g][j] = 0.0f; }
+        for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; qreg[g][j] = (d < hd) ? qh[d] : 0.0f; acc[g][d] = 0.0f; }
         m[g] = -INFINITY; l[g] = 0.0f;
     }
     const uint t0 = sp * a.chunk; uint t1 = t0 + a.chunk; if (t1 > a.n_ctx) t1 = a.n_ctx;
@@ -2184,7 +2187,7 @@ kernel void kernel_dense_attn_decode_split_gqa_f32(
             const float mn = max(m[g], s);
             const float corr = exp(m[g] - mn), pe = exp(s - mn);
             l[g] = l[g]*corr + pe;
-            for (uint j = 0; j < ndl; j++) acc[g][j] = acc[g][j]*corr + pe*vreg[j];
+            for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; acc[g][d] = acc[g][d]*corr + pe*vreg[j]; }
             m[g] = mn;
         }
     }
@@ -2192,7 +2195,7 @@ kernel void kernel_dense_attn_decode_split_gqa_f32(
         const uint base = (hkv*group + g)*a.n_split + sp;
         if (lane == 0) { pm[base] = m[g]; pl[base] = l[g]; }
         device float * po = pacc + (ulong)base*hd;
-        for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) po[d] = acc[g][j]; }
+        for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) po[d] = acc[g][d]; }
     }
 }
 
