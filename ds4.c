@@ -26250,6 +26250,7 @@ static void build_q3n_desc(ds4_q3n_model_desc *desc, const ds4_model *model,
     desc->dn_conv_kernel = g_ds4_shape.ssm_conv_kernel;            /* 4 */
     desc->dn_conv_dim   = desc->dn_key_dim * 2u + desc->dn_value_dim;  /* 8192 */
     desc->model_base = model->map; desc->model_size = model->size;
+    desc->model_fd   = model->fd;
     desc->token_embd  = dense_wdesc_of(model, weights->token_embd);
     desc->output_norm = dense_wdesc_of(model, weights->output_norm);
     desc->output      = dense_wdesc_of(model, weights->output);

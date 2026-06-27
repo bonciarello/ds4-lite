@@ -4525,6 +4525,18 @@ struct ds4_q3n_gpu {
     NSMutableDictionary<NSNumber *, NSValue *> *wcache;
     const void *model_base; uint64_t model_size;
     bool zerocopy;                   /* model map registered -> wrap weights instead of copying */
+    /* Bounded LRU for routed-expert buffers (DS4_Q3N_EXPERT_CACHE_GIB). The wcache never
+     * evicts, so for the 80B every touched expert accumulates as a real GPU copy → RSS
+     * grows with tokens. When a budget is set, routed experts are tracked here and the
+     * least-recently-used ones are freed after each MoE layer to cap RAM (re-copied on a
+     * later miss). 0 = unbounded (original behavior). Shared expert + dense weights stay
+     * pinned in wcache. */
+    NSMutableOrderedSet<NSNumber *> *elru;       /* expert keys, index 0 = LRU (O(1) move/evict) */
+    NSMutableDictionary<NSNumber *, NSNumber *> *ebytes;  /* key -> bytes */
+    uint64_t ecache_bytes, ecache_budget;
+    uint64_t ehits, emisses, eevicts;
+    int model_fd;                 /* model file descriptor */
+    bool expert_pread;            /* stream experts via pread (no mmap RSS) instead of mmap-copy */
     /* DeltaNet recurrent state, HOST arrays (the linear-attn recurrence runs on the CPU
      * for correctness-first; only the 4 quantized projections are matvec'd on GPU). */
     float **conv_state;              /* [n_layer] conv window [(K-1)*conv_dim], NULL for full-attn */
@@ -4533,15 +4545,10 @@ struct ds4_q3n_gpu {
     ds4_gpu_tensor *dn_in;           /* GPU input buffer for the ssm_out matvec (value_dim) */
 };
 
-static ds4_gpu_tensor *q3n_cached_weight(ds4_q3n_gpu *g, const void *data, uint64_t bytes) {
-    if (!data || !bytes) return NULL;
-    NSNumber *key = @((unsigned long long)(uintptr_t)data);
-    NSValue *v = g->wcache[key];
-    if (v) return (ds4_gpu_tensor *)[v pointerValue];
+/* Load a weight into a GPU buffer: wrap the mmap range zero-copy when the model map is
+ * registered (GPU faults pages on access), else copy it to a fresh GPU allocation. */
+static ds4_gpu_tensor *q3n_load_weight_buffer(ds4_q3n_gpu *g, const void *data, uint64_t bytes) {
     ds4_gpu_tensor *buf = NULL;
-    /* Zero-copy: wrap the mmap-backed weight as a GPU buffer (no expert copies / no GPU-memory
-     * duplication; the GPU faults the pages on access). ONLY when the model map registered
-     * (g->zerocopy) — otherwise every wrap would fail + spam; just copy. Falls back to a copy. */
     if (g->zerocopy && g->model_base && data >= g->model_base && (const char *)data + bytes <= (const char *)g->model_base + g->model_size) {
         const uint64_t offset = (uint64_t)((const char *)data - (const char *)g->model_base);
         uint64_t inner = 0;
@@ -4549,15 +4556,100 @@ static ds4_gpu_tensor *q3n_cached_weight(ds4_q3n_gpu *g, const void *data, uint6
         if (wb) buf = ds4_gpu_tensor_wrap_buffer(wb, inner, bytes);
     }
     if (!buf) { buf = ds4_gpu_tensor_alloc(bytes); if (buf) ds4_gpu_tensor_write(buf, 0, data, bytes); }
+    return buf;
+}
+
+/* Pinned weight cache (never evicted): dense/attention/norm/shared-expert weights. */
+static ds4_gpu_tensor *q3n_cached_weight(ds4_q3n_gpu *g, const void *data, uint64_t bytes) {
+    if (!data || !bytes) return NULL;
+    NSNumber *key = @((unsigned long long)(uintptr_t)data);
+    NSValue *v = g->wcache[key];
+    if (v) return (ds4_gpu_tensor *)[v pointerValue];
+    ds4_gpu_tensor *buf = q3n_load_weight_buffer(g, data, bytes);
     if (!buf) return NULL;
     g->wcache[key] = [NSValue valueWithPointer:buf];
     return buf;
 }
 
-/* matvec out = dequant(W) . x, dispatching on the weight's GGML type (reuses the dense
- * K-quant kernels). W->dim0 = in_dim, W->dim1 = out_dim. */
-static bool q3n_matvec(ds4_q3n_gpu *g, const ds4_dense_wdesc *W, ds4_gpu_tensor *x, ds4_gpu_tensor *out) {
-    ds4_gpu_tensor *Wb = q3n_cached_weight(g, W->data, W->bytes);
+/* Stream an expert straight from the file into a fresh GPU buffer with pread, bypassing the
+ * mmap entirely. Why: copying from the mmap faults the expert's pages into the PROCESS RSS,
+ * and on macOS those file-backed pages can't be evicted (madvise DONTNEED is a no-op for
+ * them) — so every touched expert sticks in RSS forever. pread lands the bytes in the kernel
+ * buffer cache (system-wide, NOT charged to the process) + directly into the GPU buffer's
+ * unified-memory contents, so freeing that GPU buffer actually returns the RAM. */
+static ds4_gpu_tensor *q3n_pread_expert(ds4_q3n_gpu *g, const void *data, uint64_t bytes) {
+    ds4_gpu_tensor *buf = ds4_gpu_tensor_alloc(bytes);
+    if (!buf) return NULL;
+    void *dst = ds4_gpu_tensor_contents(buf);
+    if (!dst) { ds4_gpu_tensor_free(buf); return NULL; }
+    const off_t off = (off_t)((const char *)data - (const char *)g->model_base);
+    size_t got = 0;
+    while (got < bytes) {
+        const ssize_t r = pread(g->model_fd, (char *)dst + got, (size_t)(bytes - got), off + (off_t)got);
+        if (r <= 0) { ds4_gpu_tensor_free(buf); return NULL; }
+        got += (size_t)r;
+    }
+    return buf;
+}
+
+/* Routed-expert cache: same store as wcache but tracked in an LRU so q3n_prune_experts
+ * can free the cold ones when DS4_Q3N_EXPERT_CACHE_GIB is set. Unbounded budget → behaves
+ * exactly like q3n_cached_weight (no tracking overhead). */
+static ds4_gpu_tensor *q3n_cached_expert(ds4_q3n_gpu *g, const void *data, uint64_t bytes) {
+    if (!data || !bytes) return NULL;
+    if (g->ecache_budget == 0) return q3n_cached_weight(g, data, bytes);
+    NSNumber *key = @((unsigned long long)(uintptr_t)data);
+    NSValue *v = g->wcache[key];
+    if (v) {                                   /* hit: move to MRU (ordered-set remove+add is O(1)) */
+        [g->elru removeObject:key];
+        [g->elru addObject:key];
+        g->ehits++;
+        return (ds4_gpu_tensor *)[v pointerValue];
+    }
+    ds4_gpu_tensor *buf = g->expert_pread ? q3n_pread_expert(g, data, bytes)   /* miss: load + track */
+                                          : q3n_load_weight_buffer(g, data, bytes);
+    if (!buf) return NULL;
+    g->wcache[key] = [NSValue valueWithPointer:buf];
+    g->ebytes[key] = @(bytes);
+    [g->elru addObject:key];
+    g->ecache_bytes += bytes;
+    g->emisses++;
+    return buf;
+}
+
+/* Free the least-recently-used routed experts until the cache fits the byte budget. Safe
+ * to call only when no command buffer references the freed buffers (between MoE layers,
+ * after their commit+wait). */
+static void q3n_prune_experts(ds4_q3n_gpu *g) {
+    if (g->ecache_budget == 0) return;
+    const uintptr_t pg = 16384;   /* page size on Apple silicon */
+    while (g->ecache_bytes > g->ecache_budget && g->elru.count > 0) {
+        NSNumber *key = g->elru[0];
+        [g->elru removeObjectAtIndex:0];
+        NSValue *v = g->wcache[key];
+        if (v) { ds4_gpu_tensor_free((ds4_gpu_tensor *)[v pointerValue]); [g->wcache removeObjectForKey:key]; }
+        NSNumber *b = g->ebytes[key];
+        const uint64_t nb = b ? [b unsignedLongLongValue] : 0;
+        if (b) { g->ecache_bytes -= nb; [g->ebytes removeObjectForKey:key]; }
+        /* Freeing the GPU copy alone leaves the expert's mmap pages page-cached (they were
+         * faulted in to be copied) — that page cache, not the GPU copy, dominates RSS. These
+         * are plain MAP_PRIVATE file pages (NOT GPU-wrapped/wired like the dense path), so
+         * MADV_DONTNEED actually drops them; re-faulted from SSD on a later miss. Align inward
+         * so a boundary page shared with a still-cached neighbour is left alone. */
+#if defined(POSIX_MADV_DONTNEED)
+        if (nb && !g->zerocopy) {
+            const uintptr_t a = (uintptr_t)[key unsignedLongLongValue];
+            const uintptr_t s = (a + pg - 1) & ~(pg - 1), e = (a + nb) & ~(pg - 1);
+            if (e > s) posix_madvise((void *)s, (size_t)(e - s), POSIX_MADV_DONTNEED);
+        }
+#endif
+        g->eevicts++;
+    }
+}
+
+/* matvec out = dequant(W) . x on an already-resolved GPU weight buffer, dispatching on the
+ * GGML type (reuses the dense K-quant kernels). W->dim0 = in_dim, W->dim1 = out_dim. */
+static bool q3n_matvec_buf(ds4_q3n_gpu *g, ds4_gpu_tensor *Wb, const ds4_dense_wdesc *W, ds4_gpu_tensor *x, ds4_gpu_tensor *out) {
     if (!Wb) return false;
     struct __attribute__((packed)) { uint32_t in_dim, out_dim; } qa = { W->dim0, W->dim1 };
     ds4_gpu_tensor *bufs[3] = { Wb, x, out };
@@ -4567,6 +4659,16 @@ static bool q3n_matvec(ds4_q3n_gpu *g, const ds4_dense_wdesc *W, ds4_gpu_tensor 
     if (kernel) return ds4_gpu_run_simple(kernel, &qa, sizeof(qa), bufs, 3, W->dim1, "q3n matvec");
     if (W->type == 0) return ds4_gpu_dense_matvec_f32(out, Wb, x, W->dim0, W->dim1, g->hostscratch, "q3n matvec f32");
     return false;
+}
+
+/* Pinned-weight matvec (dense/attention/norm/shared expert). */
+static bool q3n_matvec(ds4_q3n_gpu *g, const ds4_dense_wdesc *W, ds4_gpu_tensor *x, ds4_gpu_tensor *out) {
+    return q3n_matvec_buf(g, q3n_cached_weight(g, W->data, W->bytes), W, x, out);
+}
+
+/* Routed-expert matvec (LRU-tracked, evictable under DS4_Q3N_EXPERT_CACHE_GIB). */
+static bool q3n_matvec_expert(ds4_q3n_gpu *g, const ds4_dense_wdesc *W, ds4_gpu_tensor *x, ds4_gpu_tensor *out) {
+    return q3n_matvec_buf(g, q3n_cached_expert(g, W->data, W->bytes), W, x, out);
 }
 
 static bool q3n_rms(ds4_q3n_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *x, const ds4_dense_wdesc *norm, uint32_t n, float eps) {
@@ -4586,6 +4688,15 @@ ds4_q3n_gpu *ds4_q3n_gpu_create(const ds4_q3n_model_desc *d) {
     g->n_ctx = d->n_ctx; g->n_head = d->n_head; g->n_kv = d->n_kv; g->head_dim = d->head_dim;
     g->model_base = d->model_base; g->model_size = d->model_size;
     g->wcache = [NSMutableDictionary dictionary];
+    g->elru = [NSMutableOrderedSet orderedSet];
+    g->ebytes = [NSMutableDictionary dictionary];
+    g->model_fd = d->model_fd;
+    g->ecache_budget = 0;   /* unbounded by default (original behavior) */
+    { const char *e = getenv("DS4_Q3N_EXPERT_CACHE_GIB");
+      if (e && atof(e) > 0) {
+        g->ecache_budget = (uint64_t)(atof(e) * (double)(1ull<<30));
+        fprintf(stderr, "ds4: qwen3_next routed-expert cache capped at %.1f GiB (LRU eviction)\n", atof(e));
+      } }
     /* Zero-copy weight wrapping needs the model map registered, which makes the whole model
      * resident on the GPU — for qwen3_next (45GB > GPU memory) that OOMs after a ~30s warmup.
      * So only register it when the model comfortably fits (smaller future q3n variants); for
@@ -4599,6 +4710,10 @@ ds4_q3n_gpu *ds4_q3n_gpu_create(const ds4_q3n_model_desc *d) {
         g->zerocopy = false;
     }
     fprintf(stderr, "ds4: qwen3_next weights %s\n", g->zerocopy ? "zero-copy (mmap-wrapped)" : "copied to GPU on demand");
+    /* When the routed-expert cache is bounded and we're copying (not wrapping), stream experts
+     * via pread so their bytes never enter the process RSS (the eviction then truly frees RAM). */
+    g->expert_pread = (g->ecache_budget != 0 && !g->zerocopy && g->model_fd >= 0);
+    if (g->expert_pread) fprintf(stderr, "ds4: qwen3_next experts streamed via pread (mmap-free, evictable)\n");
     const uint32_t qd = d->n_head*d->head_dim, kvd = d->n_kv*d->head_dim;
     g->x = ds4_gpu_tensor_alloc((uint64_t)d->n_embd*4);
     g->h = ds4_gpu_tensor_alloc((uint64_t)d->n_embd*4);
@@ -4664,8 +4779,13 @@ void ds4_q3n_gpu_free(ds4_q3n_gpu *g) {
     free(g->conv_state); free(g->ssm_state);
     ds4_gpu_tensor_free(g->dn_in); free(g->dn_host);
     free(g->embedscratch); free(g->hostscratch);
+    if (g->ecache_budget && (g->ehits || g->emisses))
+        fprintf(stderr, "ds4: qwen3_next expert cache: %llu hits, %llu misses (%.0f%% hit), %llu evictions, %.1f GiB resident\n",
+                (unsigned long long)g->ehits, (unsigned long long)g->emisses,
+                100.0*(double)g->ehits/(double)(g->ehits+g->emisses), (unsigned long long)g->eevicts,
+                (double)g->ecache_bytes/(double)(1ull<<30));
     for (NSNumber *key in g->wcache) ds4_gpu_tensor_free((ds4_gpu_tensor *)[g->wcache[key] pointerValue]);
-    g->wcache = nil;
+    g->wcache = nil; g->elru = nil; g->ebytes = nil;
     free(g);
 }
 
@@ -4852,14 +4972,28 @@ static bool q3n_moe_ffn(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d, const ds4_q
     for (uint32_t i=0;i<nused;i++) selw[i]/=(float)wsum;
     /* prefetch: kick off parallel disk reads for ALL selected experts' weights before the
      * matvec loop faults them one at a time (the model is 45GB > RAM, so experts stream
-     * from SSD; WILLNEED lets the NVMe queue serve them concurrently). */
-#if defined(POSIX_MADV_WILLNEED)
+     * from SSD; serving the NVMe queue concurrently hides latency). In pread mode use
+     * F_RDADVISE (reads into the buffer cache, NOT the process RSS) — a mmap WILLNEED here
+     * would fault the very pages pread mode exists to keep out of RSS. */
     { const uint64_t gb = L->ffn_gate_exps.bytes/nexp, ub = L->ffn_up_exps.bytes/nexp, db = L->ffn_down_exps.bytes/nexp;
       for (uint32_t i=0;i<nused;i++){ const uint32_t e=sel[i];
-        posix_madvise((void*)((const char*)L->ffn_gate_exps.data + (size_t)e*gb), gb, POSIX_MADV_WILLNEED);
-        posix_madvise((void*)((const char*)L->ffn_up_exps.data   + (size_t)e*ub), ub, POSIX_MADV_WILLNEED);
-        posix_madvise((void*)((const char*)L->ffn_down_exps.data + (size_t)e*db), db, POSIX_MADV_WILLNEED); } }
+        const void *gp=(const char*)L->ffn_gate_exps.data+(size_t)e*gb;
+        const void *up=(const char*)L->ffn_up_exps.data  +(size_t)e*ub;
+        const void *dp=(const char*)L->ffn_down_exps.data+(size_t)e*db;
+        if (g->expert_pread) {
+            struct radvisory ra;
+            ra.ra_offset=(off_t)((const char*)gp-(const char*)g->model_base); ra.ra_count=(int)gb; fcntl(g->model_fd,F_RDADVISE,&ra);
+            ra.ra_offset=(off_t)((const char*)up-(const char*)g->model_base); ra.ra_count=(int)ub; fcntl(g->model_fd,F_RDADVISE,&ra);
+            ra.ra_offset=(off_t)((const char*)dp-(const char*)g->model_base); ra.ra_count=(int)db; fcntl(g->model_fd,F_RDADVISE,&ra);
+        }
+#if defined(POSIX_MADV_WILLNEED)
+        else {
+            posix_madvise((void*)gp, gb, POSIX_MADV_WILLNEED);
+            posix_madvise((void*)up, ub, POSIX_MADV_WILLNEED);
+            posix_madvise((void*)dp, db, POSIX_MADV_WILLNEED);
+        }
 #endif
+      } }
     /* shared-expert sigmoid gate = sigmoid(w_f16 . h), w = ffn_gate_inp_shexp [n_embd] f16 */
     float sg = 0.0f;
     if (L->ffn_up_shexp.data) {
@@ -4877,12 +5011,12 @@ static bool q3n_moe_ffn(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d, const ds4_q
         ds4_dense_wdesc wg=q3n_expert_slice(&L->ffn_gate_exps, e, nexp, ne, nff);
         ds4_dense_wdesc wu=q3n_expert_slice(&L->ffn_up_exps,   e, nexp, ne, nff);
         ds4_dense_wdesc wd=q3n_expert_slice(&L->ffn_down_exps, e, nexp, nff, ne);
-        ok = q3n_matvec(g,&wg,g->h,g->moe_gate) && q3n_matvec(g,&wu,g->h,g->moe_up)
+        ok = q3n_matvec_expert(g,&wg,g->h,g->moe_gate) && q3n_matvec_expert(g,&wu,g->h,g->moe_up)
           && dense_swiglu(g->moe_act, g->moe_gate, g->moe_up, nff)
-          && q3n_matvec(g,&wd,g->moe_act,g->moe_down)
+          && q3n_matvec_expert(g,&wd,g->moe_act,g->moe_down)
           && q3n_axpy(g->moe_acc, g->moe_down, selw[i], ne);
     }
-    if (ok && L->ffn_up_shexp.data) {                       /* shared expert */
+    if (ok && L->ffn_up_shexp.data) {                       /* shared expert (used every token → pinned) */
         ok = q3n_matvec(g,&L->ffn_gate_shexp,g->h,g->moe_gate) && q3n_matvec(g,&L->ffn_up_shexp,g->h,g->moe_up)
           && dense_swiglu(g->moe_act, g->moe_gate, g->moe_up, nff)
           && q3n_matvec(g,&L->ffn_down_shexp,g->moe_act,g->moe_down)
@@ -4890,6 +5024,9 @@ static bool q3n_moe_ffn(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d, const ds4_q
     }
     ok = ok && dense_add(g->x, g->moe_acc, ne);
     if (batch) { const int ended = ds4_gpu_end_commands(); g_batch_serialize = false; if (!ended) ok = false; }
+    /* This layer's command buffer has committed+waited → its expert buffers are no longer
+     * referenced by the GPU; safe to free the cold ones to cap RAM. */
+    q3n_prune_experts(g);
     return ok;
 }
 

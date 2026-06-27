@@ -253,6 +253,7 @@ typedef struct {
     ds4_q3n_layer_desc   *layers;     /* [n_layer] */
     const void           *model_base; /* mmap base */
     unsigned long long    model_size;
+    int                   model_fd;   /* open model fd (for pread-streaming experts; -1 if none) */
 } ds4_q3n_model_desc;
 
 typedef struct ds4_q3n_gpu ds4_q3n_gpu;
