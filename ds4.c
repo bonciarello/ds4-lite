@@ -27193,33 +27193,55 @@ static int ds4_q3n_chat(const char *model_path, const char *system, int ctx_size
     if (!g) { if (errlen) snprintf(err, errlen, "qwen3_next GPU create failed"); free(desc.layers); vocab_free(&vocab); model_close(&model); return 1; }
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     const char *sys = (system && system[0]) ? system : "You are a helpful assistant.";
-    printf("\n\033[1mds4 · Qwen3-Next-80B-A3B\033[0m \033[2m(EXPERIMENTAL ~1 tok/s · ctx %u · /exit to quit)\033[0m\n\n", n_ctx);
     uint32_t pos = 0; int rc = 0; bool first = true;
-    char *line = xmalloc(65536);
+
+    /* same box UI as the dense chat: startup banner + boxed input with a live context bar. */
+    char init_log[128]; snprintf(init_log, sizeof init_log,
+        "qwen3_next EXPERIMENTAL · 48 layers (12 full-attn, 36 DeltaNet) · 512 experts top-%u · ~1-3 tok/s",
+        (unsigned)g_ds4_shape.n_expert_used);
+    dense_print_banner(model_path, n_ctx, NULL, init_log);
+    char histpath[PATH_MAX];
+    { const char *home = getenv("HOME"); if (!home || !home[0]) home = ".";
+      snprintf(histpath, sizeof histpath, "%s/.ds4_q3n_chat_history", home); }
+    linenoiseHistorySetMaxLen(512); linenoiseHistoryLoad(histpath);
+    if (isatty(STDIN_FILENO) && pipe(g_winch_pipe) == 0) {
+        fcntl(g_winch_pipe[0], F_SETFL, O_NONBLOCK); fcntl(g_winch_pipe[1], F_SETFL, O_NONBLOCK);
+        struct sigaction sa; memset(&sa, 0, sizeof sa);
+        sa.sa_handler = dense_winch_handler; sigemptyset(&sa.sa_mask); sigaction(SIGWINCH, &sa, NULL);
+    }
+    char *line = NULL;
     while (rc == 0) {
-        printf("\033[1m›\033[0m "); fflush(stdout);
-        if (!fgets(line, 65536, stdin)) break;
-        size_t L = strlen(line); while (L && (line[L-1] == '\n' || line[L-1] == '\r')) line[--L] = '\0';
-        if (L == 0) continue;
+        linenoiseFree(line);
+        line = dense_readline("> ", model_path, n_ctx, NULL, init_log, pos);
+        if (!line) { printf("\n"); break; }
+        if (line[0] == '\0') continue;
         if (!strcmp(line, "/exit") || !strcmp(line, "/quit")) break;
+        linenoiseHistoryAdd(line); linenoiseHistorySave(histpath);
         token_vec t = {0};
         if (first) { dense_chat_append_block(&t, &vocab, im_start, im_end, "system", sys); first = false; }
         dense_chat_append_block(&t, &vocab, im_start, im_end, "user", line);
         token_vec_push(&t, im_start);
         bpe_tokenize_text(&vocab, "assistant\n", &t);
+        /* loading spinner while we prefill, until the first token streams */
+        pthread_t spin; int spin_on = 0;
+        if (isatty(STDOUT_FILENO)) {
+            printf("\r\033[36m⠋\033[0m \033[2mthinking…\033[0m\033[K"); fflush(stdout);
+            g_spin_run = 1;
+            if (pthread_create(&spin, NULL, dense_spinner_thread, NULL) == 0) spin_on = 1; else g_spin_run = 0;
+        }
         for (uint32_t i = 0; i < (uint32_t)t.len && pos < n_ctx - 1u && rc == 0; i++)
             if (ds4_q3n_gpu_forward(g, &desc, t.v[i], pos++, logits) != 0) rc = 1;
         token_vec_free(&t);
-        printf("\033[36m");
+        if (spin_on) { g_spin_run = 0; pthread_join(spin, NULL); }
+        printf("\r\033[K\033[36m");                         /* clear spinner, color the reply */
         while (rc == 0 && pos < n_ctx - 1u) {
             int next = sample_argmax(logits, DS4_N_VOCAB);
             if (next == im_end || next == vocab.eos_id) break;
             dense_print_token(&vocab, next); fflush(stdout);
             if (ds4_q3n_gpu_forward(g, &desc, next, pos++, logits) != 0) { rc = 1; break; }
         }
-        printf("\033[0m\n\n");
-        /* close the assistant turn in the context (im_end + newline) */
-        if (rc == 0 && pos < n_ctx - 1u) {
+        printf("\033[0m\n");
+        if (rc == 0 && pos < n_ctx - 1u) {                  /* close the assistant turn (im_end + \n) */
             token_vec e = {0}; token_vec_push(&e, im_end); bpe_tokenize_text(&vocab, "\n", &e);
             for (uint32_t i = 0; i < (uint32_t)e.len && pos < n_ctx - 1u && rc == 0; i++)
                 if (ds4_q3n_gpu_forward(g, &desc, e.v[i], pos++, logits) != 0) rc = 1;
@@ -27227,7 +27249,9 @@ static int ds4_q3n_chat(const char *model_path, const char *system, int ctx_size
         }
         if (pos >= n_ctx - 2u) { printf("\033[2m(context full — restart to continue)\033[0m\n"); break; }
     }
-    free(line); free(logits); ds4_q3n_gpu_free(g); free(desc.layers);
+    linenoiseFree(line);
+    if (g_winch_pipe[0] >= 0) { close(g_winch_pipe[0]); close(g_winch_pipe[1]); g_winch_pipe[0] = g_winch_pipe[1] = -1; }
+    free(logits); ds4_q3n_gpu_free(g); free(desc.layers);
     vocab_free(&vocab); model_close(&model);
     return rc;
 }
