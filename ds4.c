@@ -27216,8 +27216,9 @@ static int ds4_q3n_chat(const char *model_path, const char *system, int ctx_size
         const uint64_t kv_per_tok = (uint64_t)n_full * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 4ull;  /* f16 K+V */
         uint64_t ram = 0; size_t rlen = sizeof ram;
         if (sysctlbyname("hw.memsize", &ram, &rlen, NULL, 0) != 0 || ram == 0) ram = 16ull << 30;
-        /* DS4_CTX_EXTEND=N allows up to N× the native context (RoPE-scaled in build_q3n_desc). */
-        uint64_t extend = 1; { const char *e = getenv("DS4_CTX_EXTEND"); if (e && atol(e) > 1) extend = (uint64_t)atol(e); }
+        /* Auto-extend up to 4× native by default (RoPE-scaled in build_q3n_desc); RAM bounds
+         * it. DS4_CTX_EXTEND=N overrides (1 = cap at native). */
+        uint64_t extend = 4; { const char *e = getenv("DS4_CTX_EXTEND"); if (e && atol(e) >= 1) extend = (uint64_t)atol(e); }
         const uint64_t max_ctx = native * extend;
         uint64_t c = kv_per_tok ? (ram / 10ull) / kv_per_tok : max_ctx;
         if (c > max_ctx) c = max_ctx;
@@ -27349,10 +27350,12 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         const uint64_t overhead = 1024ull << 20;
         const uint64_t model_sz = (uint64_t)model.size;
         const uint64_t avail    = (budget > model_sz + overhead) ? budget - model_sz - overhead : 0;
-        /* DS4_CTX_EXTEND=N lets the auto context grow up to N× the model's native context
-         * (RAM permitting), via RoPE NTK scaling in dense_build_desc. Default 1 = cap at
-         * native. Beyond ~native, quality degrades (the model never trained that far). */
-        uint64_t extend = 1; { const char *e = getenv("DS4_CTX_EXTEND"); if (e && atol(e) > 1) extend = (uint64_t)atol(e); }
+        /* Auto-extend the context beyond the model's native length, sized by RAM, via RoPE
+         * NTK scaling (in dense_build_desc). By default we allow up to 4× native (where NTK
+         * holds well) — so small models still get large contexts automatically. RAM is the
+         * real bound (avail/kv_per_tok). DS4_CTX_EXTEND=N overrides the multiple (1 = no
+         * extension/cap at native; higher pushes further toward the RAM limit). */
+        uint64_t extend = 4; { const char *e = getenv("DS4_CTX_EXTEND"); if (e && atol(e) >= 1) extend = (uint64_t)atol(e); }
         const uint64_t max_ctx = native * extend;
         uint64_t c = kv_per_tok ? avail / kv_per_tok : max_ctx;
         if (c > max_ctx) c = max_ctx;               /* RAM- and extension-bounded */
