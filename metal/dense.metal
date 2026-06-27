@@ -1807,6 +1807,105 @@ kernel void kernel_dense_attn_decode_f32_sg(
 }
 
 // ===========================================================================
+// Gemma-3 kernels. Isolated variants of the dense building blocks for the
+// gemma3 quirks: RMSNorm with (1 + w) weights, per-head QK-norm, GeGLU (gelu
+// tanh approximation) instead of SwiGLU, and NEOX RoPE with a linear freq_scale
+// (global layers use freq_scale 0.125; local/sliding layers use 1.0). These do
+// not touch the validated dense/q3n kernels above.
+// ===========================================================================
+
+// Gemma RMSNorm: out[i] = x[i]/rms(x) * (1 + w[i]). One threadgroup of 128.
+// Dispatch: grid=(1,1,1) tpg=(128,1,1).
+kernel void kernel_gemma_rms_norm_f32_sg(
+        constant ds4_dense_rmsnorm_args & a [[buffer(0)]],
+        device const float * x   [[buffer(1)]],
+        device const float * w   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint   tid   [[thread_position_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint nt = 128u;
+    threadgroup float sdata[4];
+    float ss = 0.0f;
+    for (uint i = tid; i < a.n; i += nt) ss += x[i]*x[i];
+    ss = simd_sum(ss);
+    if (tiisg == 0) sdata[sgitg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (uint s = 0; s < nt/32u; s++) tot += sdata[s];
+        sdata[0] = tot;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float scale = 1.0f / sqrt(sdata[0] / (float)a.n + a.eps);
+    /* gemma norm weights already include the +1 (baked in at GGUF conversion), so
+     * multiply by w directly. */
+    for (uint i = tid; i < a.n; i += nt) out[i] = x[i]*scale*w[i];
+}
+
+// Gemma per-head QK RMSNorm: x is [n_head * head_dim], normed over each head's
+// head_dim slice, scaled by the shared (1 + w[d]) (w is [head_dim]). In place.
+// Dispatch: grid=(n_head,1,1) tpg=(32,1,1) — one simdgroup per head.
+struct ds4_gemma_qknorm_args { uint n_head; uint head_dim; float eps; };
+kernel void kernel_gemma_qk_norm_f32(
+        constant ds4_gemma_qknorm_args & a [[buffer(0)]],
+        device       float * x [[buffer(1)]],
+        device const float * w [[buffer(2)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]]) {
+    const uint h = tgpig.x;
+    if (h >= a.n_head) return;
+    device float * xh = x + h * a.head_dim;
+    float ss = 0.0f;
+    for (uint d = lane; d < a.head_dim; d += 32u) ss += xh[d]*xh[d];
+    ss = simd_sum(ss);
+    const float scale = 1.0f / sqrt(ss / (float)a.head_dim + a.eps);
+    /* gemma q/k-norm weights already include the +1 (baked in at conversion). */
+    for (uint d = lane; d < a.head_dim; d += 32u) xh[d] = xh[d]*scale*w[d];
+}
+
+// GeGLU: out[i] = gelu_tanh(gate[i]) * up[i]. gelu_tanh(v) =
+// 0.5 v (1 + tanh(sqrt(2/pi)(v + 0.044715 v^3))). One thread per element.
+kernel void kernel_gemma_geglu_f32(
+        constant uint & n [[buffer(0)]],
+        device const float * gate [[buffer(1)]],
+        device const float * up   [[buffer(2)]],
+        device       float * out  [[buffer(3)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    const float v = gate[gid];
+    /* Clamp the tanh argument: Metal's fast-math tanh overflows (exp(arg) -> inf ->
+     * inf/inf = NaN) for large gate values, but tanh saturates to ±1 well before
+     * |arg|=15, which is the correct GELU limit (GELU(x) -> x for large +x). */
+    float arg = 0.7978845608028654f * (v + 0.044715f * v*v*v);
+    arg = clamp(arg, -15.0f, 15.0f);
+    const float g = 0.5f * v * (1.0f + tanh(arg));
+    out[gid] = g * up[gid];
+}
+
+// Gemma NEOX RoPE with a linear freq_scale: theta = pos * freq_scale * freq.
+struct ds4_gemma_rope_args { uint n_head; uint head_dim; uint n_rot; uint pos; float freq_base; float freq_scale; };
+kernel void kernel_gemma_rope_neox_f32(
+        constant ds4_gemma_rope_args & a [[buffer(0)]],
+        device float * x [[buffer(1)]],
+        uint gid [[thread_position_in_grid]]) {
+    const uint rot_half = a.n_rot / 2u;
+    const uint total = a.n_head * rot_half;
+    if (gid >= total) return;
+    const uint h = gid / rot_half;
+    const uint i = gid % rot_half;
+    device float * head = x + h * a.head_dim;
+    const float freq  = pow(a.freq_base, -2.0f * (float)i / (float)a.n_rot);
+    const float theta = (float)a.pos * a.freq_scale * freq;
+    const float c = cos(theta);
+    const float s = sin(theta);
+    const float x0 = head[i];
+    const float x1 = head[i + rot_half];
+    head[i]            = x0 * c - x1 * s;
+    head[i + rot_half] = x0 * s + x1 * c;
+}
+
+// ===========================================================================
 // Batched-prefill kernels (process M tokens at once). The matmuls use
 // kernel_mul_mm (q4_K/q6_K); these cover the elementwise + attention parts.
 // ===========================================================================

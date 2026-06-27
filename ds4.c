@@ -118,7 +118,7 @@ static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
  */
 
 enum {
-    DS4_MAX_LAYER            = 61,
+    DS4_MAX_LAYER            = 64,   /* DeepSeek Pro=61; gemma-3-27b=62 -> 64 with headroom */
     DS4_MAX_EMBD             = 7168,
     DS4_MAX_VOCAB            = 129280,
     DS4_MAX_HEAD             = 128,
@@ -155,6 +155,7 @@ typedef enum {
     DS4_ARCH_DEEPSEEK  = 0,  /* MLA + MoE + indexer + hash-compression */
     DS4_ARCH_DENSE     = 1,  /* standard attention + dense SwiGLU FFN  */
     DS4_ARCH_QWEN3NEXT = 2,  /* hybrid Gated-DeltaNet linear-attn + MoE (see docs/QWEN3NEXT_PLAN.md) */
+    DS4_ARCH_GEMMA3    = 3,  /* dense transformer + gemma quirks: 4 norms/layer, QK-norm, GeGLU, sliding-window */
 } ds4_arch_family;
 
 typedef struct {
@@ -376,6 +377,7 @@ static int g_ds4_lock_fd = -1;
  * because call sites are introduced incrementally (Fase 2+). */
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_deepseek(void) { return DS4_ARCH == DS4_ARCH_DEEPSEEK; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_qwen3next(void) { return DS4_ARCH == DS4_ARCH_QWEN3NEXT; }
+DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma3(void) { return DS4_ARCH == DS4_ARCH_GEMMA3; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_moe(void)     { return DS4_N_EXPERT != 0; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_mla(void)     { return DS4_N_LORA_Q != 0; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_indexer(void) { return DS4_N_INDEXER_HEAD != 0; }
@@ -3159,9 +3161,14 @@ typedef struct {
     ds4_tensor *q3n_a;           /* blk.%u.ssm_a     — [n_v_heads] */
     ds4_tensor *q3n_ssm_norm;    /* blk.%u.ssm_norm  — RMSNorm over head_v_dim */
     ds4_tensor *q3n_out_proj;    /* blk.%u.ssm_out   — [value_dim, n_embd] */
-    ds4_tensor *attn_q_norm;     /* blk.%u.attn_q_norm — full-attn per-head q RMSNorm */
-    ds4_tensor *attn_k_norm;     /* blk.%u.attn_k_norm — full-attn per-head k RMSNorm */
+    ds4_tensor *attn_q_norm;     /* blk.%u.attn_q_norm — full-attn per-head q RMSNorm (q3n + gemma3) */
+    ds4_tensor *attn_k_norm;     /* blk.%u.attn_k_norm — full-attn per-head k RMSNorm (q3n + gemma3) */
     ds4_tensor *ffn_gate_inp_shexp; /* blk.%u.ffn_gate_inp_shexp — shared-expert sigmoid gate */
+    /* gemma3 extra norms: post_attention_norm (after attn_out, before residual) and
+     * post_ffw_norm (after ffn_down, before residual). attn_norm/ffn_norm above are the
+     * pre-attention / pre-feedforward norms. */
+    ds4_tensor *attn_post_norm;  /* blk.%u.post_attention_norm */
+    ds4_tensor *ffn_post_norm;   /* blk.%u.post_ffw_norm */
 } ds4_layer_weights;
 
 typedef struct {
@@ -4062,6 +4069,8 @@ static void config_build_dense_shape(const ds4_model *m, const char *ns) {
 
     /* Required core dimensions. */
     s.n_layer   = required_u32_ns(m, ns, "block_count");
+    if (s.n_layer > DS4_MAX_LAYER)
+        ds4_die("model has more layers than DS4_MAX_LAYER (raise the limit)");
     s.n_embd    = required_u32_ns(m, ns, "embedding_length");
     s.n_head    = required_u32_ns(m, ns, "attention.head_count");
     s.n_head_kv = required_u32_ns(m, ns, "attention.head_count_kv");
@@ -4166,6 +4175,20 @@ static void config_build_qwen3next_shape(const ds4_model *m) {
     g_ds4_shape = s;
 }
 
+/* gemma3 (general.architecture == "gemma3"): a dense transformer with gemma quirks
+ * (4 norms/layer, per-head QK-norm, GeGLU, sliding-window attention on 5/6 layers).
+ * Reuse the dense shape reader (head_dim = key_length = 128, vocab from tokenizer,
+ * rope.freq_base = 1e6 global base) then mark the arch + sliding window. The gemma
+ * forward variant + per-layer rope base/scale are set in dense_build_desc. */
+static void config_build_gemma3_shape(const ds4_model *m) {
+    config_build_dense_shape(m, "gemma3");
+    g_ds4_shape.arch = DS4_ARCH_GEMMA3;
+    g_ds4_shape.name = "Gemma 3";
+    uint32_t swa = 0;
+    model_get_u32_ns(m, "gemma3", "attention.sliding_window", &swa);
+    g_ds4_shape.n_swa = swa ? swa : 1024u;
+}
+
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
 static void config_validate_model(const ds4_model *m) {
@@ -4184,6 +4207,10 @@ static void config_validate_model(const ds4_model *m) {
     }
     if (ds4_str_eq_cstr(arch, "qwen3next")) {        /* hybrid Gated-DeltaNet + MoE */
         config_build_qwen3next_shape(m);
+        return;
+    }
+    if (ds4_str_eq_cstr(arch, "gemma3")) {           /* dense + gemma quirks (runs the dense driver) */
+        config_build_gemma3_shape(m);
         return;
     }
 
@@ -4438,6 +4465,13 @@ static void weights_bind_layer_dense(ds4_layer_weights *l, const ds4_model *m, u
     l->ffn_gate    = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
     l->ffn_up      = required_tensorf(m, "blk.%u.ffn_up.weight", il);
     l->ffn_down    = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+    /* gemma3 extra norms: per-head QK-norm + post-attention/post-ffn norms. */
+    if (ds4_arch_is_gemma3()) {
+        l->attn_q_norm    = tensor_by_namef(m, "blk.%u.attn_q_norm.weight", il);
+        l->attn_k_norm    = tensor_by_namef(m, "blk.%u.attn_k_norm.weight", il);
+        l->attn_post_norm = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);
+        l->ffn_post_norm  = required_tensorf(m, "blk.%u.post_ffw_norm.weight", il);
+    }
 }
 
 static void weights_bind_dense(ds4_weights *w, const ds4_model *m, bool load_slice,
@@ -22468,6 +22502,7 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
 typedef enum {
     DS4_PRETOK_JOYAI = 0,   /* DeepSeek V4 ("joyai-llm") */
     DS4_PRETOK_QWEN2 = 1,   /* Qwen2/GPT-2 byte-level split */
+    DS4_PRETOK_SPM   = 2,   /* SentencePiece (llama/gemma): score-driven merge, no BPE merges */
 } ds4_pretok;
 
 struct ds4_vocab {
@@ -22475,6 +22510,7 @@ struct ds4_vocab {
     int n_vocab;
     int bos_id;
     int eos_id;
+    int unk_id;             /* SPM byte-fallback fallback token (-1 if none) */
     int user_id;
     int assistant_id;
     int think_start_id;
@@ -22483,6 +22519,7 @@ struct ds4_vocab {
     ds4_pretok pre_type;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
+    float *scores;          /* SPM merge scores [n_vocab] (NULL for BPE vocabs) */
 };
 
 struct ds4_engine {
@@ -22927,9 +22964,83 @@ static void qwen2_tokenize_text(const ds4_vocab *vocab, const char *text, token_
     }
 }
 
+/* Emit one final SPM symbol: its token if present, else byte-fallback (<0xXX>),
+ * else the unk token. */
+static void spm_emit_symbol(const ds4_vocab *vocab, const char *ptr, uint32_t n, token_vec *out) {
+    int id = -1;
+    if (table_get(&vocab->token_to_id, ptr, n, &id)) { token_vec_push(out, id); return; }
+    for (uint32_t i = 0; i < n; i++) {
+        char bt[8];
+        snprintf(bt, sizeof bt, "<0x%02X>", (unsigned char)ptr[i]);
+        int bid = -1;
+        if (table_get(&vocab->token_to_id, bt, strlen(bt), &bid)) token_vec_push(out, bid);
+        else if (vocab->unk_id >= 0) token_vec_push(out, vocab->unk_id);
+    }
+}
+
+/* SentencePiece (llama SPM) tokenizer. Spaces become ▁ (U+2581); the text is split
+ * into UTF-8 symbols, then adjacent symbols are greedily merged — at each step the
+ * adjacent pair whose concatenation is a vocab token with the highest score is
+ * merged (ties to the leftmost) — until no merge applies. Final symbols are emitted
+ * (byte-fallback if absent). Bytes never move, so adjacent symbols stay contiguous
+ * and a merged symbol's text is just the slice spanning both. O(n^2); fine for
+ * prompts. Matches llama.cpp's llm_tokenizer_spm. */
+static void spm_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    const size_t len = strlen(text);
+    char *buf = xmalloc(len * 3 + 1);   /* each ' ' -> 3 bytes (▁) worst case */
+    size_t bn = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (text[i] == ' ') { buf[bn++] = (char)0xE2; buf[bn++] = (char)0x96; buf[bn++] = (char)0x81; }
+        else buf[bn++] = text[i];
+    }
+    buf[bn] = 0;
+    if (bn == 0) { free(buf); return; }
+
+    typedef struct { int prev, next; const char *ptr; uint32_t n; } spm_sym;
+    spm_sym *sym = xmalloc(sizeof(spm_sym) * (bn + 1));
+    int nsym = 0;
+    for (uint64_t p = 0; p < bn; ) {
+        const uint64_t q = next_utf8_char(buf, bn, p);
+        sym[nsym].ptr  = buf + p;
+        sym[nsym].n    = (uint32_t)(q - p);
+        sym[nsym].prev = nsym - 1;
+        sym[nsym].next = (q < bn) ? nsym + 1 : -1;
+        nsym++;
+        p = q;
+    }
+
+    for (;;) {
+        int best_left = -1; float best_score = -1e30f; uint32_t best_n = 0;
+        for (int i = 0; i != -1; i = sym[i].next) {
+            const int j = sym[i].next;
+            if (j == -1) break;
+            const uint32_t mn = sym[i].n + sym[j].n;   /* contiguous slice */
+            int id = -1;
+            if (table_get(&vocab->token_to_id, sym[i].ptr, mn, &id) &&
+                vocab->scores && id >= 0 && id < vocab->n_vocab) {
+                const float sc = vocab->scores[id];
+                if (sc > best_score) { best_score = sc; best_left = i; best_n = mn; }
+            }
+        }
+        if (best_left == -1) break;
+        const int j = sym[best_left].next;
+        sym[best_left].n    = best_n;
+        sym[best_left].next = sym[j].next;
+        if (sym[j].next != -1) sym[sym[j].next].prev = best_left;
+    }
+
+    for (int i = 0; i != -1; i = sym[i].next)
+        spm_emit_symbol(vocab, sym[i].ptr, sym[i].n, out);
+    free(sym); free(buf);
+}
+
 /* JoyAI/DeepSeek pre-tokenization.  The split shape matters: different pieces
  * lead to different BPE merges even when the final text bytes are identical. */
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    if (vocab->pre_type == DS4_PRETOK_SPM) {
+        spm_tokenize_text(vocab, text, out);
+        return;
+    }
     if (vocab->pre_type == DS4_PRETOK_QWEN2) {
         qwen2_tokenize_text(vocab, text, out);
         return;
@@ -23024,18 +23135,20 @@ static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
+    vocab->unk_id = -1;
 
     ds4_array_ref tokens;
-    ds4_array_ref merges;
     if (!model_get_array(model, "tokenizer.ggml.tokens", &tokens) ||
         tokens.type != GGUF_VALUE_STRING ||
         tokens.len > INT32_MAX) {
         ds4_die("GGUF tokenizer token table is missing or invalid");
     }
-    if (!model_get_array(model, "tokenizer.ggml.merges", &merges) ||
-        merges.type != GGUF_VALUE_STRING) {
-        ds4_die("GGUF tokenizer merge table is missing or invalid");
-    }
+
+    /* Tokenizer model: "llama" => SentencePiece (scores, no BPE merges); "gpt2"/
+     * "joyai-llm" => byte-level BPE (merges). gemma3 uses SPM. */
+    ds4_str tmodel = {0};
+    model_get_string(model, "tokenizer.ggml.model", &tmodel);
+    const bool is_spm = ds4_str_eq_cstr(tmodel, "llama");
 
     vocab->n_vocab = (int)tokens.len;
     vocab->token = xcalloc((size_t)vocab->n_vocab, sizeof(vocab->token[0]));
@@ -23047,21 +23160,40 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->token_to_id, vocab->token[i], i);
     }
 
-    table_init(&vocab->merge_rank, merges.len);
-    c = cursor_at(model, merges.data_pos);
-    for (uint64_t i = 0; i < merges.len; i++) {
-        ds4_str merge;
-        if (!cursor_string(&c, &merge)) ds4_die(c.error);
-        table_put(&vocab->merge_rank, merge, (int)i);
-    }
-
-    /* Pre-tokenizer family from GGUF. Dense models (Qwen2) declare "qwen2";
-     * DeepSeek V4 declares "joyai-llm". Default to JOYAI for back-compat. */
-    ds4_str pre = {0};
-    vocab->pre_type = DS4_PRETOK_JOYAI;
-    if (model_get_string(model, "tokenizer.ggml.pre", &pre) &&
-        ds4_str_eq_cstr(pre, "qwen2")) {
-        vocab->pre_type = DS4_PRETOK_QWEN2;
+    if (is_spm) {
+        /* SPM: load the per-token merge scores; no BPE merge table. */
+        ds4_array_ref scores;
+        if (!model_get_array(model, "tokenizer.ggml.scores", &scores) ||
+            scores.type != GGUF_VALUE_FLOAT32 || scores.len != (uint64_t)vocab->n_vocab) {
+            ds4_die("SPM tokenizer is missing a valid tokenizer.ggml.scores array");
+        }
+        vocab->scores = xmalloc(sizeof(float) * (size_t)vocab->n_vocab);
+        ds4_cursor sc = cursor_at(model, scores.data_pos);
+        for (int i = 0; i < vocab->n_vocab; i++)
+            if (!cursor_read(&sc, &vocab->scores[i], 4)) ds4_die("SPM scores truncated");
+        table_init(&vocab->merge_rank, 1);   /* unused; keep a valid empty table */
+        vocab->pre_type = DS4_PRETOK_SPM;
+    } else {
+        ds4_array_ref merges;
+        if (!model_get_array(model, "tokenizer.ggml.merges", &merges) ||
+            merges.type != GGUF_VALUE_STRING) {
+            ds4_die("GGUF tokenizer merge table is missing or invalid");
+        }
+        table_init(&vocab->merge_rank, merges.len);
+        c = cursor_at(model, merges.data_pos);
+        for (uint64_t i = 0; i < merges.len; i++) {
+            ds4_str merge;
+            if (!cursor_string(&c, &merge)) ds4_die(c.error);
+            table_put(&vocab->merge_rank, merge, (int)i);
+        }
+        /* Pre-tokenizer family from GGUF. Dense models (Qwen2) declare "qwen2";
+         * DeepSeek V4 declares "joyai-llm". Default to JOYAI for back-compat. */
+        ds4_str pre = {0};
+        vocab->pre_type = DS4_PRETOK_JOYAI;
+        if (model_get_string(model, "tokenizer.ggml.pre", &pre) &&
+            ds4_str_eq_cstr(pre, "qwen2")) {
+            vocab->pre_type = DS4_PRETOK_QWEN2;
+        }
     }
 
     if (vocab->pre_type == DS4_PRETOK_JOYAI) {
@@ -23074,13 +23206,20 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->think_end_id = vocab_lookup(vocab, "</think>");
         vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
     } else {
-        /* Qwen2 (and other dense families): take bos/eos from metadata ids; the
-         * DeepSeek-specific markers do not exist, so leave them at -1. */
-        uint32_t bos = 0, eos = 0;
+        /* Qwen2/gemma and other dense families: take bos/eos/unk from metadata ids;
+         * the DeepSeek-specific markers do not exist, so leave them at -1. */
+        uint32_t bos = 0, eos = 0, unk = 0;
         vocab->bos_id = model_get_u32(model, "tokenizer.ggml.bos_token_id", &bos) ? (int)bos : -1;
         vocab->eos_id = model_get_u32(model, "tokenizer.ggml.eos_token_id", &eos) ? (int)eos : -1;
+        vocab->unk_id = model_get_u32(model, "tokenizer.ggml.unknown_token_id", &unk) ? (int)unk : -1;
+        /* Turn markers: Qwen2 uses <|im_start/end|>; gemma uses <start_of_turn> (turn
+         * start, == user_id role) and <end_of_turn> (turn end, == im_end stop token). */
         vocab->user_id        = vocab_lookup_optional(vocab, "<|im_start|>");
         vocab->assistant_id   = vocab_lookup_optional(vocab, "<|im_end|>");
+        if (vocab->user_id < 0) {
+            vocab->user_id      = vocab_lookup_optional(vocab, "<start_of_turn>");
+            vocab->assistant_id = vocab_lookup_optional(vocab, "<end_of_turn>");
+        }
         vocab->think_start_id = -1;
         vocab->think_end_id   = -1;
         vocab->dsml_id        = -1;
@@ -23089,6 +23228,7 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
 
 static void vocab_free(ds4_vocab *vocab) {
     free(vocab->token);
+    free(vocab->scores);
     table_free(&vocab->token_to_id);
     table_free(&vocab->merge_rank);
     memset(vocab, 0, sizeof(*vocab));
@@ -25918,7 +26058,8 @@ int ds4_model_is_dense(const char *path) {
     ds4_str arch = {0};
     model_get_string(&m, "general.architecture", &arch);
     const char *ns = NULL;
-    const int dense = ds4_dense_arch_supported(arch, &ns) ? 1 : 0;
+    const int dense = (ds4_dense_arch_supported(arch, &ns) ||
+                       ds4_str_eq_cstr(arch, "gemma3")) ? 1 : 0;
     model_close(&m);
     return dense;
 }
@@ -25934,9 +26075,30 @@ static ds4_dense_wdesc dense_wdesc_of(const ds4_model *m, const ds4_tensor *t) {
     return w;
 }
 
+static int ds4_hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
 static void dense_print_token(const ds4_vocab *vocab, int token) {
     if (token < 0 || token >= vocab->n_vocab) return;
     ds4_str s = vocab->token[token];
+    if (vocab->pre_type == DS4_PRETOK_SPM) {
+        /* SPM tokens are raw UTF-8: ▁ (U+2581) is a space, and <0xXX> are byte
+         * fallbacks. Everything else prints verbatim (no GPT-2 byte remap). */
+        if (s.len == 6 && s.ptr[0] == '<' && s.ptr[1] == '0' && s.ptr[2] == 'x' && s.ptr[5] == '>') {
+            int hi = ds4_hex_digit(s.ptr[3]), lo = ds4_hex_digit(s.ptr[4]);
+            if (hi >= 0 && lo >= 0) { putchar(hi * 16 + lo); return; }
+        }
+        for (uint64_t i = 0; i < s.len; ) {
+            if (i + 2 < s.len && (uint8_t)s.ptr[i] == 0xE2 && (uint8_t)s.ptr[i+1] == 0x96 && (uint8_t)s.ptr[i+2] == 0x81) {
+                putchar(' '); i += 3;
+            } else { putchar((unsigned char)s.ptr[i]); i++; }
+        }
+        return;
+    }
     uint64_t pos = 0;
     while (pos < s.len) {
         uint32_t cp = utf8_decode_one(s.ptr, s.len, &pos);
@@ -25955,11 +26117,29 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
     desc->n_head = DS4_N_HEAD; desc->n_kv = DS4_N_HEAD_KV; desc->head_dim = DS4_N_HEAD_DIM;
     desc->n_vocab = DS4_N_VOCAB; desc->n_rot = DS4_N_ROT; desc->n_ctx = n_ctx;
     desc->rms_eps = DS4_RMS_EPS; desc->rope_base = DS4_ROPE_FREQ_BASE;
+    desc->rope_scale = 1.0f;   /* plain dense: no linear RoPE freq_scale */
+    /* gemma3: dense transformer with gemma quirks. Embedding scaling, attention
+     * scale on query_pre_attn_scalar (= n_embd/n_head for the 27B), GeGLU, per-head
+     * QK-norm, 4 norms/layer, and sliding-window attention with a separate RoPE base
+     * (10000, freq_scale 1.0) on local layers vs the global base (1e6, freq_scale
+     * 0.125). See config_build_gemma3_shape. */
+    const bool gemma = ds4_arch_is_gemma3();
+    if (gemma) {
+        desc->gemma            = 1;
+        desc->embed_scale      = sqrtf((float)DS4_N_EMBD);
+        desc->attn_scale       = 1.0f / sqrtf((float)DS4_N_EMBD / (float)DS4_N_HEAD);
+        desc->rope_scale       = 0.125f;     /* global linear freq_scale (rope_scale_factor 8) */
+        desc->rope_base_local  = 10000.0f;
+        desc->rope_scale_local = 1.0f;
+        desc->swa_window       = g_ds4_shape.n_swa ? g_ds4_shape.n_swa : 1024u;
+        desc->swa_pattern      = 6u;
+    }
     /* YaRN / NTK-aware context extension: when the requested context exceeds the
      * model's native training context, scale the RoPE base so positions stay in
      * distribution. base' = base * s^(d/(d-2)), s = n_ctx/orig. Gated, so for
-     * n_ctx <= native the base is unchanged (identical behaviour). */
-    if (DS4_ROPE_ORIG_CTX > 0 && (uint64_t)n_ctx > DS4_ROPE_ORIG_CTX) {
+     * n_ctx <= native the base is unchanged (identical behaviour). gemma handles
+     * long-context via its own linear freq_scale, so skip NTK there. */
+    if (!gemma && DS4_ROPE_ORIG_CTX > 0 && (uint64_t)n_ctx > DS4_ROPE_ORIG_CTX) {
         const double s = (double)n_ctx / (double)DS4_ROPE_ORIG_CTX;
         const double d = (double)DS4_N_HEAD_DIM;
         desc->rope_base = (float)((double)DS4_ROPE_FREQ_BASE * pow(s, d / (d - 2.0)));
@@ -25986,6 +26166,11 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
         L->ffn_gate    = dense_wdesc_of(model, lw->ffn_gate);
         L->ffn_up      = dense_wdesc_of(model, lw->ffn_up);
         L->ffn_down    = dense_wdesc_of(model, lw->ffn_down);
+        /* gemma3 extra norms (NULL data for non-gemma -> ignored by the forward). */
+        L->attn_q_norm    = dense_wdesc_of(model, lw->attn_q_norm);
+        L->attn_k_norm    = dense_wdesc_of(model, lw->attn_k_norm);
+        L->attn_post_norm = dense_wdesc_of(model, lw->attn_post_norm);
+        L->ffn_post_norm  = dense_wdesc_of(model, lw->ffn_post_norm);
     }
 }
 
@@ -26164,6 +26349,8 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
     weights_bind(&weights, &model, false, 0, 0, true, false);
 
     token_vec toks = {0};
+    /* SPM/gemma: llama.cpp prepends BOS to the raw prompt; match it so greedy aligns. */
+    if (vocab.pre_type == DS4_PRETOK_SPM && vocab.bos_id >= 0) token_vec_push(&toks, vocab.bos_id);
     bpe_tokenize_text(&vocab, prompt ? prompt : "", &toks);
     if (toks.len == 0) { if (errlen) snprintf(err, errlen, "empty prompt"); vocab_free(&vocab); model_close(&model); return 1; }
 
@@ -26304,8 +26491,21 @@ int ds4_dense_generate(const char *model_path, const char *prompt, int n_predict
 static int dense_token_bytes(const ds4_vocab *vocab, int token, char *out, size_t cap) {
     if (token < 0 || token >= vocab->n_vocab) return 0;
     ds4_str s = vocab->token[token];
-    uint64_t p = 0;
     size_t n = 0;
+    if (vocab->pre_type == DS4_PRETOK_SPM) {
+        /* SPM: raw UTF-8 with ▁ (U+2581) -> space and <0xXX> byte fallbacks. */
+        if (s.len == 6 && s.ptr[0] == '<' && s.ptr[1] == '0' && s.ptr[2] == 'x' && s.ptr[5] == '>') {
+            int hi = ds4_hex_digit(s.ptr[3]), lo = ds4_hex_digit(s.ptr[4]);
+            if (hi >= 0 && lo >= 0) { if (cap) out[0] = (char)(hi*16+lo); return cap ? 1 : 0; }
+        }
+        for (uint64_t i = 0; i < s.len && n < cap; ) {
+            if (i + 2 < s.len && (uint8_t)s.ptr[i] == 0xE2 && (uint8_t)s.ptr[i+1] == 0x96 && (uint8_t)s.ptr[i+2] == 0x81) {
+                out[n++] = ' '; i += 3;
+            } else { out[n++] = s.ptr[i]; i++; }
+        }
+        return (int)n;
+    }
+    uint64_t p = 0;
     while (p < s.len && n < cap) {
         uint32_t cp = utf8_decode_one(s.ptr, s.len, &p);
         const int b = gpt2_codepoint_to_byte(cp);
@@ -27340,13 +27540,18 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         return 1;
     }
     const int is_q3n = ds4_arch_is_qwen3next();   /* same chat loop drives dense + qwen3_next */
+    const int is_gemma = ds4_arch_is_gemma3();    /* gemma3 uses its own turn template */
     vocab_load(&vocab, &model);
     weights_bind(&weights, &model, false, 0, 0, true, false);
 
-    const int im_start = vocab.user_id;      /* <|im_start|> */
-    const int im_end   = vocab.assistant_id; /* <|im_end|>   */
+    /* Turn markers + assistant primer. ChatML: <|im_start|>/<|im_end|> + "assistant".
+     * gemma: <start_of_turn>/<end_of_turn> (loaded into user_id/assistant_id) + "model",
+     * with a single <bos> at the conversation start and no system turn. */
+    const int im_start = vocab.user_id;
+    const int im_end   = vocab.assistant_id;
+    const char *asst_primer = is_gemma ? "model\n" : "assistant\n";
     if (im_start < 0 || im_end < 0) {
-        if (errlen) snprintf(err, errlen, "model has no ChatML tokens (not a chat model?)");
+        if (errlen) snprintf(err, errlen, "model has no chat turn tokens (not a chat model?)");
         vocab_free(&vocab); model_close(&model);
         return 1;
     }
@@ -27426,7 +27631,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     const char *base_sys = (system && system[0]) ? system : "You are a helpful assistant.";
     /* function-calling ON by default for dense; OFF for qwen3_next — the tools prompt is
      * hundreds of tokens and prefilling it at qwen3_next's ~1-3 tok/s would take minutes. */
-    const bool tools_on = getenv("DS4_DENSE_NO_TOOLS") == NULL && !is_q3n;
+    const bool tools_on = getenv("DS4_DENSE_NO_TOOLS") == NULL && !is_q3n && !is_gemma;
     char *sys_buf = NULL;
     const char *sys = base_sys;
     if (tools_on) {
@@ -27446,8 +27651,8 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     uint32_t pos = 0;
     int rc = 0;
     bool first = true;
-    bool think = !is_q3n;   /* reflection on for dense; off by default for qwen3_next (too slow
-                             * at ~1-3 tok/s to reason before every answer). Toggle with /think. */
+    bool think = !is_q3n && !is_gemma;   /* reflection on for dense; off for qwen3_next (too slow)
+                             * and gemma (no <think> training). Toggle with /think. */
 
     /* sampling: greedy by default; /temp /topp /topk adjust it live */
     float temp = 0.0f, top_p = 0.95f;
@@ -27566,7 +27771,8 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             for (size_t i = 0; i < hist_n; i++) token_vec_free(&hist[i]);
             hist_n = 0; pos = 0;
             { token_vec st = {0};
-              dense_chat_append_block(&st, &vocab, im_start, im_end, "system", sys);
+              if (is_gemma) { if (vocab.bos_id >= 0) token_vec_push(&st, vocab.bos_id); }
+              else dense_chat_append_block(&st, &vocab, im_start, im_end, "system", sys);
               for (uint32_t i = 0; i < (uint32_t)st.len && pos < n_ctx - 1u && rc == 0; i++)
                   if (chat_step(is_q3n, g, &desc, qg, &qdesc, st.v[i], pos++, logits) != 0) rc = 1;
               token_vec_free(&st); }
@@ -27635,10 +27841,12 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
 
         const bool think_turn = think;
 
-        /* system block (first turn only) stays permanently in history */
+        /* system block (first turn only) stays permanently in history. gemma has no
+         * system role: emit a single <bos> instead (the conversation start marker). */
         if (first) {
             token_vec st = {0};
-            dense_chat_append_block(&st, &vocab, im_start, im_end, "system", sys);
+            if (is_gemma) { if (vocab.bos_id >= 0) token_vec_push(&st, vocab.bos_id); }
+            else dense_chat_append_block(&st, &vocab, im_start, im_end, "system", sys);
             for (uint32_t i = 0; i < (uint32_t)st.len && rc == 0; i++)
                 if (chat_step(is_q3n, g, &desc, qg, &qdesc, st.v[i], pos++, logits) != 0) rc = 1;
             token_vec_free(&st);
@@ -27659,7 +27867,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             dense_chat_append_block(&t, &vocab, im_start, im_end, "user", line);
         }
         token_vec_push(&t, im_start);
-        bpe_tokenize_text(&vocab, "assistant\n", &t);
+        bpe_tokenize_text(&vocab, asst_primer, &t);
 
         /* Sliding window: if this turn won't fit, drop the oldest stored turns and
          * rebuild the KV from base_pos (system) + the most recent turns that fit,
@@ -27762,7 +27970,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                 int wn = snprintf(wrap, rl + 64, "<tool_response>\n%s\n</tool_response>", res ? res : "");
                 dense_chat_append_block(&tr, &vocab, im_start, im_end, "user", wrap);
                 free(wrap); free(res);
-                token_vec_push(&tr, im_start); bpe_tokenize_text(&vocab, "assistant\n", &tr);
+                token_vec_push(&tr, im_start); bpe_tokenize_text(&vocab, asst_primer, &tr);
                 if (think_turn) bpe_tokenize_text(&vocab, "<think>\n", &tr);
                 (void)wn;
                 for (uint32_t i = 0; i < (uint32_t)tr.len && pos < n_ctx - 1u && rc == 0; i++)
@@ -27795,7 +28003,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             token_vec turn_clean = {0};
             dense_chat_append_block(&turn_clean, &vocab, im_start, im_end, "user", line);
             token_vec_push(&turn_clean, im_start);
-            bpe_tokenize_text(&vocab, "assistant\n", &turn_clean);
+            bpe_tokenize_text(&vocab, asst_primer, &turn_clean);
             if (ans_trim[0]) bpe_tokenize_text(&vocab, ans_trim, &turn_clean);
             token_vec_push(&turn_clean, im_end);
             bpe_tokenize_text(&vocab, "\n", &turn_clean);   /* ...<|im_end|>\n */

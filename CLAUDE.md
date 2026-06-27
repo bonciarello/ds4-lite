@@ -145,3 +145,37 @@ Stato:
     con `DS4_BENCH_CSV=path` appende una riga CSV. Misura M1 Max: ds4 ~3.2 t/s decode
     vs llama.cpp ~44 (~14x), greedy identico. (Le 2 ottimizzazioni in [[ds4-lite-dense-optimizations]].)
   - GGUF reale in `gguf/qwen2-7b-instruct-q4_k_m.gguf` (4.68 GB, non committare).
+
+## gemma-3 (general.architecture == "gemma3") ✅
+
+Supporto **gemma-3** (validato su `gemma-3-27b-it.Q4_K_M`, 62 layer) sul **path denso**:
+`./ds4 --metal-dense-generate gguf/gemma-3-27b-it.Q4_K_M.gguf "..."` e
+`./ds4 --metal-dense-chat gguf/gemma-3-27b-it.Q4_K_M.gguf`. **Validato byte-identico a
+llama-simple** ("1, 2, 3, 4, 5, 6, 7," → " 8, 9, 10, 11, 12, 13"); chat risponde "Paris."
+~10.7 tok/s su M1 Max. Non regressione: Qwen2 denso + `--metal-dense-selftest` invariati.
+
+- **Arch**: `DS4_ARCH_GEMMA3` (`ds4_arch_is_gemma3()`). `config_build_gemma3_shape` riusa
+  `config_build_dense_shape` (head_dim=key_length=128 ≠ n_embd/n_head; vocab dal tokenizer;
+  rope.freq_base 1e6 = base globale) e marca arch + `n_swa`=1024. Gira sul **driver denso**
+  (`ds4_dense_model_desc.gemma` + branch `ds4_gemma_gpu_forward`), NON un driver separato.
+- **Quirk gemma** (in `ds4_gemma_gpu_forward`): embedding ×√n_embd (Q6_K tied output);
+  **QK-norm** per-head; **4 norm/layer** (input/post-attn/pre-ffn/post-ffn); **GeGLU** (gelu
+  tanh); **sliding-window 1024** su 5/6 layer (globale a `il%6==5`) con RoPE locale base 10000
+  freq_scale 1.0 vs globale 1e6 freq_scale 0.125; attn scale = 1/√(n_embd/n_head) = 1/√168 per
+  il 27B (NON 1/√head_dim). 4 kernel Metal isolati in `dense.metal`
+  (`kernel_gemma_{rms_norm_f32_sg,qk_norm_f32,geglu_f32,rope_neox_f32}`).
+- **Gotcha pesi norm**: i pesi RMSNorm/QK-norm gemma **includono già il +1** (llama.cpp lo
+  bake in conversione) → moltiplicare per `w` diretto, NON `(1+w)`.
+- **Gotcha GeGLU**: il `tanh` di Metal (fast-math, default ON) **overflowa** per argomenti
+  grandi (exp→inf, inf/inf=NaN) → clamp dell'argomento a ±15 nel kernel geglu.
+- **Tokenizer SentencePiece** (`DS4_PRETOK_SPM`): gemma usa `tokenizer.ggml.model=llama`
+  (SPM con `scores`, niente `merges`). `vocab_load` rende i merges opzionali + carica gli
+  scores; `spm_tokenize_text` (spazio→▁ U+2581, merge guidato dagli score sui simboli
+  adiacenti, byte-fallback `<0xXX>`); detokenizzazione SPM in `dense_token_bytes`/
+  `dense_print_token` (▁→spazio). Chat template: `<bos><start_of_turn>user\n{q}<end_of_turn>\n
+  <start_of_turn>model\n`, stop su `<end_of_turn>`(106)/eos; reflection+tools OFF per gemma.
+- **Bug latente risolto**: `DS4_MAX_LAYER` era 61 (DeepSeek Pro) ma gemma-3-27b ha 62 →
+  off-by-one OOB su `ds4_weights.layer[]` che corrompeva lo stack adiacente (il vocab in chat;
+  il generate usa `desc->layers` su heap quindi sembrava ok). Alzato a 64 + guardia runtime in
+  `config_build_dense_shape`. Riguardava ogni modello denso ≥62 layer.
+- Dettagli + status in [[gemma3-support]].

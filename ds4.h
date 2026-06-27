@@ -182,6 +182,8 @@ typedef struct {
     ds4_dense_wdesc attn_norm, attn_q, attn_q_bias, attn_k, attn_k_bias,
                     attn_v, attn_v_bias, attn_out;
     ds4_dense_wdesc ffn_norm, ffn_gate, ffn_up, ffn_down;
+    /* gemma3 only (NULL data otherwise): QK-norm [head_dim], post-attn & post-ffn norms. */
+    ds4_dense_wdesc attn_q_norm, attn_k_norm, attn_post_norm, ffn_post_norm;
 } ds4_dense_layer_desc;
 
 typedef struct {
@@ -191,6 +193,15 @@ typedef struct {
     ds4_dense_layer_desc *layers;   /* [n_layer] */
     const void         *model_base; /* mmap base (for zero-copy weight wrapping) */
     unsigned long long  model_size; /* mmapped model size in bytes */
+    /* gemma3 extensions (gemma==0 -> plain dense path, all fields below ignored). */
+    int      gemma;             /* 1 when the gemma3 forward variant should run */
+    float    embed_scale;       /* token embeddings scaled by this (sqrt(n_embd)) */
+    float    attn_scale;        /* attention softmax scale; 0 -> default 1/sqrt(head_dim) */
+    float    rope_scale;        /* global-layer RoPE linear freq_scale (gemma: 0.125) */
+    float    rope_base_local;   /* sliding-layer RoPE base (gemma: 10000) */
+    float    rope_scale_local;  /* sliding-layer RoPE freq_scale (gemma: 1.0) */
+    unsigned swa_window;        /* sliding-window size (gemma: 1024); 0 -> full attention */
+    unsigned swa_pattern;       /* 1 global every swa_pattern layers (gemma: 6) */
 } ds4_dense_model_desc;
 
 typedef struct ds4_dense_gpu ds4_dense_gpu;

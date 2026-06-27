@@ -4073,6 +4073,31 @@ static void ds4_q4k_dequant_block(const uint8_t *blk, float *y) {
     }
 }
 
+/* Dequantize a Q6_K block (210 bytes) to 256 floats. Mirrors ds4_q6k_block_dot
+ * (gemma3 token_embd / tied output are Q6_K). GGML layout: ql[128] qh[64]
+ * scales(int8)[16] d(f16). */
+static void ds4_q6k_dequant_block(const uint8_t *blk, float *y) {
+    const uint8_t *ql = blk;
+    const uint8_t *qh = blk + 128;
+    const int8_t  *sc = (const int8_t *)(blk + 192);
+    __fp16 dh; memcpy(&dh, blk + 208, 2);
+    const float d = (float)dh;
+    for (int n = 0; n < 256; n += 128) {
+        for (int l = 0; l < 32; l++) {
+            const int is = l / 16;
+            const int q1 = (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            const int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            const int q3 = (int)((ql[l]      >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            const int q4 = (int)((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            y[n + l +  0] = d * (float)sc[is + 0] * (float)q1;
+            y[n + l + 32] = d * (float)sc[is + 2] * (float)q2;
+            y[n + l + 64] = d * (float)sc[is + 4] * (float)q3;
+            y[n + l + 96] = d * (float)sc[is + 6] * (float)q4;
+        }
+        ql += 64; qh += 32; sc += 8;
+    }
+}
+
 typedef struct { ds4_gpu_tensor *k, *v; } ds4_dense_kv_layer;
 
 struct ds4_dense_gpu {
@@ -4738,8 +4763,136 @@ int ds4_q3n_gpu_forward(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d,
     }
 }
 
+/* ---- gemma3 building blocks (isolated; the gemma forward branch below) ----- */
+
+/* RMSNorm with (1 + w) weights (gemma scales the normed value by 1+w). */
+static bool gemma_rms(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *x,
+                      const ds4_dense_wdesc *norm, uint32_t n, float eps) {
+    ds4_gpu_tensor *wb = dense_cached_weight(g, norm->data, norm->bytes);
+    if (!wb) return false;
+    struct __attribute__((packed)) { uint32_t n; float eps; } a = { n, eps };
+    ds4_gpu_tensor *bufs[3] = { x, wb, out };
+    return ds4_gpu_run_grid("kernel_gemma_rms_norm_f32_sg", &a, sizeof(a), bufs, 3,
+                            MTLSizeMake(1, 1, 1), MTLSizeMake(128, 1, 1), "gemma rms");
+}
+
+/* Per-head QK RMSNorm over head_dim with (1 + w); in place on x [n_head*head_dim]. */
+static bool gemma_qk_norm(ds4_dense_gpu *g, ds4_gpu_tensor *x, const ds4_dense_wdesc *norm,
+                          uint32_t n_head, uint32_t head_dim, float eps) {
+    if (!norm->data) return true;   /* no q/k norm tensor -> skip */
+    ds4_gpu_tensor *wb = dense_cached_weight(g, norm->data, norm->bytes);
+    if (!wb) return false;
+    struct __attribute__((packed)) { uint32_t n_head, head_dim; float eps; } a = { n_head, head_dim, eps };
+    ds4_gpu_tensor *bufs[2] = { x, wb };
+    return ds4_gpu_run_grid("kernel_gemma_qk_norm_f32", &a, sizeof(a), bufs, 2,
+                            MTLSizeMake(n_head, 1, 1), MTLSizeMake(32, 1, 1), "gemma qk norm");
+}
+
+/* GeGLU activation: out[i] = gelu_tanh(gate[i]) * up[i]. */
+static bool gemma_geglu(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, uint32_t n) {
+    ds4_gpu_tensor *bufs[3] = { gate, up, out };
+    return ds4_gpu_run_simple("kernel_gemma_geglu_f32", &n, sizeof(n), bufs, 3, n, "gemma geglu");
+}
+
+/* NEOX RoPE with a linear freq_scale (global layers 0.125, local 1.0). */
+static bool gemma_rope(ds4_gpu_tensor *x, uint32_t nh, uint32_t hd, uint32_t nrot,
+                       uint32_t pos, float base, float freq_scale) {
+    struct __attribute__((packed)) { uint32_t n_head, head_dim, n_rot, pos; float fb, fs; }
+        a = { nh, hd, nrot, pos, base, freq_scale };
+    ds4_gpu_tensor *bufs[1] = { x };
+    return ds4_gpu_run_simple("kernel_gemma_rope_neox_f32", &a, sizeof(a), bufs, 1, nh*(nrot/2), "gemma rope");
+}
+
+/* Debug: read a GPU f32 buffer back and report nan/inf/min/max (gemma bring-up). */
+/* One-token gemma3 forward. Dense transformer with gemma quirks: embedding ×sqrt(n_embd)
+ * (Q6_K tied embed), per-head QK-norm, 4 RMSNorms/layer (weights already include the +1),
+ * GeGLU FFN, attention scaled by 1/sqrt(query_pre_attn_scalar), and sliding-window
+ * attention with a separate RoPE base/scale on the local (non-global) layers. */
+static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
+                                 int token, unsigned pos, float *logits) {
+    @autoreleasepool {
+        const uint32_t ne=d->n_embd, nff=d->n_ff, nh=d->n_head, nkv=d->n_kv, hd=d->head_dim;
+        const uint32_t kvd=g->kvd, nrot=d->n_rot;
+        const float eps=d->rms_eps;
+        const float scale = d->attn_scale > 0.0f ? d->attn_scale : 1.0f/sqrtf((float)hd);
+        const uint32_t window = d->swa_window, pattern = d->swa_pattern ? d->swa_pattern : 6u;
+
+        /* embedding row: dequant token_embd[token] (Q6_K=14 or Q4_K=12), scale ×sqrt(ne). */
+        const uint32_t nblk = ne/256u;
+        if (d->token_embd.type == 14) {
+            const uint8_t *row = (const uint8_t *)d->token_embd.data + (size_t)token*nblk*210u;
+            for (uint32_t b = 0; b < nblk; b++) ds4_q6k_dequant_block(row + (size_t)b*210u, g->embedscratch + b*256);
+        } else if (d->token_embd.type == 12) {
+            const uint8_t *row = (const uint8_t *)d->token_embd.data + (size_t)token*nblk*144u;
+            for (uint32_t b = 0; b < nblk; b++) ds4_q4k_dequant_block(row + (size_t)b*144u, g->embedscratch + b*256);
+        } else return 2;
+        const float es = d->embed_scale > 0.0f ? d->embed_scale : 1.0f;
+        for (uint32_t i = 0; i < ne; i++) g->embedscratch[i] *= es;
+        ds4_gpu_tensor_write(g->x, 0, g->embedscratch, (uint64_t)ne*4);
+
+        const bool use_batch = !g->profile && !getenv("DS4_DENSE_NOBATCH");
+        if (use_batch) {
+            g_batch_serialize = true;
+            if (!ds4_gpu_begin_commands()) { g_batch_serialize = false; return 1; }
+        }
+        bool ok = true;
+        const uint32_t n_keys = pos + 1u;
+        for (uint32_t il = 0; ok && il < d->n_layer; il++) {
+            const ds4_dense_layer_desc *L = &d->layers[il];
+            ds4_dense_kv_layer *kv = &g->kv[il];
+            const bool is_global = (il % pattern) == (pattern - 1u);
+            const float rbase  = is_global ? d->rope_base : d->rope_base_local;
+            const float rscale = is_global ? d->rope_scale : d->rope_scale_local;
+            /* sliding window: local layers attend only to the last `window` keys, a
+             * contiguous slice of the cache (positions are appended in order). */
+            uint32_t kv_start = 0u, n_attn = n_keys;
+            if (!is_global && window && n_keys > window) { kv_start = n_keys - window; n_attn = window; }
+
+            ds4_gpu_tensor *kslot = ds4_gpu_tensor_view(kv->k, (uint64_t)pos*kvd*2, (uint64_t)kvd*2);
+            ds4_gpu_tensor *vslot = ds4_gpu_tensor_view(kv->v, (uint64_t)pos*kvd*2, (uint64_t)kvd*2);
+            ds4_gpu_tensor *kc = ds4_gpu_tensor_view(kv->k, (uint64_t)kv_start*kvd*2, (uint64_t)n_attn*kvd*2);
+            ds4_gpu_tensor *vc = ds4_gpu_tensor_view(kv->v, (uint64_t)kv_start*kvd*2, (uint64_t)n_attn*kvd*2);
+            ok = kslot && vslot && kc && vc
+              && gemma_rms(g, g->h, g->x, &L->attn_norm, ne, eps)
+              && dense_matvec(g, &L->attn_q, g->h, g->q)
+              && dense_matvec(g, &L->attn_k, g->h, g->k)
+              && dense_matvec(g, &L->attn_v, g->h, g->v)
+              && gemma_qk_norm(g, g->q, &L->attn_q_norm, nh,  hd, eps)
+              && gemma_qk_norm(g, g->k, &L->attn_k_norm, nkv, hd, eps)
+              && gemma_rope(g->q, nh,  hd, nrot, pos, rbase, rscale)
+              && gemma_rope(g->k, nkv, hd, nrot, pos, rbase, rscale)
+              && dense_cvt_f16(g, kslot, g->k, kvd)
+              && dense_cvt_f16(g, vslot, g->v, kvd)
+              && dense_attn(g, g->att, g->q, kc, vc, nh, nkv, hd, n_attn, scale)
+              && dense_matvec(g, &L->attn_out, g->att, g->o)
+              && gemma_rms(g, g->h, g->o, &L->attn_post_norm, ne, eps)
+              && dense_add(g->x, g->h, ne)
+              && gemma_rms(g, g->h2, g->x, &L->ffn_norm, ne, eps)
+              && dense_matvec(g, &L->ffn_gate, g->h2, g->gate)
+              && dense_matvec(g, &L->ffn_up, g->h2, g->up)
+              && gemma_geglu(g->act, g->gate, g->up, nff)
+              && dense_matvec(g, &L->ffn_down, g->act, g->down)
+              && gemma_rms(g, g->h2, g->down, &L->ffn_post_norm, ne, eps)
+              && dense_add(g->x, g->h2, ne);
+            ds4_gpu_tensor_free(kslot); ds4_gpu_tensor_free(vslot);
+            ds4_gpu_tensor_free(kc);    ds4_gpu_tensor_free(vc);
+        }
+        ok = ok && gemma_rms(g, g->h, g->x, &d->output_norm, ne, eps)
+                && dense_matvec(g, &d->output, g->h, g->logits);
+        if (use_batch) {
+            const int ended = ds4_gpu_end_commands();
+            g_batch_serialize = false;
+            if (!ended) return 1;
+        }
+        if (!ok) return 1;
+        ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)d->n_vocab*4);
+        return 0;
+    }
+}
+
 int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
                           int token, unsigned pos, float *logits) {
+    if (d->gemma) return ds4_gemma_gpu_forward(g, d, token, pos, logits);
     @autoreleasepool {
         const uint32_t ne=d->n_embd, nff=d->n_ff, nh=d->n_head, nkv=d->n_kv, hd=d->head_dim;
         const uint32_t qd=g->qd, kvd=g->kvd, nrot=d->n_rot;
@@ -5127,8 +5280,22 @@ static bool dense_attn_prefill(ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_t
 int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
                           const int *tokens, uint32_t M, uint32_t start_pos,
                           float *last_logits, float *all_logits) {
+    if (M == 0) return 1;
+    /* gemma3 has no batched-matmul prefill yet: process the prompt one token at a
+     * time through the (validated) decode forward, which builds the KV cache
+     * incrementally. Slower prefill, but correct + reuses all gemma logic. */
+    if (d->gemma) {
+        float *throwaway = all_logits ? NULL : malloc((size_t)d->n_vocab * sizeof(float));
+        int rc = 0;
+        for (uint32_t i = 0; i < M && rc == 0; i++) {
+            float *dst = all_logits ? all_logits + (size_t)i*d->n_vocab
+                                    : (i + 1u == M ? last_logits : throwaway);
+            rc = ds4_dense_gpu_forward(g, d, tokens[i], start_pos + i, dst);
+        }
+        free(throwaway);
+        return rc;
+    }
     @autoreleasepool {
-        if (M == 0) return 1;
         if (d->token_embd.type != 12) return 2;
         const uint32_t ne=d->n_embd, nff=d->n_ff, nh=d->n_head, nkv=d->n_kv, hd=d->head_dim;
         const uint32_t qd=g->qd, kvd=g->kvd, nrot=d->n_rot;
