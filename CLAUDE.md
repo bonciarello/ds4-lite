@@ -186,6 +186,13 @@ llama-simple** ("1, 2, 3, 4, 5, 6, 7," → " 8, 9, 10, 11, 12, 13"); chat rispon
     `ds4_dense_gpu`. Riduzione KV ~3× a 4K ctx, ~5–6× a 32K–128K (es. 32K: 15.4→2.9 GiB).
     Validato byte-corretto a 1942 token (ring in wrap). L'auto-context gemma conta solo i layer
     globali (f16) → contesti molto più ampi (es. ~16K→128K+ su 32GB).
+  - **Auto-context budget GPU-resident (fix OOM)**: con modello residente, pesi+KV+command-buffer
+    sono tutti allocazioni GPU. Su Mac unified-memory `recommendedMaxWorkingSetSize` sovra-riporta
+    (≈ RAM fisica) e NON è un bound OOM affidabile; il command buffer va in OOM ben prima di
+    0.85×RAM. Quindi `ds4_auto_context` per il caso residente usa budget = `0.62×RAM` (+ cap col
+    working set se più basso) e 2.5 GiB di headroom sopra model+KV. Su gemma-27b/32GB → auto 32K
+    (~18 GiB di picco) invece di 128–256K che OOMmava. (Prima il budget 0.85×RAM sceglieva 256K →
+    KV 10.7 GiB + modello 16 GiB → `kIOGPUCommandBufferCallbackErrorOutOfMemory`.)
   - **SSD streaming dei pesi**: se `model_size > 0.60×RAM`, `ds4_dense_gpu_create` salta il pin di
     residency (`setenv DS4_METAL_NO_RESIDENCY`) → le pagine dei pesi mmap si caricano on-demand
     dall'SSD (RAM wired minore, decode più lento) invece di andare in OOM. Override con

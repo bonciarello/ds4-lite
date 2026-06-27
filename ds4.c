@@ -26198,9 +26198,20 @@ static uint32_t ds4_auto_context(uint64_t native, uint64_t kv_per_tok, uint64_t 
     uint64_t ram = 0; size_t rl = sizeof ram;
     if (sysctlbyname("hw.memsize", &ram, &rl, NULL, 0) != 0 || ram == 0) ram = 16ull << 30;
     if (native == 0) native = 8192ull;
-    const uint64_t overhead = 1024ull << 20;
     const uint64_t reserve  = streaming ? (uint64_t)((double)ram * 0.70) : model_size;   /* RAM the model needs */
-    const uint64_t budget   = (uint64_t)((double)ram * 0.85);                             /* leave 15% for the OS */
+    /* A GPU-resident model + its KV cache are ALL live GPU allocations, and the GPU command
+     * buffer also needs transient working memory during a forward. On unified-memory Macs
+     * recommendedMaxWorkingSetSize over-reports (≈ physical RAM) so it is not a reliable OOM
+     * bound; empirically the command buffer OOMs well before 0.85×RAM. So for the resident
+     * case use a conservative fraction of physical RAM (0.62) as the total GPU budget and a
+     * 2.5 GiB headroom above model+KV for command-buffer working memory. Streaming keeps the
+     * model off the GPU so it can use more of RAM for KV. */
+    uint64_t budget   = (uint64_t)((double)ram * (streaming ? 0.85 : 0.62));
+    uint64_t overhead = streaming ? (1024ull << 20) : (2560ull << 20);
+    if (!streaming) {
+        const uint64_t ws = ds4_gpu_recommended_working_set_size();   /* also cap by it when it IS lower */
+        if (ws > 0 && budget > ws) budget = ws;
+    }
     const uint64_t avail    = (budget > reserve + overhead) ? budget - reserve - overhead : 0;
     uint64_t c = kv_per_tok ? avail / kv_per_tok : native;
     const char *e = getenv("DS4_CTX_EXTEND");
