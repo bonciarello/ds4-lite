@@ -2980,3 +2980,15 @@ kernel void kernel_q3n_split_qgate_f32(
     q[gid]    = qfull[base + d];
     gate[gid] = qfull[base + a.head_dim + d];
 }
+
+/* Scaled accumulate: acc[i] += scale * x[i]. Used to sum MoE expert outputs on the GPU
+ * (weight * down_e) without round-tripping each expert to the host. */
+struct dense_axpy_args { uint n; float scale; };
+kernel void kernel_dense_axpy_f32(
+        constant dense_axpy_args & a [[buffer(0)]],
+        device const float * x   [[buffer(1)]],
+        device       float * acc [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.n) return;
+    acc[gid] += a.scale * x[gid];
+}
