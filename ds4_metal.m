@@ -4216,8 +4216,18 @@ static bool dense_attn(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *q,
         { nh, nkv, hd, nctx, S, chunk, scale };
     ds4_gpu_tensor *split_bufs[6]   = { q, kc, vc, g->pm, g->pl, g->pacc };
     ds4_gpu_tensor *combine_bufs[4] = { g->pm, g->pl, g->pacc, out };
-    return ds4_gpu_run_grid("kernel_dense_attn_decode_split_f32", &sa, sizeof(sa), split_bufs, 6,
-                            MTLSizeMake(nh, S, 1), MTLSizeMake(32, 1, 1), "fwd attn split")
+    /* GQA-grouped split (one simdgroup per KV-head -> reads the KV once for the whole group)
+     * is OPT-IN (DS4_ATTN_GQA): measured SLOWER than the per-query-head split because it
+     * cuts the threadgroup count by the GQA ratio + raises register pressure, and decode
+     * attention here is parallelism/latency-bound (not KV-bandwidth-bound). Kept for
+     * reference / future tuning (e.g. acc in threadgroup memory to restore occupancy). */
+    const uint32_t grp = nkv ? nh / nkv : 1u;
+    const bool gqa = getenv("DS4_ATTN_GQA")
+                     && (hd <= 128u) && (nkv >= 1u) && (nh % nkv == 0u) && grp >= 2u && grp <= 8u;
+    const char *split_k = gqa ? "kernel_dense_attn_decode_split_gqa_f32" : "kernel_dense_attn_decode_split_f32";
+    const MTLSize split_grid = gqa ? MTLSizeMake(nkv, S, 1) : MTLSizeMake(nh, S, 1);
+    return ds4_gpu_run_grid(split_k, &sa, sizeof(sa), split_bufs, 6,
+                            split_grid, MTLSizeMake(32, 1, 1), "fwd attn split")
         && ds4_gpu_run_grid("kernel_dense_attn_decode_combine_f32", &sa, sizeof(sa), combine_bufs, 4,
                             MTLSizeMake(nh, 1, 1), MTLSizeMake(32, 1, 1), "fwd attn combine");
 }

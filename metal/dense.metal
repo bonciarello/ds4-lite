@@ -2143,6 +2143,59 @@ kernel void kernel_dense_attn_decode_combine_f32(
     }
 }
 
+// GQA-grouped split-KV decode: dispatch one simdgroup per (KV-head, split) instead of per
+// (query-head, split). Each loads the KV chunk ONCE and computes all `group` query-heads
+// that share that KV-head, so KV memory traffic drops by the GQA ratio (the dominant cost
+// at long context). Writes the same per-query-head partials, so the existing combine pass
+// is reused. Used when head_dim <= 128 and group in [2,8] (register budget); else the
+// per-query-head kernel above. Output is identical (same per-head online softmax).
+kernel void kernel_dense_attn_decode_split_gqa_f32(
+        constant ds4_dense_attn_split_args & a [[buffer(0)]],
+        device const float * q      [[buffer(1)]],
+        device const float * kcache [[buffer(2)]],
+        device const float * vcache [[buffer(3)]],
+        device       float * pm     [[buffer(4)]],
+        device       float * pl     [[buffer(5)]],
+        device       float * pacc   [[buffer(6)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]]) {
+    const uint hkv = tgpig.x;
+    const uint sp  = tgpig.y;
+    if (hkv >= a.n_kv || sp >= a.n_split) return;
+    const uint group = a.n_head / a.n_kv;
+    const uint hd = a.head_dim, kvdim = a.n_kv * hd;
+    const uint ndl = (hd + 31u) / 32u;       // <= 4 (head_dim <= 128)
+    float qreg[8][4], acc[8][4], m[8], l[8];
+    for (uint g = 0; g < group; g++) {
+        device const float * qh = q + (hkv*group + g)*hd;
+        for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; qreg[g][j] = (d < hd) ? qh[d] : 0.0f; acc[g][j] = 0.0f; }
+        m[g] = -INFINITY; l[g] = 0.0f;
+    }
+    const uint t0 = sp * a.chunk; uint t1 = t0 + a.chunk; if (t1 > a.n_ctx) t1 = a.n_ctx;
+    for (uint t = t0; t < t1; t++) {
+        device const half * kt = (device const half *)kcache + (ulong)t*kvdim + hkv*hd;
+        device const half * vt = (device const half *)vcache + (ulong)t*kvdim + hkv*hd;
+        float kreg[4], vreg[4];
+        for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; kreg[j] = (d < hd) ? (float)kt[d] : 0.0f; vreg[j] = (d < hd) ? (float)vt[d] : 0.0f; }
+        for (uint g = 0; g < group; g++) {
+            float p = 0.0f;
+            for (uint j = 0; j < ndl; j++) p += qreg[g][j] * kreg[j];
+            const float s = simd_sum(p) * a.scale;
+            const float mn = max(m[g], s);
+            const float corr = exp(m[g] - mn), pe = exp(s - mn);
+            l[g] = l[g]*corr + pe;
+            for (uint j = 0; j < ndl; j++) acc[g][j] = acc[g][j]*corr + pe*vreg[j];
+            m[g] = mn;
+        }
+    }
+    for (uint g = 0; g < group; g++) {
+        const uint base = (hkv*group + g)*a.n_split + sp;
+        if (lane == 0) { pm[base] = m[g]; pl[base] = l[g]; }
+        device float * po = pacc + (ulong)base*hd;
+        for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) po[d] = acc[g][j]; }
+    }
+}
+
 // ---- Dense Q6_K matvec (Fase: Q6_K support) --------------------------------
 // out[row] = dot(dequant(W[row]), x). Canonical GGML Q6_K dequant inline. One
 // thread per output row (reference; optimize later). Block = 210 bytes:
