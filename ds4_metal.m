@@ -4399,12 +4399,19 @@ ds4_q3n_gpu *ds4_q3n_gpu_create(const ds4_q3n_model_desc *d) {
     g->n_ctx = d->n_ctx; g->n_head = d->n_head; g->n_kv = d->n_kv; g->head_dim = d->head_dim;
     g->model_base = d->model_base; g->model_size = d->model_size;
     g->wcache = [NSMutableDictionary dictionary];
-    /* Register the model map so weights can be wrapped zero-copy instead of copied (no GPU
-     * duplication of the 45GB of experts). If it fails, q3n_cached_weight copies — quietly,
-     * no per-weight error spam. maxw = the largest single tensor we wrap (the output head). */
-    { uint64_t maxw = d->output.bytes; if (d->token_embd.bytes > maxw) maxw = d->token_embd.bytes;
-      g->zerocopy = ds4_gpu_set_model_map_range(d->model_base, d->model_size, 0, d->model_size, maxw) != 0;
-      fprintf(stderr, "ds4: qwen3_next weights %s\n", g->zerocopy ? "zero-copy (mmap-wrapped)" : "copied to GPU on demand"); }
+    /* Zero-copy weight wrapping needs the model map registered, which makes the whole model
+     * resident on the GPU — for qwen3_next (45GB > GPU memory) that OOMs after a ~30s warmup.
+     * So only register it when the model comfortably fits (smaller future q3n variants); for
+     * the 80B we copy experts on demand. q3n_cached_weight is gated on this flag, so a
+     * disabled map produces NO failed-wrap spam. */
+    uint64_t hwram = 0; { size_t rl = sizeof hwram; if (sysctlbyname("hw.memsize", &hwram, &rl, NULL, 0) != 0) hwram = 16ull<<30; }
+    if (d->model_size <= (uint64_t)((double)hwram * 0.55)) {
+        uint64_t maxw = d->output.bytes; if (d->token_embd.bytes > maxw) maxw = d->token_embd.bytes;
+        g->zerocopy = ds4_gpu_set_model_map_range(d->model_base, d->model_size, 0, d->model_size, maxw) != 0;
+    } else {
+        g->zerocopy = false;
+    }
+    fprintf(stderr, "ds4: qwen3_next weights %s\n", g->zerocopy ? "zero-copy (mmap-wrapped)" : "copied to GPU on demand");
     const uint32_t qd = d->n_head*d->head_dim, kvd = d->n_kv*d->head_dim;
     g->x = ds4_gpu_tensor_alloc((uint64_t)d->n_embd*4);
     g->h = ds4_gpu_tensor_alloc((uint64_t)d->n_embd*4);

@@ -26347,7 +26347,8 @@ static void dense_chat_append_block(token_vec *t, const ds4_vocab *vocab,
  * <think>...</think> reasoning dimmed with the markers suppressed, and return the
  * malloc'd answer text (everything after </think>). Advances *pos_io; sets *rc_io
  * non-zero on a forward error. Shared by the normal turn and tool-response rounds. */
-static char *dense_chat_gen_response(ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
+static char *dense_chat_gen_response(int is_q3n, ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
+                                     ds4_q3n_gpu *qg, const ds4_q3n_model_desc *qdesc,
                                      const ds4_vocab *vocab, uint32_t *pos_io, uint32_t n_ctx,
                                      float *logits, int im_end, bool think_turn,
                                      float temp, float top_p, int top_k, uint64_t *rng, int *rc_io) {
@@ -26400,7 +26401,8 @@ static char *dense_chat_gen_response(ds4_dense_gpu *g, const ds4_dense_model_des
             }
         }
         fflush(stdout);
-        if (ds4_dense_gpu_forward(g, desc, next, pos++, logits) != 0) { *rc_io = 1; break; }
+        if ((is_q3n ? ds4_q3n_gpu_forward(qg, qdesc, next, pos++, logits)
+                    : ds4_dense_gpu_forward(g, desc, next, pos++, logits)) != 0) { *rc_io = 1; break; }
     }
     if (pend_len > 0) {
         if (in_think) fwrite(pend, 1, (size_t)pend_len, stdout);
@@ -27220,6 +27222,15 @@ static bool dense_pick_model(char *out, size_t cap) {
 
 /* Minimal interactive ChatML REPL for qwen3_next (EXPERIMENTAL, ~1 tok/s). Persists the
  * KV/SSM state across turns. Simpler than the dense chat (no tools/sessions/fancy UI). */
+/* Per-token forward dispatch so the ONE chat loop (ds4_dense_chat) drives both the dense and
+ * the qwen3_next GPU drivers — unifying the whole UI + feature set across model types. */
+static int chat_step(int q3n, ds4_dense_gpu *dg, const ds4_dense_model_desc *dd,
+                     ds4_q3n_gpu *qg, const ds4_q3n_model_desc *qd, int tok, unsigned pos, float *lg) {
+    return q3n ? ds4_q3n_gpu_forward(qg, qd, tok, pos, lg)
+               : ds4_dense_gpu_forward(dg, dd, tok, pos, lg);
+}
+
+DS4_MAYBE_UNUSED
 static int ds4_q3n_chat(const char *model_path, const char *system, int ctx_size,
                         char *err, size_t errlen) {
     ds4_model model; ds4_vocab vocab; ds4_weights weights;
@@ -27328,12 +27339,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         model_close(&model);
         return 1;
     }
-    if (ds4_arch_is_qwen3next()) {
-        /* qwen3_next has its own forward + REPL; re-open it there (this open was just for
-         * arch detection). */
-        model_close(&model);
-        return ds4_q3n_chat(model_path, system, ctx_size, err, errlen);
-    }
+    const int is_q3n = ds4_arch_is_qwen3next();   /* same chat loop drives dense + qwen3_next */
     vocab_load(&vocab, &model);
     weights_bind(&weights, &model, false, 0, 0, true, false);
 
@@ -27346,15 +27352,20 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     }
 
     /* Context window: explicit if given (>0), else AUTO — RAM-driven (see ds4_auto_context).
-     * Dense models are resident, so the full model size is reserved. */
+     * Dense models are resident (reserve the full model size); qwen3_next streams its experts
+     * from SSD (streaming=true) and only its 12 full-attention layers keep a growing KV. */
     uint32_t n_ctx;
-    if (ctx_size > 0)
-        n_ctx = (uint32_t)ctx_size;
-    else
+    if (ctx_size > 0) n_ctx = (uint32_t)ctx_size;
+    else if (is_q3n) {
+        uint32_t n_full = 0; for (uint32_t i = 0; i < DS4_N_LAYER; i++) if (ds4_q3n_layer_is_full_attn(i)) n_full++;
+        n_ctx = ds4_auto_context(DS4_ROPE_ORIG_CTX, (uint64_t)n_full * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 4ull,
+                                 (uint64_t)model.size, true, "qwen3_next");
+    } else
         n_ctx = ds4_auto_context(DS4_ROPE_ORIG_CTX, (uint64_t)DS4_N_LAYER * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 4ull,
                                  (uint64_t)model.size, false, "dense");
-    ds4_dense_model_desc desc;
-    dense_build_desc(&desc, &model, &weights, n_ctx);
+    ds4_dense_model_desc desc; ds4_q3n_model_desc qdesc;
+    if (is_q3n) build_q3n_desc(&qdesc, &model, &weights, n_ctx);
+    else        dense_build_desc(&desc, &model, &weights, n_ctx);
 
     /* Capture the Metal init log (stderr) during GPU create so the banner can show it
      * inside the box. The two tty-gated progress lines (residency/warming) are static
@@ -27367,7 +27378,10 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         fflush(stderr); cap_fd = mkstemp(cap_path);
         if (cap_fd >= 0) { cap_saved = dup(STDERR_FILENO); if (cap_saved >= 0) dup2(cap_fd, STDERR_FILENO); }
     }
-    ds4_dense_gpu *g = ds4_dense_gpu_create(&desc);
+    ds4_dense_gpu *g = NULL; ds4_q3n_gpu *qg = NULL;
+    if (is_q3n) qg = ds4_q3n_gpu_create(&qdesc);
+    else        g  = ds4_dense_gpu_create(&desc);
+    const bool created = is_q3n ? (qg != NULL) : (g != NULL);
     if (cap_saved >= 0) {
         fflush(stderr); dup2(cap_saved, STDERR_FILENO); close(cap_saved);
         off_t sz = lseek(cap_fd, 0, SEEK_END); lseek(cap_fd, 0, SEEK_SET);
@@ -27375,7 +27389,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         if (sz > 0) { raw = malloc((size_t)sz + 1); ssize_t r = read(cap_fd, raw, (size_t)sz); if (r < 0) r = 0; raw[r] = '\0'; }
         close(cap_fd); unlink(cap_path); cap_fd = -1;
         if (raw) {
-            if (!g) fputs(raw, stderr);   /* keep errors visible if init failed */
+            if (!created) fputs(raw, stderr);   /* keep errors visible if init failed */
             else {
                 size_t it = 0; bool prog = false; char *line = raw;
                 while (line && *line) {
@@ -27402,15 +27416,17 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         }
     }
     if (cap_fd >= 0) { close(cap_fd); unlink(cap_path); }
-    if (!g) {
-        if (errlen) snprintf(err, errlen, "dense GPU create failed");
-        free(desc.layers); vocab_free(&vocab); model_close(&model);
+    if (!created) {
+        if (errlen) snprintf(err, errlen, "%s GPU create failed", is_q3n ? "qwen3_next" : "dense");
+        free(is_q3n ? qdesc.layers : desc.layers); vocab_free(&vocab); model_close(&model);
         return 1;
     }
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     const char *base_sys = (system && system[0]) ? system : "You are a helpful assistant.";
-    const bool tools_on = getenv("DS4_DENSE_NO_TOOLS") == NULL;   /* function-calling: ON by default */
+    /* function-calling ON by default for dense; OFF for qwen3_next — the tools prompt is
+     * hundreds of tokens and prefilling it at qwen3_next's ~1-3 tok/s would take minutes. */
+    const bool tools_on = getenv("DS4_DENSE_NO_TOOLS") == NULL && !is_q3n;
     char *sys_buf = NULL;
     const char *sys = base_sys;
     if (tools_on) {
@@ -27430,7 +27446,8 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     uint32_t pos = 0;
     int rc = 0;
     bool first = true;
-    const bool think = true;   /* reflection is always on for dense models */
+    bool think = !is_q3n;   /* reflection on for dense; off by default for qwen3_next (too slow
+                             * at ~1-3 tok/s to reason before every answer). Toggle with /think. */
 
     /* sampling: greedy by default; /temp /topp /topk adjust it live */
     float temp = 0.0f, top_p = 0.95f;
@@ -27511,10 +27528,10 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         if (!strncmp(line, "/ctx", 4) && (line[4] == ' ' || line[4] == '\0')) {
             if (line[4] && atoi(line + 5) > 0) {
                 const uint32_t newc = (uint32_t)atoi(line + 5);
-                ds4_dense_gpu_free(g);
-                desc.n_ctx = newc; n_ctx = newc;
-                g = ds4_dense_gpu_create(&desc);
-                if (!g) { if (errlen) snprintf(err, errlen, "ctx resize failed"); rc = 1; break; }
+                n_ctx = newc;
+                if (is_q3n) { ds4_q3n_gpu_free(qg); qdesc.n_ctx = newc; qg = ds4_q3n_gpu_create(&qdesc); }
+                else        { ds4_dense_gpu_free(g); desc.n_ctx = newc;  g  = ds4_dense_gpu_create(&desc); }
+                if (is_q3n ? !qg : !g) { if (errlen) snprintf(err, errlen, "ctx resize failed"); rc = 1; break; }
                 pos = 0; first = true; base_pos = 0;
                 for (size_t i = 0; i < hist_n; i++) token_vec_free(&hist[i]);   /* reset transcript */
                 hist_n = 0;
@@ -27551,7 +27568,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             { token_vec st = {0};
               dense_chat_append_block(&st, &vocab, im_start, im_end, "system", sys);
               for (uint32_t i = 0; i < (uint32_t)st.len && pos < n_ctx - 1u && rc == 0; i++)
-                  if (ds4_dense_gpu_forward(g, &desc, st.v[i], pos++, logits) != 0) rc = 1;
+                  if (chat_step(is_q3n, g, &desc, qg, &qdesc, st.v[i], pos++, logits) != 0) rc = 1;
               token_vec_free(&st); }
             first = false; base_pos = pos;
             uint32_t loaded = 0;
@@ -27563,7 +27580,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                 for (uint32_t k = 0; k < len; k++) { int tok; if (fread(&tok, sizeof(int), 1, fp) != 1) { ok_read = 0; break; } token_vec_push(&tv, tok); }
                 if (!ok_read) { token_vec_free(&tv); break; }
                 for (uint32_t i = 0; i < (uint32_t)tv.len && pos < n_ctx - 1u && rc == 0; i++)
-                    if (ds4_dense_gpu_forward(g, &desc, tv.v[i], pos++, logits) != 0) rc = 1;
+                    if (chat_step(is_q3n, g, &desc, qg, &qdesc, tv.v[i], pos++, logits) != 0) rc = 1;
                 if (hist_n == hist_cap) { hist_cap = hist_cap ? hist_cap * 2 : 16; hist = xrealloc(hist, hist_cap * sizeof(hist[0])); }
                 hist[hist_n++] = tv;
                 loaded++;
@@ -27623,7 +27640,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             token_vec st = {0};
             dense_chat_append_block(&st, &vocab, im_start, im_end, "system", sys);
             for (uint32_t i = 0; i < (uint32_t)st.len && rc == 0; i++)
-                if (ds4_dense_gpu_forward(g, &desc, st.v[i], pos++, logits) != 0) rc = 1;
+                if (chat_step(is_q3n, g, &desc, qg, &qdesc, st.v[i], pos++, logits) != 0) rc = 1;
             token_vec_free(&st);
             first = false;
             base_pos = pos;       /* turn history begins here */
@@ -27669,7 +27686,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             pos = base_pos;                                   /* rebuild from system */
             for (size_t i = 0; i < hist_n && rc == 0; i++)
                 for (uint32_t k = 0; k < (uint32_t)hist[i].len && rc == 0; k++)
-                    if (ds4_dense_gpu_forward(g, &desc, hist[i].v[k], pos++, logits) != 0) rc = 1;
+                    if (chat_step(is_q3n, g, &desc, qg, &qdesc, hist[i].v[k], pos++, logits) != 0) rc = 1;
             if (rc) { token_vec_free(&t); break; }
             printf("\033[2m[context slid: dropped %zu old turn(s)]\033[0m\n", drop);
         }
@@ -27692,7 +27709,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
 
         /* prefill this turn's new tokens (KV from prior turns is reused) */
         for (uint32_t i = 0; i < (uint32_t)t.len && rc == 0; i++)
-            if (ds4_dense_gpu_forward(g, &desc, t.v[i], pos++, logits) != 0) rc = 1;
+            if (chat_step(is_q3n, g, &desc, qg, &qdesc, t.v[i], pos++, logits) != 0) rc = 1;
         token_vec_free(&t);
         if (rc) { if (spin_on) { g_spin_run = 0; pthread_join(spin, NULL); } break; }
 
@@ -27702,7 +27719,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             token_vec th = {0};
             bpe_tokenize_text(&vocab, "<think>\nUser's language: ", &th);
             for (uint32_t i = 0; i < (uint32_t)th.len && pos < n_ctx - 1u && rc == 0; i++)
-                if (ds4_dense_gpu_forward(g, &desc, th.v[i], pos++, logits) != 0) rc = 1;
+                if (chat_step(is_q3n, g, &desc, qg, &qdesc, th.v[i], pos++, logits) != 0) rc = 1;
             token_vec_free(&th);
             if (rc) { if (spin_on) { g_spin_run = 0; pthread_join(spin, NULL); } break; }
         }
@@ -27714,7 +27731,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
          * prints dimmed, the marker is dropped, then the final answer prints
          * normally. The answer text (after "</think>") is accumulated so the turn
          * can be re-fed clean (reasoning stripped from history). */
-        char *ans = dense_chat_gen_response(g, &desc, &vocab, &pos, n_ctx, logits, im_end,
+        char *ans = dense_chat_gen_response(is_q3n, g, &desc, qg, &qdesc, &vocab, &pos, n_ctx, logits, im_end,
                                             think_turn, temp, top_p, top_k, &rng, &rc);
 
         /* Tool loop: while the answer is a tool call, run it, feed the result back
@@ -27732,7 +27749,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                 /* close the assistant turn that emitted the call */
                 token_vec cl = {0}; token_vec_push(&cl, im_end); bpe_tokenize_text(&vocab, "\n", &cl);
                 for (uint32_t i = 0; i < (uint32_t)cl.len && pos < n_ctx - 1u; i++)
-                    if (ds4_dense_gpu_forward(g, &desc, cl.v[i], pos++, logits) != 0) rc = 1;
+                    if (chat_step(is_q3n, g, &desc, qg, &qdesc, cl.v[i], pos++, logits) != 0) rc = 1;
                 token_vec_free(&cl);
                 if (rc) break;
                 /* execute the tool + render the call/result as a bordered block */
@@ -27749,11 +27766,11 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                 if (think_turn) bpe_tokenize_text(&vocab, "<think>\n", &tr);
                 (void)wn;
                 for (uint32_t i = 0; i < (uint32_t)tr.len && pos < n_ctx - 1u && rc == 0; i++)
-                    if (ds4_dense_gpu_forward(g, &desc, tr.v[i], pos++, logits) != 0) rc = 1;
+                    if (chat_step(is_q3n, g, &desc, qg, &qdesc, tr.v[i], pos++, logits) != 0) rc = 1;
                 token_vec_free(&tr);
                 if (rc) break;
                 free(ans);
-                ans = dense_chat_gen_response(g, &desc, &vocab, &pos, n_ctx, logits, im_end,
+                ans = dense_chat_gen_response(is_q3n, g, &desc, qg, &qdesc, &vocab, &pos, n_ctx, logits, im_end,
                                               think_turn, temp, top_p, top_k, &rng, &rc);
                 if (rc) break;
             }
@@ -27787,14 +27804,14 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                 /* re-feed the clean turn over the dirty one (drops directive + reasoning) */
                 pos = pos_user_start;
                 for (uint32_t i = 0; i < (uint32_t)turn_clean.len && pos < n_ctx - 1u; i++)
-                    if (ds4_dense_gpu_forward(g, &desc, turn_clean.v[i], pos++, logits) != 0) { rc = 1; break; }
+                    if (chat_step(is_q3n, g, &desc, qg, &qdesc, turn_clean.v[i], pos++, logits) != 0) { rc = 1; break; }
             } else {
                 /* keep the live response; just append the closing <|im_end|>\n */
                 token_vec cl = {0};
                 token_vec_push(&cl, im_end);
                 bpe_tokenize_text(&vocab, "\n", &cl);
                 for (uint32_t i = 0; i < (uint32_t)cl.len && pos < n_ctx - 1u; i++)
-                    if (ds4_dense_gpu_forward(g, &desc, cl.v[i], pos++, logits) != 0) { rc = 1; break; }
+                    if (chat_step(is_q3n, g, &desc, qg, &qdesc, cl.v[i], pos++, logits) != 0) { rc = 1; break; }
                 token_vec_free(&cl);
             }
             /* record the turn for the sliding window (transfer ownership) */
@@ -27818,11 +27835,11 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     free(sys_buf);
     linenoiseFree(line);
     free(logits);
-    ds4_dense_gpu_free(g);
-    free(desc.layers);
+    if (is_q3n) { ds4_q3n_gpu_free(qg); free(qdesc.layers); }
+    else        { ds4_dense_gpu_free(g); free(desc.layers); }
     vocab_free(&vocab);
     model_close(&model);
-    if (rc && errlen) snprintf(err, errlen, "dense chat forward failed");
+    if (rc && errlen) snprintf(err, errlen, "%s chat forward failed", is_q3n ? "qwen3_next" : "dense");
     return rc;
 }
 
