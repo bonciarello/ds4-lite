@@ -201,3 +201,27 @@ llama-simple** ("1, 2, 3, 4, 5, 6, 7," → " 8, 9, 10, 11, 12, 13"); chat rispon
 - **Limite noto**: il prefill gemma è token-by-token (no matmul batchato) → O(ctx²), lento su prompt
   lunghi (~10 t/s, TTFT 191s su 1942 token). Follow-up: aggiungere il prefill batchato gemma.
 - Dettagli + status in [[gemma3-support]].
+
+## Chat CLI (stile Claude Code) — `--metal-dense-chat`
+
+La chat interattiva (`ds4_dense_chat`, condivisa da dense + gemma + q3n) replica le
+funzionalità osservabili del CLI di Claude Code, **tenendo il banner box iniziale**. Il repo
+`anthropics/claude-code` è solo il repo pubblico meta (niente sorgente CLI, pacchetto npm
+minificato); le feature sono reimplementate da zero in C.
+
+- **Rendering markdown** (`md_state`/`md_feed`/`md_emit_line` prima di `dense_chat_gen_response`):
+  renderer line-buffered della risposta — code block ``` come box a barra laterale (`╭─ lang` /
+  `│ ` cyan / `╰─`), `#` header → bold, bullet `-`/`*`/`N.`, inline **bold**/*italic*/`code`.
+  Solo su tty; `DS4_NO_MARKDOWN` off, `DS4_FORCE_MARKDOWN` on (pipe).
+- **Esc per interrompere**: durante la generazione il tty va in raw non-bloccante e un Esc ferma
+  lo stream (cooked mode ripristinato per il prompt). Solo su tty.
+- **Status footer + scorciatoie**: sotto l'input box, riga dim con `<modello> · ⏎ send · esc stop ·
+  / commands · ^D exit` (il modello resta visibile dopo lo scroll del banner). In `dense_ctx_status`.
+- **Menu slash autocomplete**: digitando `/` la status footer diventa un menu comandi filtrato live
+  (match più vicino evidenziato) via il meccanismo status multi-riga di linenoise (`dense_slash_menu`
+  in `dense_layout_cb`). `DENSE_CMDS[]` è la lista comandi.
+- **Tools/function-calling** (`read_file`/`bash`/`web_fetch`/`web_search`, formato Hermes
+  `<tool_call>`): ON anche per **gemma** — il prompt-tool è iniettato nel **primo turno user**
+  (`gemma_sys_pending`, gemma non ha system role). Validato end-to-end su gemma-3-27b (emette
+  `<tool_call>` ben formato, esegue, risponde dal risultato). Il tool loop rende chiamata (🔧) +
+  box risultato (`dense_tool_render`). Disabilita con `DS4_DENSE_NO_TOOLS`.
