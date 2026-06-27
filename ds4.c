@@ -27187,7 +27187,28 @@ static int ds4_q3n_chat(const char *model_path, const char *system, int ctx_size
     weights_bind(&weights, &model, false, 0, 0, true, false);
     const int im_start = vocab.user_id, im_end = vocab.assistant_id;
     if (im_start < 0 || im_end < 0) { if (errlen) snprintf(err, errlen, "ChatML tokens missing"); vocab_free(&vocab); model_close(&model); return 1; }
-    uint32_t n_ctx = ctx_size > 0 ? (uint32_t)ctx_size : 4096u;
+    /* Auto context: in qwen3_next only the full-attention layers (12/48) keep a growing KV
+     * cache — the 36 Gated-DeltaNet layers use a FIXED recurrent state — so a large context
+     * is cheap. The experts stream from SSD (zero-copy), so we don't subtract the 45GB model;
+     * budget ~1/10 of RAM for the KV cache (leaves the rest for the streamed expert working
+     * set), capped at the model's native context. Streaming the KV itself would be useless
+     * (attention reads ALL positions every token), so it lives in fast unified memory. */
+    uint32_t n_ctx;
+    if (ctx_size > 0) n_ctx = (uint32_t)ctx_size;
+    else {
+        const uint64_t native = (DS4_ROPE_ORIG_CTX > 0) ? DS4_ROPE_ORIG_CTX : 8192ull;
+        uint32_t n_full = 0; for (uint32_t i = 0; i < DS4_N_LAYER; i++) if (ds4_q3n_layer_is_full_attn(i)) n_full++;
+        const uint64_t kv_per_tok = (uint64_t)n_full * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 4ull;  /* f16 K+V */
+        uint64_t ram = 0; size_t rlen = sizeof ram;
+        if (sysctlbyname("hw.memsize", &ram, &rlen, NULL, 0) != 0 || ram == 0) ram = 16ull << 30;
+        uint64_t c = kv_per_tok ? (ram / 10ull) / kv_per_tok : native;
+        if (c > native) c = native;
+        c = (c / 1024ull) * 1024ull; if (c < 4096ull) c = 4096ull;
+        n_ctx = (uint32_t)c;
+        fprintf(stderr, "ds4: qwen3_next auto context %u tok  (native %llu · only %u/%u layers grow · KV %.0f KB/tok -> %.1f GB)\n",
+                n_ctx, (unsigned long long)native, n_full, (unsigned)DS4_N_LAYER,
+                (double)kv_per_tok / 1024.0, (double)n_ctx * (double)kv_per_tok / 1e9);
+    }
     ds4_q3n_model_desc desc; build_q3n_desc(&desc, &model, &weights, n_ctx);
     ds4_q3n_gpu *g = ds4_q3n_gpu_create(&desc);
     if (!g) { if (errlen) snprintf(err, errlen, "qwen3_next GPU create failed"); free(desc.layers); vocab_free(&vocab); model_close(&model); return 1; }
