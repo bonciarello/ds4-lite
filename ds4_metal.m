@@ -3853,6 +3853,7 @@ static const char *dense_kquant_sg_kernel(int type, uint32_t *nr0) {
         case 12: if (nr0) *nr0 = 2; return "kernel_dense_mul_mv_q4_K_f32_sg";
         case 13: if (nr0) *nr0 = 1; return "kernel_dense_mul_mv_q5_K_f32_sg";
         case 14: if (nr0) *nr0 = 2; return "kernel_dense_mul_mv_q6_K_f32_sg";
+        case 16: if (nr0) *nr0 = 2; return "kernel_dense_mul_mv_iq2_xxs_f32_sg";
         default: return NULL;
     }
 }
@@ -4230,6 +4231,7 @@ static const char *dense_kquant_kernel(int type) {
         case 12: return "kernel_dense_mul_mv_q4_K_f32";
         case 13: return "kernel_dense_mul_mv_q5_K_f32";
         case 14: return "kernel_dense_mul_mv_q6_K_f32";
+        case 16: return "kernel_dense_mul_mv_iq2_xxs_f32";   /* IQ2_XXS (no _sg variant) */
         default: return NULL;
     }
 }

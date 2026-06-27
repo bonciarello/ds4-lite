@@ -676,6 +676,97 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
     }
 }
 
+// Simple dense-path IQ2_XXS matvec (1 thread/row), out = dequant(W) . x, using the
+// {in_dim,out_dim} arg convention of the dense kernels (q3n routed-expert path). Reuses
+// the iq2xxs grid/sign tables above; correctness-first (no threadgroup caching). Dequant
+// mirrors kernel_mul_mv_iq2_xxs_f32_impl: per 32-value sub-block, scale d=db*(0.5+(aux32>>28)),
+// value = grid[aux8[l]][j] * sign; row sum is finally scaled by 0.25.
+kernel void kernel_dense_mul_mv_iq2_xxs_f32(
+        constant ds4_dense_mvq_args & a [[buffer(0)]],
+        device const char  * W   [[buffer(1)]],
+        device const float * x   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= a.out_dim) return;
+    const uint nblk = a.in_dim / 256u;
+    const uint BLK = 66u;                       // sizeof(block_iq2_xxs)
+    float acc = 0.0f;
+    for (uint bi = 0; bi < nblk; bi++) {
+        device const char * blk = W + (ulong)(row * nblk + bi) * BLK;
+        const float db = (float)(*(device const half *)(blk + 0));
+        device const uint16_t * qs = (device const uint16_t *)(blk + 2);
+        device const float * xb = x + (ulong)bi * 256u;
+        for (uint ib = 0; ib < 8u; ib++) {       // 8 sub-blocks of 32 values
+            device const uint16_t * q2 = qs + 4u*ib;
+            device const uint8_t  * aux8 = (device const uint8_t *)q2;
+            const uint32_t aux32 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+            const float d = db * (0.5f + (float)(aux32 >> 28));
+            device const float * yl = xb + 32u*ib;
+            float sum = 0.0f;
+            for (uint l = 0; l < 4u; l++) {
+                constant uchar * grid = (constant uchar *)(iq2xxs_grid + aux8[l]);
+                const uchar signs = ksigns_iq2xs[(aux32 >> (7u*l)) & 127u];
+                for (uint j = 0; j < 8u; j++)
+                    sum += yl[8u*l + j] * (float)grid[j] * ((signs & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+            }
+            acc += d * sum;
+        }
+    }
+    out[row] = acc * 0.25f;
+}
+
+// Optimized simdgroup IQ2_XXS matvec for the dense/q3n path (NSG=2 simdgroups, nr0=2 rows
+// per simdgroup, reduction via simd_sum). Mirrors kernel_mul_mv_iq2_xxs_f32_impl's partition
+// (thread ix strides the 32-value sub-blocks) but with ds4's {in_dim,out_dim} args + contiguous
+// per-row blocks, and reads the grid from constant memory (run_kquant_sg sets no threadgroup
+// mem). Dispatch: threadsPerThreadgroup=(32,2,1), threadgroups=ceil(out_dim/4).
+kernel void kernel_dense_mul_mv_iq2_xxs_f32_sg(
+        constant ds4_dense_mvq_args & args [[buffer(0)]],
+        device const char  * src0 [[buffer(1)]],
+        device const float * src1 [[buffer(2)]],
+        device       float * dst  [[buffer(3)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const short NSG = 2;
+    const short nr0 = 2;
+    const uint  nb   = args.in_dim / 256u;        // blocks/row
+    const uint  nb01 = nb * 66u;                  // bytes/row
+    const uint  nb32 = nb * 8u;                    // 32-value sub-blocks/row
+    const int   first_row = ((int)tgpig.x * NSG + (int)sgitg) * nr0;
+    device const float * y = src1;
+    float yl[32];
+    float sumf[nr0] = {0.f, 0.f};
+    const uint ix = tiisg;                         // 0..31
+    device const float * y4 = y + 32u*ix;
+    for (uint ib32 = ix; ib32 < nb32; ib32 += 32u) {
+        for (short i = 0; i < 32; ++i) yl[i] = y4[i];
+        const uint ibl = ib32 / 8u;                // block (256-group)
+        const uint ib  = ib32 % 8u;                // sub-block 0..7
+        for (short row = 0; row < nr0; ++row) {
+            device const char * blk = src0 + (ulong)(first_row + row) * nb01 + (ulong)ibl * 66u;
+            const float db = (float)(*(device const half *)(blk + 0));
+            device const uint16_t * q2 = (device const uint16_t *)(blk + 2) + 4u*ib;
+            device const uint8_t  * aux8 = (device const uint8_t *)q2;
+            const uint32_t aux32 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+            const float d = db * (0.5f + (float)(aux32 >> 28));
+            float sum = 0.f;
+            for (short l = 0; l < 4; ++l) {
+                constant uchar * grid = (constant uchar *)(iq2xxs_grid + aux8[l]);
+                const uchar signs = ksigns_iq2xs[(aux32 >> (7u*l)) & 127u];
+                for (short j = 0; j < 8; ++j)
+                    sum += yl[8*l + j] * (float)grid[j] * ((signs & kmask_iq2xs[j]) ? -1.f : 1.f);
+            }
+            sumf[row] += d * sum;
+        }
+        y4 += 32u * 32u;
+    }
+    for (short row = 0; row < nr0 && first_row + row < (int)args.out_dim; ++row) {
+        const float s = simd_sum(sumf[row]);
+        if (tiisg == 0) dst[first_row + row] = s * 0.25f;
+    }
+}
+
 template<int nr0>
 void kernel_mul_mv_iq2_xxs_pair_f32_impl(
         ds4_metal_args_mul_mv args,
