@@ -1806,6 +1806,76 @@ kernel void kernel_dense_attn_decode_f32_sg(
     }
 }
 
+// ---- int8 KV cache (DS4_KV_INT8): half the KV RAM -------------------------
+// Quantize one f32 KV slot (n values) to int8 with a single per-slot absmax scale.
+// Dispatch: grid=(1,1,1) tpg=(128,1,1).
+kernel void kernel_dense_cvt_f32_to_q8_f32(
+        constant uint & n [[buffer(0)]],
+        device const float * src   [[buffer(1)]],
+        device       char  * dst   [[buffer(2)]],
+        device       float * scale [[buffer(3)]],
+        uint   tid   [[thread_position_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint nt = 128u;
+    threadgroup float sdata[4];
+    float amax = 0.0f;
+    for (uint i = tid; i < n; i += nt) amax = max(amax, fabs(src[i]));
+    amax = simd_max(amax);
+    if (tiisg == 0) sdata[sgitg] = amax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { float mx = 0.0f; for (uint s = 0; s < nt/32u; s++) mx = max(mx, sdata[s]); sdata[0] = mx; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float s = sdata[0] > 0.0f ? sdata[0] / 127.0f : 1.0f;
+    if (tid == 0) scale[0] = s;
+    const float inv = 1.0f / s;
+    for (uint i = tid; i < n; i += nt) dst[i] = (char)clamp(round(src[i] * inv), -127.0f, 127.0f);
+}
+
+// Decode attention over an int8 KV cache with a per-slot scale (kscale/vscale[t]).
+// Mirror of kernel_dense_attn_decode_f32_sg; dequant = (float)int8 * scale[t].
+// Dispatch: threadgroups=(n_head,1,1) tpg=(32,1,1).
+kernel void kernel_dense_attn_decode_q8_sg(
+        constant ds4_dense_attn_args & a [[buffer(0)]],
+        device const float * q      [[buffer(1)]],
+        device const char  * kcache [[buffer(2)]],
+        device const float * kscale [[buffer(3)]],
+        device const char  * vcache [[buffer(4)]],
+        device const float * vscale [[buffer(5)]],
+        device       float * out    [[buffer(6)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]]) {
+    const uint hq = tgpig.x;
+    if (hq >= a.n_head) return;
+    const uint group = a.n_head / a.n_kv;
+    const uint hkv = hq / group;
+    const uint hd = a.head_dim;
+    const uint kvdim = a.n_kv * hd;
+    device const float * qh = q + hq * hd;
+    device       float * oh = out + hq * hd;
+    const uint ndl = (hd + 31u) / 32u;
+    float qreg[8]; float acc[8];
+    for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; qreg[j] = (d < hd) ? qh[d] : 0.0f; acc[j] = 0.0f; }
+    float m = -1e30f, l = 0.0f;
+    for (uint t = 0; t < a.n_ctx; t++) {
+        device const char * kt = kcache + (ulong)t*kvdim + hkv*hd;
+        const float ksc = kscale[t];
+        float p = 0.0f;
+        for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) p += qreg[j] * ((float)kt[d] * ksc); }
+        const float s = simd_sum(p) * a.scale;
+        const float m_new = max(m, s);
+        const float corr  = exp(m - m_new);
+        const float pe    = exp(s - m_new);
+        l = l * corr + pe;
+        device const char * vt = vcache + (ulong)t*kvdim + hkv*hd;
+        const float vsc = vscale[t];
+        for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) acc[j] = acc[j]*corr + pe * ((float)vt[d] * vsc); }
+        m = m_new;
+    }
+    const float inv = 1.0f / l;
+    for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) oh[d] = acc[j] * inv; }
+}
+
 // ===========================================================================
 // Gemma-3 kernels. Isolated variants of the dense building blocks for the
 // gemma3 quirks: RMSNorm with (1 + w) weights, per-head QK-norm, GeGLU (gelu

@@ -4098,10 +4098,11 @@ static void ds4_q6k_dequant_block(const uint8_t *blk, float *y) {
     }
 }
 
-typedef struct { ds4_gpu_tensor *k, *v; } ds4_dense_kv_layer;
+typedef struct { ds4_gpu_tensor *k, *v, *kscale, *vscale; } ds4_dense_kv_layer;
 
 struct ds4_dense_gpu {
     uint32_t n_layer, n_embd, n_ff, qd, kvd, n_vocab, n_ctx;
+    bool kv_int8;                       /* DS4_KV_INT8: store KV as int8 + per-slot scale (½ the KV RAM) */
     uint32_t swa_window, swa_pattern;   /* gemma sliding window: local layers cap their KV
                                          * cache at swa_window slots (ring buffer); 0 = off */
     ds4_gpu_tensor *x, *h, *h2, *q, *k, *v, *att, *o, *gate, *up, *act, *down, *logits;
@@ -4271,6 +4272,62 @@ static bool dense_attn(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *q,
                             MTLSizeMake(nh, 1, 1), MTLSizeMake(32, 1, 1), "fwd attn combine");
 }
 
+/* ---- int8 KV (DS4_KV_INT8) helpers + the KV write/read wrappers that hide the
+ * f16-vs-int8 storage from the forward (default f16 path is unchanged). --------- */
+static bool dense_cvt_q8(ds4_dense_gpu *g, ds4_gpu_tensor *dst8, ds4_gpu_tensor *scale, ds4_gpu_tensor *src32, uint32_t n) {
+    (void)g;
+    ds4_gpu_tensor *bufs[3] = { src32, dst8, scale };
+    return ds4_gpu_run_grid("kernel_dense_cvt_f32_to_q8_f32", &n, sizeof(n), bufs, 3,
+                            MTLSizeMake(1, 1, 1), MTLSizeMake(128, 1, 1), "kv q8 cvt");
+}
+static bool dense_attn_q8(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *q,
+                          ds4_gpu_tensor *kc, ds4_gpu_tensor *ksc, ds4_gpu_tensor *vc, ds4_gpu_tensor *vsc,
+                          uint32_t nh, uint32_t nkv, uint32_t hd, uint32_t nctx, float scale) {
+    (void)g;
+    struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; } a = { nh, nkv, hd, nctx, scale };
+    ds4_gpu_tensor *b6[6] = { q, kc, ksc, vc, vsc, out };   /* int8 attention is single-simdgroup (no split) */
+    return ds4_gpu_run_grid("kernel_dense_attn_decode_q8_sg", &a, sizeof(a), b6, 6,
+                            MTLSizeMake(nh, 1, 1), MTLSizeMake(32, 1, 1), "fwd attn q8");
+}
+
+/* Append the current K (g->k) and V (g->v) to layer kv at ring slot wslot. */
+static bool dense_kv_write(ds4_dense_gpu *g, ds4_dense_kv_layer *kv, uint32_t wslot, uint32_t kvd) {
+    if (g->kv_int8) {
+        ds4_gpu_tensor *ks  = ds4_gpu_tensor_view(kv->k, (uint64_t)wslot*kvd, (uint64_t)kvd);
+        ds4_gpu_tensor *vs  = ds4_gpu_tensor_view(kv->v, (uint64_t)wslot*kvd, (uint64_t)kvd);
+        ds4_gpu_tensor *ksc = ds4_gpu_tensor_view(kv->kscale, (uint64_t)wslot*4, 4);
+        ds4_gpu_tensor *vsc = ds4_gpu_tensor_view(kv->vscale, (uint64_t)wslot*4, 4);
+        bool ok = ks && vs && ksc && vsc
+               && dense_cvt_q8(g, ks, ksc, g->k, kvd) && dense_cvt_q8(g, vs, vsc, g->v, kvd);
+        ds4_gpu_tensor_free(ks); ds4_gpu_tensor_free(vs); ds4_gpu_tensor_free(ksc); ds4_gpu_tensor_free(vsc);
+        return ok;
+    }
+    ds4_gpu_tensor *ks = ds4_gpu_tensor_view(kv->k, (uint64_t)wslot*kvd*2, (uint64_t)kvd*2);
+    ds4_gpu_tensor *vs = ds4_gpu_tensor_view(kv->v, (uint64_t)wslot*kvd*2, (uint64_t)kvd*2);
+    bool ok = ks && vs && dense_cvt_f16(g, ks, g->k, kvd) && dense_cvt_f16(g, vs, g->v, kvd);
+    ds4_gpu_tensor_free(ks); ds4_gpu_tensor_free(vs);
+    return ok;
+}
+/* Attention over the first n_attn cache slots [0, n_attn). */
+static bool dense_kv_read_attn(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_dense_kv_layer *kv,
+                               uint32_t nh, uint32_t nkv, uint32_t hd, uint32_t n_attn, float scale) {
+    const uint32_t kvd = nkv*hd;
+    if (g->kv_int8) {
+        ds4_gpu_tensor *kc  = ds4_gpu_tensor_view(kv->k, 0, (uint64_t)n_attn*kvd);
+        ds4_gpu_tensor *vc  = ds4_gpu_tensor_view(kv->v, 0, (uint64_t)n_attn*kvd);
+        ds4_gpu_tensor *ksc = ds4_gpu_tensor_view(kv->kscale, 0, (uint64_t)n_attn*4);
+        ds4_gpu_tensor *vsc = ds4_gpu_tensor_view(kv->vscale, 0, (uint64_t)n_attn*4);
+        bool ok = kc && vc && ksc && vsc && dense_attn_q8(g, out, q, kc, ksc, vc, vsc, nh, nkv, hd, n_attn, scale);
+        ds4_gpu_tensor_free(kc); ds4_gpu_tensor_free(vc); ds4_gpu_tensor_free(ksc); ds4_gpu_tensor_free(vsc);
+        return ok;
+    }
+    ds4_gpu_tensor *kc = ds4_gpu_tensor_view(kv->k, 0, (uint64_t)n_attn*kvd*2);
+    ds4_gpu_tensor *vc = ds4_gpu_tensor_view(kv->v, 0, (uint64_t)n_attn*kvd*2);
+    bool ok = kc && vc && dense_attn(g, out, q, kc, vc, nh, nkv, hd, n_attn, scale);
+    ds4_gpu_tensor_free(kc); ds4_gpu_tensor_free(vc);
+    return ok;
+}
+
 ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     ds4_dense_gpu *g = calloc(1, sizeof(*g));
@@ -4280,6 +4337,7 @@ ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
     g->n_vocab = d->n_vocab; g->n_ctx = d->n_ctx;
     g->swa_window = d->gemma ? d->swa_window : 0u;   /* sliding-window KV only for gemma */
     g->swa_pattern = d->swa_pattern;
+    g->kv_int8 = getenv("DS4_KV_INT8") != NULL;
     g->wcache = [NSMutableDictionary dictionary];
     g->profile = getenv("DS4_DENSE_PROFILE") != NULL;
     g->model_base = d->model_base; g->model_size = d->model_size;
@@ -4327,8 +4385,15 @@ ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
     g->kv = calloc(d->n_layer, sizeof(g->kv[0]));
     for (uint32_t il = 0; il < d->n_layer; il++) {
         const uint64_t cap = dense_kv_cap(g, il);   /* sliding layers cap at swa_window slots */
-        g->kv[il].k = ds4_gpu_tensor_alloc(cap*g->kvd*2);  /* f16 KV cache */
-        g->kv[il].v = ds4_gpu_tensor_alloc(cap*g->kvd*2);
+        if (g->kv_int8) {                            /* int8 KV (cap*kvd bytes) + per-slot f32 scale */
+            g->kv[il].k = ds4_gpu_tensor_alloc(cap*g->kvd);
+            g->kv[il].v = ds4_gpu_tensor_alloc(cap*g->kvd);
+            g->kv[il].kscale = ds4_gpu_tensor_alloc(cap*4);
+            g->kv[il].vscale = ds4_gpu_tensor_alloc(cap*4);
+        } else {                                     /* f16 KV (cap*kvd*2 bytes) */
+            g->kv[il].k = ds4_gpu_tensor_alloc(cap*g->kvd*2);
+            g->kv[il].v = ds4_gpu_tensor_alloc(cap*g->kvd*2);
+        }
     }
     /* split-KV attention partials: [n_head, S_max] and [n_head, S_max, head_dim] */
     g->pm   = ds4_gpu_tensor_alloc((uint64_t)d->n_head*DS4_ATTN_SPLIT_MAX*4);
@@ -4341,6 +4406,9 @@ ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
     g->vattb=ds4_gpu_tensor_alloc(V*g->qd*4);     g->vgateb=ds4_gpu_tensor_alloc(V*g->n_ff*4);
     g->vupb=ds4_gpu_tensor_alloc(V*g->n_ff*4);    g->vactb=ds4_gpu_tensor_alloc(V*g->n_ff*4);
     g->vAllT=ds4_gpu_tensor_alloc(V*(uint64_t)g->n_vocab*4);
+    if (getenv("DS4_GPU_MEM"))
+        fprintf(stderr, "ds4: GPU allocated %.3f GiB after create (ctx=%u, KV=%s)\n",
+                (double)[g_device currentAllocatedSize]/(1024.0*1024*1024), g->n_ctx, g->kv_int8 ? "int8" : "f16");
     return g;
 }
 
@@ -4364,7 +4432,8 @@ void ds4_dense_gpu_free(ds4_dense_gpu *g) {
     ds4_gpu_tensor_free(g->vXb); ds4_gpu_tensor_free(g->vHb); ds4_gpu_tensor_free(g->vOb);
     ds4_gpu_tensor_free(g->vQb); ds4_gpu_tensor_free(g->vattb); ds4_gpu_tensor_free(g->vgateb);
     ds4_gpu_tensor_free(g->vupb); ds4_gpu_tensor_free(g->vactb); ds4_gpu_tensor_free(g->vAllT);
-    if (g->kv) for (uint32_t il = 0; il < g->n_layer; il++) { ds4_gpu_tensor_free(g->kv[il].k); ds4_gpu_tensor_free(g->kv[il].v); }
+    if (g->kv) for (uint32_t il = 0; il < g->n_layer; il++) { ds4_gpu_tensor_free(g->kv[il].k); ds4_gpu_tensor_free(g->kv[il].v);
+                                                              ds4_gpu_tensor_free(g->kv[il].kscale); ds4_gpu_tensor_free(g->kv[il].vscale); }
     free(g->kv); free(g->embedscratch); free(g->hostscratch);
     for (NSNumber *key in g->wcache) ds4_gpu_tensor_free((ds4_gpu_tensor *)[g->wcache[key] pointerValue]);
     g->wcache = nil;
@@ -4883,12 +4952,7 @@ static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d
             const uint32_t wslot = pos % cap;
             const uint32_t n_attn = (n_keys < cap) ? n_keys : cap;
 
-            ds4_gpu_tensor *kslot = ds4_gpu_tensor_view(kv->k, (uint64_t)wslot*kvd*2, (uint64_t)kvd*2);
-            ds4_gpu_tensor *vslot = ds4_gpu_tensor_view(kv->v, (uint64_t)wslot*kvd*2, (uint64_t)kvd*2);
-            ds4_gpu_tensor *kc = ds4_gpu_tensor_view(kv->k, 0, (uint64_t)n_attn*kvd*2);
-            ds4_gpu_tensor *vc = ds4_gpu_tensor_view(kv->v, 0, (uint64_t)n_attn*kvd*2);
-            ok = kslot && vslot && kc && vc
-              && gemma_rms(g, g->h, g->x, &L->attn_norm, ne, eps)
+            ok = gemma_rms(g, g->h, g->x, &L->attn_norm, ne, eps)
               && dense_matvec(g, &L->attn_q, g->h, g->q)
               && dense_matvec(g, &L->attn_k, g->h, g->k)
               && dense_matvec(g, &L->attn_v, g->h, g->v)
@@ -4896,9 +4960,8 @@ static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d
               && gemma_qk_norm(g, g->k, &L->attn_k_norm, nkv, hd, eps)
               && gemma_rope(g->q, nh,  hd, nrot, pos, rbase, rscale)
               && gemma_rope(g->k, nkv, hd, nrot, pos, rbase, rscale)
-              && dense_cvt_f16(g, kslot, g->k, kvd)
-              && dense_cvt_f16(g, vslot, g->v, kvd)
-              && dense_attn(g, g->att, g->q, kc, vc, nh, nkv, hd, n_attn, scale)
+              && dense_kv_write(g, kv, wslot, kvd)                                  /* f16 or int8 + scale */
+              && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv, hd, n_attn, scale)
               && dense_matvec(g, &L->attn_out, g->att, g->o)
               && gemma_rms(g, g->h, g->o, &L->attn_post_norm, ne, eps)
               && dense_add(g->x, g->h, ne)
@@ -4909,8 +4972,6 @@ static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d
               && dense_matvec(g, &L->ffn_down, g->act, g->down)
               && gemma_rms(g, g->h2, g->down, &L->ffn_post_norm, ne, eps)
               && dense_add(g->x, g->h2, ne);
-            ds4_gpu_tensor_free(kslot); ds4_gpu_tensor_free(vslot);
-            ds4_gpu_tensor_free(kc);    ds4_gpu_tensor_free(vc);
         }
         ok = ok && gemma_rms(g, g->h, g->x, &d->output_norm, ne, eps)
                 && dense_matvec(g, &d->output, g->h, g->logits);
@@ -4955,13 +5016,10 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
         for (uint32_t il = 0; ok && il < d->n_layer; il++) {
             const ds4_dense_layer_desc *L = &d->layers[il];
             ds4_dense_kv_layer *kv = &g->kv[il];
-            /* f16 KV: compute K/V in f32 scratch (g->k/g->v), bias + rope there,
-             * then narrow into the f16 cache slice at byte offset pos*kvd*2. */
-            ds4_gpu_tensor *kview = ds4_gpu_tensor_view(kv->k, (uint64_t)pos*kvd*2, (uint64_t)kvd*2);
-            ds4_gpu_tensor *vview = ds4_gpu_tensor_view(kv->v, (uint64_t)pos*kvd*2, (uint64_t)kvd*2);
+            /* KV: compute K/V in f32 scratch (g->k/g->v), bias + rope there, then append
+             * to the cache slot at pos (f16, or int8 + scale under DS4_KV_INT8). */
             const double ta0 = g->profile ? ds4_gpu_now_ms() : 0.0;
-            ok = kview && vview
-              && dense_rms(g, g->h, g->x, &L->attn_norm, ne, eps)
+            ok = dense_rms(g, g->h, g->x, &L->attn_norm, ne, eps)
               && dense_matvec(g, &L->attn_q, g->h, g->q)
               && dense_matvec(g, &L->attn_k, g->h, g->k)
               && dense_matvec(g, &L->attn_v, g->h, g->v)
@@ -4970,9 +5028,8 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
               && dense_add_bias(g, g->v, &L->attn_v_bias, kvd)
               && dense_rope(g->q, nh,  hd, nrot, pos, base)
               && dense_rope(g->k, nkv, hd, nrot, pos, base)
-              && dense_cvt_f16(g, kview, g->k, kvd)
-              && dense_cvt_f16(g, vview, g->v, kvd)
-              && dense_attn(g, g->att, g->q, kv->k, kv->v, nh, nkv, hd, pos+1, scale)
+              && dense_kv_write(g, kv, pos, kvd)
+              && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv, hd, pos+1, scale)
               && dense_matvec(g, &L->attn_out, g->att, g->o)
               && dense_add(g->x, g->o, ne);
             const double ta1 = g->profile ? ds4_gpu_now_ms() : 0.0;
@@ -4984,8 +5041,6 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
               && dense_matvec(g, &L->ffn_down, g->act, g->down)
               && dense_add(g->x, g->down, ne);
             const double ta2 = g->profile ? ds4_gpu_now_ms() : 0.0;
-            ds4_gpu_tensor_free(kview);
-            ds4_gpu_tensor_free(vview);
             if (g->profile) { g->t_attn += ta1 - ta0; g->t_ffn += ta2 - ta1; }
         }
         const double to0 = g->profile ? ds4_gpu_now_ms() : 0.0;
@@ -5316,10 +5371,10 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
                           const int *tokens, uint32_t M, uint32_t start_pos,
                           float *last_logits, float *all_logits) {
     if (M == 0) return 1;
-    /* gemma3 has no batched-matmul prefill yet: process the prompt one token at a
-     * time through the (validated) decode forward, which builds the KV cache
-     * incrementally. Slower prefill, but correct + reuses all gemma logic. */
-    if (d->gemma) {
+    /* gemma3 (no batched prefill) and int8 KV (batched prefill writes f16) fall back to
+     * processing the prompt one token at a time through the decode forward, which builds
+     * the KV cache incrementally in the right format. Slower prefill, but correct. */
+    if (d->gemma || g->kv_int8) {
         float *throwaway = all_logits ? NULL : malloc((size_t)d->n_vocab * sizeof(float));
         int rc = 0;
         for (uint32_t i = 0; i < M && rc == 0; i++) {
