@@ -4407,19 +4407,23 @@ ds4_q3n_gpu *ds4_q3n_gpu_create(const ds4_q3n_model_desc *d) {
         !g->att || !g->o || !g->moe_router || !g->moe_gate || !g->moe_up || !g->moe_act || !g->moe_down ||
         !g->embedscratch || !g->hostscratch || !g->conv_state || !g->ssm_state ||
         !g->kc || !g->vc || !g->dn_host || !g->dn_in) {
+        fprintf(stderr, "ds4 q3n create: alloc fail (ne=%u qd=%u kvd=%u nvoc=%u valdim=%u convdim=%u K=%u) "
+                "x=%d h=%d log=%d qf=%d moe=%d dn_host=%d dn_in=%d cs=%d ss=%d\n",
+                d->n_embd, qd, kvd, d->n_vocab, d->dn_value_dim, d->dn_conv_dim, d->dn_conv_kernel,
+                !!g->x,!!g->h,!!g->logits,!!g->q_full,!!g->moe_router,!!g->dn_host,!!g->dn_in,!!g->conv_state,!!g->ssm_state);
         ds4_q3n_gpu_free(g); return NULL;
     }
     /* per-layer caches: GPU KV (full-attn) or host conv+ssm state (DeltaNet), zero-init */
     for (uint32_t il = 0; il < d->n_layer; il++) {
         if (d->layers[il].is_full_attn) {
-            g->kc[il] = ds4_gpu_tensor_alloc((uint64_t)d->n_ctx*kvd*4);
-            g->vc[il] = ds4_gpu_tensor_alloc((uint64_t)d->n_ctx*kvd*4);
-            if (!g->kc[il] || !g->vc[il]) { ds4_q3n_gpu_free(g); return NULL; }
+            g->kc[il] = ds4_gpu_tensor_alloc((uint64_t)d->n_ctx*kvd*2);   /* f16 KV (the attn kernel reads half) */
+            g->vc[il] = ds4_gpu_tensor_alloc((uint64_t)d->n_ctx*kvd*2);
+            if (!g->kc[il] || !g->vc[il]) { fprintf(stderr,"ds4 q3n: KV alloc fail il=%u n_ctx=%u kvd=%u\n",il,d->n_ctx,kvd); ds4_q3n_gpu_free(g); return NULL; }
             continue;
         }
         g->conv_state[il] = calloc((size_t)(d->dn_conv_kernel - 1u) * d->dn_conv_dim, sizeof(float));
         g->ssm_state[il]  = calloc((size_t)d->dn_n_v_heads * d->dn_head_v * d->dn_head_v, sizeof(float));
-        if (!g->conv_state[il] || !g->ssm_state[il]) { ds4_q3n_gpu_free(g); return NULL; }
+        if (!g->conv_state[il] || !g->ssm_state[il]) { fprintf(stderr,"ds4 q3n: state alloc fail il=%u K=%u convdim=%u nv=%u hv=%u\n",il,d->dn_conv_kernel,d->dn_conv_dim,d->dn_n_v_heads,d->dn_head_v); ds4_q3n_gpu_free(g); return NULL; }
     }
     return g;
 }
@@ -4470,12 +4474,12 @@ static bool q3n_layer_full_attn(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d,
       if (!ds4_gpu_run_simple("kernel_dense_head_rms_norm_f32", &a, sizeof(a), b, 3, nkv, "q3n knorm")) return false; }
     if (!dense_rope(g->q, nh, hd, nrot, pos, base)) return false;
     if (!dense_rope(g->k, nkv, hd, nrot, pos, base)) return false;
-    /* append K,V at pos (f32 cache; unified memory + synchronous ops -> host memcpy is safe) */
-    { char *kdst = (char *)ds4_gpu_tensor_contents(g->kc[il]) + (size_t)pos*kvd*4;
-      char *vdst = (char *)ds4_gpu_tensor_contents(g->vc[il]) + (size_t)pos*kvd*4;
-      void *ksrc = ds4_gpu_tensor_contents(g->k), *vsrc = ds4_gpu_tensor_contents(g->v);
+    /* append K,V at pos as f16 (the attn kernel reads half; unified memory + synchronous ops) */
+    { __fp16 *kdst = (__fp16 *)((char *)ds4_gpu_tensor_contents(g->kc[il]) + (size_t)pos*kvd*2);
+      __fp16 *vdst = (__fp16 *)((char *)ds4_gpu_tensor_contents(g->vc[il]) + (size_t)pos*kvd*2);
+      const float *ksrc = (const float *)ds4_gpu_tensor_contents(g->k), *vsrc = (const float *)ds4_gpu_tensor_contents(g->v);
       if (!kdst || !vdst || !ksrc || !vsrc) return false;
-      memcpy(kdst, ksrc, (size_t)kvd*4); memcpy(vdst, vsrc, (size_t)kvd*4); }
+      for (uint32_t i = 0; i < kvd; i++) { kdst[i] = (__fp16)ksrc[i]; vdst[i] = (__fp16)vsrc[i]; } }
     { struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; } a = { nh, nkv, hd, pos+1u, scale };
       ds4_gpu_tensor *b[4] = { g->q, g->kc[il], g->vc[il], g->att };
       if (!ds4_gpu_run_grid("kernel_dense_attn_decode_f32_sg", &a, sizeof(a), b, 4,
@@ -4648,12 +4652,19 @@ int ds4_q3n_gpu_forward(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d,
         for (uint32_t b = 0; b < nblk; b++) ds4_q4k_dequant_block(row + (size_t)b*144u, g->embedscratch + b*256);
         ds4_gpu_tensor_write(g->x, 0, g->embedscratch, (uint64_t)ne*4);
 
+        const bool dbg = getenv("DS4_Q3N_DBG") != NULL;
+        if (dbg) { const float *x=(const float*)ds4_gpu_tensor_contents(g->x);
+            fprintf(stderr,"[pos %u tok %d] emb: %.4f %.4f %.4f .. %.4f %.4f %.4f\n", (unsigned)pos, token,
+                    x[0],x[1],x[2],x[ne-3],x[ne-2],x[ne-1]); }
         bool ok = true;
         for (uint32_t il = 0; ok && il < d->n_layer; il++) {
             const ds4_q3n_layer_desc *L = &d->layers[il];
             ok = L->is_full_attn ? q3n_layer_full_attn(g, d, L, il, (uint32_t)pos)
                                  : q3n_layer_deltanet(g, d, L, il);
             ok = ok && q3n_moe_ffn(g, d, L);
+            if (dbg && pos==0 && il<=4) { const float *x=(const float*)ds4_gpu_tensor_contents(g->x);
+                fprintf(stderr,"[pos %u] l_out-%u (%s): %.4f %.4f %.4f .. %.4f %.4f %.4f\n", (unsigned)pos, il,
+                        L->is_full_attn?"full":"dnet", x[0],x[1],x[2],x[ne-3],x[ne-2],x[ne-1]); }
         }
         ok = ok && q3n_rms(g, g->h, g->x, &d->output_norm, ne, d->rms_eps)
                 && q3n_matvec(g, &d->output, g->h, g->logits);

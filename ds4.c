@@ -4133,7 +4133,10 @@ static void config_build_qwen3next_shape(const ds4_model *m) {
     model_get_u32_ns(m, ns, "embedding_length",         &s.n_embd);
     model_get_u32_ns(m, ns, "attention.head_count",     &s.n_head);
     model_get_u32_ns(m, ns, "attention.head_count_kv",  &s.n_head_kv);
-    model_get_u32_ns(m, ns, "vocab_size",               &s.n_vocab);
+    if (!model_get_u32_ns(m, ns, "vocab_size", &s.n_vocab) || s.n_vocab == 0) {
+        ds4_array_ref tokens;                                  /* fallback: tokenizer token count */
+        if (model_get_array(m, "tokenizer.ggml.tokens", &tokens)) s.n_vocab = (uint32_t)tokens.len;
+    }
     model_get_u32_ns(m, ns, "expert_count",             &s.n_expert);
     model_get_u32_ns(m, ns, "expert_used_count",        &s.n_expert_used);
     if (!model_get_u32_ns(m, ns, "expert_feed_forward_length", &s.n_ff_exp))
