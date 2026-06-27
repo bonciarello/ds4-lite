@@ -27175,6 +27175,63 @@ static bool dense_pick_model(char *out, size_t cap) {
     return k > 0;
 }
 
+/* Minimal interactive ChatML REPL for qwen3_next (EXPERIMENTAL, ~1 tok/s). Persists the
+ * KV/SSM state across turns. Simpler than the dense chat (no tools/sessions/fancy UI). */
+static int ds4_q3n_chat(const char *model_path, const char *system, int ctx_size,
+                        char *err, size_t errlen) {
+    ds4_model model; ds4_vocab vocab; ds4_weights weights;
+    model_open(&model, model_path, false, true);
+    config_validate_model(&model);
+    if (!ds4_arch_is_qwen3next()) { if (errlen) snprintf(err, errlen, "not a qwen3_next model"); model_close(&model); return 1; }
+    vocab_load(&vocab, &model);
+    weights_bind(&weights, &model, false, 0, 0, true, false);
+    const int im_start = vocab.user_id, im_end = vocab.assistant_id;
+    if (im_start < 0 || im_end < 0) { if (errlen) snprintf(err, errlen, "ChatML tokens missing"); vocab_free(&vocab); model_close(&model); return 1; }
+    uint32_t n_ctx = ctx_size > 0 ? (uint32_t)ctx_size : 4096u;
+    ds4_q3n_model_desc desc; build_q3n_desc(&desc, &model, &weights, n_ctx);
+    ds4_q3n_gpu *g = ds4_q3n_gpu_create(&desc);
+    if (!g) { if (errlen) snprintf(err, errlen, "qwen3_next GPU create failed"); free(desc.layers); vocab_free(&vocab); model_close(&model); return 1; }
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    const char *sys = (system && system[0]) ? system : "You are a helpful assistant.";
+    printf("\n\033[1mds4 · Qwen3-Next-80B-A3B\033[0m \033[2m(EXPERIMENTAL ~1 tok/s · ctx %u · /exit to quit)\033[0m\n\n", n_ctx);
+    uint32_t pos = 0; int rc = 0; bool first = true;
+    char *line = xmalloc(65536);
+    while (rc == 0) {
+        printf("\033[1m›\033[0m "); fflush(stdout);
+        if (!fgets(line, 65536, stdin)) break;
+        size_t L = strlen(line); while (L && (line[L-1] == '\n' || line[L-1] == '\r')) line[--L] = '\0';
+        if (L == 0) continue;
+        if (!strcmp(line, "/exit") || !strcmp(line, "/quit")) break;
+        token_vec t = {0};
+        if (first) { dense_chat_append_block(&t, &vocab, im_start, im_end, "system", sys); first = false; }
+        dense_chat_append_block(&t, &vocab, im_start, im_end, "user", line);
+        token_vec_push(&t, im_start);
+        bpe_tokenize_text(&vocab, "assistant\n", &t);
+        for (uint32_t i = 0; i < (uint32_t)t.len && pos < n_ctx - 1u && rc == 0; i++)
+            if (ds4_q3n_gpu_forward(g, &desc, t.v[i], pos++, logits) != 0) rc = 1;
+        token_vec_free(&t);
+        printf("\033[36m");
+        while (rc == 0 && pos < n_ctx - 1u) {
+            int next = sample_argmax(logits, DS4_N_VOCAB);
+            if (next == im_end || next == vocab.eos_id) break;
+            dense_print_token(&vocab, next); fflush(stdout);
+            if (ds4_q3n_gpu_forward(g, &desc, next, pos++, logits) != 0) { rc = 1; break; }
+        }
+        printf("\033[0m\n\n");
+        /* close the assistant turn in the context (im_end + newline) */
+        if (rc == 0 && pos < n_ctx - 1u) {
+            token_vec e = {0}; token_vec_push(&e, im_end); bpe_tokenize_text(&vocab, "\n", &e);
+            for (uint32_t i = 0; i < (uint32_t)e.len && pos < n_ctx - 1u && rc == 0; i++)
+                if (ds4_q3n_gpu_forward(g, &desc, e.v[i], pos++, logits) != 0) rc = 1;
+            token_vec_free(&e);
+        }
+        if (pos >= n_ctx - 2u) { printf("\033[2m(context full — restart to continue)\033[0m\n"); break; }
+    }
+    free(line); free(logits); ds4_q3n_gpu_free(g); free(desc.layers);
+    vocab_free(&vocab); model_close(&model);
+    return rc;
+}
+
 int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                    char *err, size_t errlen) {
     ds4_model model;
@@ -27196,22 +27253,10 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         return 1;
     }
     if (ds4_arch_is_qwen3next()) {
-        /* Phase 1: bind the tensors (verifies the full GGUF tensor map against the real
-         * model) and report, then reject — the forward (Gated-DeltaNet + 512-expert MoE
-         * over SSD streaming) is still being built. See docs/QWEN3NEXT_PLAN.md. */
-        vocab_load(&vocab, &model);
-        weights_bind(&weights, &model, false, 0, 0, true, false);
-        uint32_t nfull = 0;
-        for (uint32_t i = 0; i < DS4_N_LAYER; i++) if (ds4_q3n_layer_is_full_attn(i)) nfull++;
-        fprintf(stderr,
-            "ds4: qwen3_next weights bound OK — %u layers (%u full-attn, %u DeltaNet), "
-            "%u experts (top-%u) + shared.\n"
-            "     forward not yet implemented; see docs/QWEN3NEXT_PLAN.md.\n",
-            (unsigned)DS4_N_LAYER, nfull, (unsigned)DS4_N_LAYER - nfull,
-            (unsigned)DS4_N_EXPERT, (unsigned)g_ds4_shape.n_expert_used);
-        if (errlen) snprintf(err, errlen, "qwen3_next forward not yet implemented (weights bind OK)");
+        /* qwen3_next has its own forward + REPL; re-open it there (this open was just for
+         * arch detection). */
         model_close(&model);
-        return 1;
+        return ds4_q3n_chat(model_path, system, ctx_size, err, errlen);
     }
     vocab_load(&vocab, &model);
     weights_bind(&weights, &model, false, 0, 0, true, false);
