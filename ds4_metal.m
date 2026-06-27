@@ -4316,8 +4316,11 @@ void ds4_dense_gpu_free(ds4_dense_gpu *g) {
  * the full-attention, DeltaNet and MoE layer bodies are being filled in + validated
  * against the llama.cpp oracle. Layers currently pass the residual through. */
 struct ds4_q3n_gpu {
-    uint32_t n_layer, n_embd, n_vocab;
+    uint32_t n_layer, n_embd, n_vocab, n_ctx, n_head, n_kv, head_dim;
     ds4_gpu_tensor *x, *h, *logits;
+    /* full-attention scratch */
+    ds4_gpu_tensor *q_full, *q, *gate, *k, *v, *att, *o;
+    ds4_gpu_tensor **kc, **vc;       /* [n_layer] f32 KV cache [n_ctx, n_kv*head_dim], full-attn layers only */
     float *embedscratch;             /* n_embd */
     float *hostscratch;              /* n_vocab (f32 matvec readback) */
     NSMutableDictionary<NSNumber *, NSValue *> *wcache;
@@ -4367,21 +4370,38 @@ ds4_q3n_gpu *ds4_q3n_gpu_create(const ds4_q3n_model_desc *d) {
     ds4_q3n_gpu *g = calloc(1, sizeof(*g));
     if (!g) return NULL;
     g->n_layer = d->n_layer; g->n_embd = d->n_embd; g->n_vocab = d->n_vocab;
+    g->n_ctx = d->n_ctx; g->n_head = d->n_head; g->n_kv = d->n_kv; g->head_dim = d->head_dim;
     g->model_base = d->model_base; g->model_size = d->model_size;
     g->wcache = [NSMutableDictionary dictionary];
+    const uint32_t qd = d->n_head*d->head_dim, kvd = d->n_kv*d->head_dim;
     g->x = ds4_gpu_tensor_alloc((uint64_t)d->n_embd*4);
     g->h = ds4_gpu_tensor_alloc((uint64_t)d->n_embd*4);
     g->logits = ds4_gpu_tensor_alloc((uint64_t)d->n_vocab*4);
+    g->q_full = ds4_gpu_tensor_alloc((uint64_t)qd*2*4);   /* [q|gate] */
+    g->q   = ds4_gpu_tensor_alloc((uint64_t)qd*4);
+    g->gate= ds4_gpu_tensor_alloc((uint64_t)qd*4);
+    g->k   = ds4_gpu_tensor_alloc((uint64_t)kvd*4);
+    g->v   = ds4_gpu_tensor_alloc((uint64_t)kvd*4);
+    g->att = ds4_gpu_tensor_alloc((uint64_t)qd*4);
+    g->o   = ds4_gpu_tensor_alloc((uint64_t)d->n_embd*4);
     g->embedscratch = malloc((size_t)d->n_embd*4);
     g->hostscratch = malloc((size_t)d->n_vocab*4);
     g->conv_state = calloc(d->n_layer, sizeof(*g->conv_state));
     g->ssm_state  = calloc(d->n_layer, sizeof(*g->ssm_state));
-    if (!g->x || !g->h || !g->logits || !g->embedscratch || !g->hostscratch || !g->conv_state || !g->ssm_state) {
+    g->kc = calloc(d->n_layer, sizeof(*g->kc));
+    g->vc = calloc(d->n_layer, sizeof(*g->vc));
+    if (!g->x || !g->h || !g->logits || !g->q_full || !g->q || !g->gate || !g->k || !g->v ||
+        !g->att || !g->o || !g->embedscratch || !g->hostscratch || !g->conv_state || !g->ssm_state || !g->kc || !g->vc) {
         ds4_q3n_gpu_free(g); return NULL;
     }
-    /* DeltaNet state caches (zero-initialized), one per DeltaNet layer */
+    /* per-layer caches: KV (full-attn) or conv+ssm state (DeltaNet), zero-initialized */
     for (uint32_t il = 0; il < d->n_layer; il++) {
-        if (d->layers[il].is_full_attn) continue;
+        if (d->layers[il].is_full_attn) {
+            g->kc[il] = ds4_gpu_tensor_alloc((uint64_t)d->n_ctx*kvd*4);
+            g->vc[il] = ds4_gpu_tensor_alloc((uint64_t)d->n_ctx*kvd*4);
+            if (!g->kc[il] || !g->vc[il]) { ds4_q3n_gpu_free(g); return NULL; }
+            continue;
+        }
         const uint64_t conv_bytes = (uint64_t)(d->dn_conv_kernel - 1u) * d->dn_conv_dim * 4u;
         const uint64_t ssm_bytes  = (uint64_t)d->dn_n_v_heads * d->dn_head_v * d->dn_head_v * 4u;
         g->conv_state[il] = ds4_gpu_tensor_alloc(conv_bytes);
@@ -4396,6 +4416,11 @@ ds4_q3n_gpu *ds4_q3n_gpu_create(const ds4_q3n_model_desc *d) {
 void ds4_q3n_gpu_free(ds4_q3n_gpu *g) {
     if (!g) return;
     ds4_gpu_tensor_free(g->x); ds4_gpu_tensor_free(g->h); ds4_gpu_tensor_free(g->logits);
+    ds4_gpu_tensor_free(g->q_full); ds4_gpu_tensor_free(g->q); ds4_gpu_tensor_free(g->gate);
+    ds4_gpu_tensor_free(g->k); ds4_gpu_tensor_free(g->v); ds4_gpu_tensor_free(g->att); ds4_gpu_tensor_free(g->o);
+    if (g->kc) for (uint32_t il = 0; il < g->n_layer; il++) ds4_gpu_tensor_free(g->kc[il]);
+    if (g->vc) for (uint32_t il = 0; il < g->n_layer; il++) ds4_gpu_tensor_free(g->vc[il]);
+    free(g->kc); free(g->vc);
     if (g->conv_state) for (uint32_t il = 0; il < g->n_layer; il++) ds4_gpu_tensor_free(g->conv_state[il]);
     if (g->ssm_state)  for (uint32_t il = 0; il < g->n_layer; il++) ds4_gpu_tensor_free(g->ssm_state[il]);
     free(g->conv_state); free(g->ssm_state);
@@ -4405,10 +4430,51 @@ void ds4_q3n_gpu_free(ds4_q3n_gpu *g) {
     free(g);
 }
 
+/* Full-attention layer: rmsnorm -> Wq/Wk/Wv -> split [q|gate] -> per-head q/k RMSNorm ->
+ * RoPE -> append KV -> GQA attention -> att *= sigmoid(gate) -> Wo -> residual.
+ * Reuses the validated dense rope/attn/rms kernels + the qwen3_next split/head_rms/gate. */
+static bool q3n_layer_full_attn(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d,
+                                const ds4_q3n_layer_desc *L, uint32_t il, uint32_t pos) {
+    const uint32_t ne=d->n_embd, nh=d->n_head, nkv=d->n_kv, hd=d->head_dim, nrot=d->n_rot;
+    const uint32_t qd=nh*hd, kvd=nkv*hd;
+    const float eps=d->rms_eps, base=d->rope_base, scale=1.0f/sqrtf((float)hd);
+    if (!q3n_rms(g, g->h, g->x, &L->attn_norm, ne, eps)) return false;
+    if (!q3n_matvec(g, &L->attn_q, g->h, g->q_full)) return false;
+    if (!q3n_matvec(g, &L->attn_k, g->h, g->k)) return false;
+    if (!q3n_matvec(g, &L->attn_v, g->h, g->v)) return false;
+    { struct __attribute__((packed)) { uint32_t nh, hd; } a = { nh, hd };       /* split [q|gate] */
+      ds4_gpu_tensor *b[3] = { g->q_full, g->q, g->gate };
+      if (!ds4_gpu_run_simple("kernel_q3n_split_qgate_f32", &a, sizeof(a), b, 3, nh*hd, "q3n split")) return false; }
+    ds4_gpu_tensor *qn = q3n_cached_weight(g, L->attn_q_norm.data, L->attn_q_norm.bytes);
+    ds4_gpu_tensor *kn = q3n_cached_weight(g, L->attn_k_norm.data, L->attn_k_norm.bytes);
+    if (!qn || !kn) return false;
+    { struct __attribute__((packed)) { uint32_t nh, hd; float eps; } a = { nh, hd, eps };   /* q norm */
+      ds4_gpu_tensor *b[3] = { g->q, qn, g->q };
+      if (!ds4_gpu_run_simple("kernel_dense_head_rms_norm_f32", &a, sizeof(a), b, 3, nh, "q3n qnorm")) return false; }
+    { struct __attribute__((packed)) { uint32_t nh, hd; float eps; } a = { nkv, hd, eps };  /* k norm */
+      ds4_gpu_tensor *b[3] = { g->k, kn, g->k };
+      if (!ds4_gpu_run_simple("kernel_dense_head_rms_norm_f32", &a, sizeof(a), b, 3, nkv, "q3n knorm")) return false; }
+    if (!dense_rope(g->q, nh, hd, nrot, pos, base)) return false;
+    if (!dense_rope(g->k, nkv, hd, nrot, pos, base)) return false;
+    /* append K,V at pos (f32 cache; unified memory + synchronous ops -> host memcpy is safe) */
+    { char *kdst = (char *)ds4_gpu_tensor_contents(g->kc[il]) + (size_t)pos*kvd*4;
+      char *vdst = (char *)ds4_gpu_tensor_contents(g->vc[il]) + (size_t)pos*kvd*4;
+      void *ksrc = ds4_gpu_tensor_contents(g->k), *vsrc = ds4_gpu_tensor_contents(g->v);
+      if (!kdst || !vdst || !ksrc || !vsrc) return false;
+      memcpy(kdst, ksrc, (size_t)kvd*4); memcpy(vdst, vsrc, (size_t)kvd*4); }
+    { struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; } a = { nh, nkv, hd, pos+1u, scale };
+      ds4_gpu_tensor *b[4] = { g->q, g->kc[il], g->vc[il], g->att };
+      if (!ds4_gpu_run_grid("kernel_dense_attn_decode_f32_sg", &a, sizeof(a), b, 4,
+                            MTLSizeMake(nh,1,1), MTLSizeMake(32,1,1), "q3n attn")) return false; }
+    { ds4_gpu_tensor *b[3] = { g->att, g->gate, g->att };                        /* att *= sigmoid(gate) */
+      if (!ds4_gpu_run_simple("kernel_dense_sigmoid_gate_f32", &qd, sizeof(qd), b, 3, qd, "q3n attn gate")) return false; }
+    if (!q3n_matvec(g, &L->attn_out, g->att, g->o)) return false;
+    return dense_add(g->x, g->o, ne);
+}
+
 int ds4_q3n_gpu_forward(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d,
                         int token, unsigned pos, float *logits) {
     @autoreleasepool {
-        (void)pos;
         /* embedding: dequant token_embd row `token` (Q4_K) and upload */
         if (d->token_embd.type != 12) return 2;
         const uint32_t ne = d->n_embd, nblk = ne/256u;
@@ -4418,9 +4484,9 @@ int ds4_q3n_gpu_forward(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d,
 
         bool ok = true;
         for (uint32_t il = 0; ok && il < d->n_layer; il++) {
-            /* TODO(layer bodies): full-attention | Gated-DeltaNet, then MoE FFN.
-             * Scaffold passes the residual stream through unchanged. */
-            (void)il;
+            const ds4_q3n_layer_desc *L = &d->layers[il];
+            if (L->is_full_attn) ok = q3n_layer_full_attn(g, d, L, il, (uint32_t)pos);
+            /* TODO: DeltaNet layers + MoE FFN (currently passthrough). */
         }
         ok = ok && q3n_rms(g, g->h, g->x, &d->output_norm, ne, d->rms_eps)
                 && q3n_matvec(g, &d->output, g->h, g->logits);

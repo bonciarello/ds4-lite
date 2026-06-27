@@ -2963,3 +2963,20 @@ kernel void kernel_dnet_gate_f32(
     gb[(size_t)h*2 + 0] = sp * a_log[h];
     gb[(size_t)h*2 + 1] = 1.0f / (1.0f + exp(-b_raw[h]));        /* sigmoid */
 }
+
+/* qwen3_next full-attn Q projection packs [query|gate] interleaved per head:
+ * qfull[h] = [ query(head_dim) | gate(head_dim) ]. De-interleave into contiguous
+ * q[n_head, head_dim] and gate[n_head, head_dim]. One thread per (head, d). */
+struct q3n_split_args { uint n_head; uint head_dim; };
+kernel void kernel_q3n_split_qgate_f32(
+        constant q3n_split_args & a [[buffer(0)]],
+        device const float * qfull [[buffer(1)]],   /* [n_head, 2*head_dim] */
+        device       float * q     [[buffer(2)]],   /* [n_head, head_dim] */
+        device       float * gate  [[buffer(3)]],   /* [n_head, head_dim] */
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.n_head * a.head_dim) return;
+    const uint h = gid / a.head_dim, d = gid % a.head_dim;
+    const size_t base = (size_t)h * 2u * a.head_dim;
+    q[gid]    = qfull[base + d];
+    gate[gid] = qfull[base + a.head_dim + d];
+}
