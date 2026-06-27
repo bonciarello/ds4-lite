@@ -4512,11 +4512,14 @@ static bool q3n_layer_deltanet(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d,
     const uint32_t Hk=d->dn_n_k_heads, Hv=d->dn_n_v_heads, Sk=d->dn_head_k, Sv=d->dn_head_v;
     const uint32_t key_dim=d->dn_key_dim, val_dim=d->dn_value_dim, conv_dim=d->dn_conv_dim, K=d->dn_conv_kernel;
     const float eps=d->rms_eps, qscale=1.0f/sqrtf((float)Sk);
-    /* h = rmsnorm(x); 3 projections on GPU */
-    if (!q3n_rms(g, g->h, g->x, &L->attn_norm, ne, eps)) return false;
-    if (!q3n_matvec(g, &L->dn_in_proj, g->h, g->q_full)) return false;   /* qkv_mixed [conv_dim] */
-    if (!q3n_matvec(g, &L->dn_gate,    g->h, g->gate))   return false;   /* z [val_dim] */
-    if (!q3n_matvec(g, &L->dn_ba,      g->h, g->k))      return false;   /* ba [2*Hv] */
+    /* h = rmsnorm(x); 3 projections on GPU — batched into one command buffer */
+    { const bool b = ds4_gpu_begin_commands() != 0; if (b) g_batch_serialize = true;
+      bool ok = q3n_rms(g, g->h, g->x, &L->attn_norm, ne, eps)
+        && q3n_matvec(g, &L->dn_in_proj, g->h, g->q_full)   /* qkv_mixed [conv_dim] */
+        && q3n_matvec(g, &L->dn_gate,    g->h, g->gate)     /* z [val_dim] */
+        && q3n_matvec(g, &L->dn_ba,      g->h, g->k);       /* ba [2*Hv] */
+      if (b) { if (!ds4_gpu_end_commands()) ok = false; g_batch_serialize = false; }
+      if (!ok) return false; }
     const float *qkv = (const float *)ds4_gpu_tensor_contents(g->q_full);
     const float *z   = (const float *)ds4_gpu_tensor_contents(g->gate);
     const float *ba  = (const float *)ds4_gpu_tensor_contents(g->k);
@@ -4583,10 +4586,12 @@ static bool q3n_layer_deltanet(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d,
         for (uint32_t i=0;i<Sv;i++){ const float zz=z[v*Sv+i]; final[v*Sv+i]=o[v*Sv+i]*sc*ssm_norm[i]*(zz/(1.0f+expf(-zz))); }
     }
 
-    /* out projection (GPU) + residual */
+    /* out projection (GPU) + residual — batched */
     ds4_gpu_tensor_write(g->dn_in, 0, final, (uint64_t)val_dim*4u);
-    if (!q3n_matvec(g, &L->dn_out_proj, g->dn_in, g->o)) return false;
-    return dense_add(g->x, g->o, ne);
+    const bool b = ds4_gpu_begin_commands() != 0; if (b) g_batch_serialize = true;
+    bool ok = q3n_matvec(g, &L->dn_out_proj, g->dn_in, g->o) && dense_add(g->x, g->o, ne);
+    if (b) { if (!ds4_gpu_end_commands()) ok = false; g_batch_serialize = false; }
+    return ok;
 }
 
 /* per-expert weight slice within a [n_embd, n_ff_exp, n_expert] (or down [n_ff,n_embd,n_exp])
@@ -4613,8 +4618,11 @@ static bool q3n_axpy(ds4_gpu_tensor *acc, ds4_gpu_tensor *x, float scale, uint32
 static bool q3n_moe_ffn(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d, const ds4_q3n_layer_desc *L) {
     const uint32_t ne=d->n_embd, nff=d->n_ff_exp, nexp=d->n_expert, nused=d->n_expert_used;
     const float eps=d->rms_eps;
-    if (!q3n_rms(g, g->h, g->x, &L->post_attn_norm, ne, eps)) return false;
-    if (!q3n_matvec(g, &L->ffn_gate_inp, g->h, g->moe_router)) return false;   /* router logits [nexp] */
+    { const bool b = ds4_gpu_begin_commands() != 0; if (b) g_batch_serialize = true;   /* rmsnorm + router */
+      bool ok = q3n_rms(g, g->h, g->x, &L->post_attn_norm, ne, eps)
+        && q3n_matvec(g, &L->ffn_gate_inp, g->h, g->moe_router);                       /* router logits [nexp] */
+      if (b) { if (!ds4_gpu_end_commands()) ok = false; g_batch_serialize = false; }
+      if (!ok) return false; }
     float *rl = (float *)ds4_gpu_tensor_contents(g->moe_router);
     const float *hh = (const float *)ds4_gpu_tensor_contents(g->h);
     if (!rl || !hh) return false;
@@ -4630,6 +4638,16 @@ static bool q3n_moe_ffn(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d, const ds4_q
         sel[i]=bi; selw[i]=best; rl[bi]=-1.0f; wsum+=best; }
     if (wsum < 6.103515625e-5) wsum = 6.103515625e-5;
     for (uint32_t i=0;i<nused;i++) selw[i]/=(float)wsum;
+    /* prefetch: kick off parallel disk reads for ALL selected experts' weights before the
+     * matvec loop faults them one at a time (the model is 45GB > RAM, so experts stream
+     * from SSD; WILLNEED lets the NVMe queue serve them concurrently). */
+#if defined(POSIX_MADV_WILLNEED)
+    { const uint64_t gb = L->ffn_gate_exps.bytes/nexp, ub = L->ffn_up_exps.bytes/nexp, db = L->ffn_down_exps.bytes/nexp;
+      for (uint32_t i=0;i<nused;i++){ const uint32_t e=sel[i];
+        posix_madvise((void*)((const char*)L->ffn_gate_exps.data + (size_t)e*gb), gb, POSIX_MADV_WILLNEED);
+        posix_madvise((void*)((const char*)L->ffn_up_exps.data   + (size_t)e*ub), ub, POSIX_MADV_WILLNEED);
+        posix_madvise((void*)((const char*)L->ffn_down_exps.data + (size_t)e*db), db, POSIX_MADV_WILLNEED); } }
+#endif
     /* shared-expert sigmoid gate = sigmoid(w_f16 . h), w = ffn_gate_inp_shexp [n_embd] f16 */
     float sg = 0.0f;
     if (L->ffn_up_shexp.data) {
