@@ -26046,6 +26046,49 @@ static void build_q3n_desc(ds4_q3n_model_desc *desc, const ds4_model *model,
     }
 }
 
+/* EXPERIMENTAL: greedy generation on the qwen3_next forward driver. Per-token prefill +
+ * greedy decode (correctness-first; the MoE + DeltaNet run partly on the CPU). Validate
+ * the greedy continuation vs llama.cpp (docs/qwen3next_oracle.txt). */
+int ds4_q3n_generate(const char *model_path, const char *prompt, int n_predict,
+                     char *err, size_t errlen) {
+    ds4_model model; ds4_vocab vocab; ds4_weights weights;
+    model_open(&model, model_path, false, true);
+    config_validate_model(&model);
+    if (!ds4_arch_is_qwen3next()) { if (errlen) snprintf(err, errlen, "not a qwen3_next model"); model_close(&model); return 1; }
+    vocab_load(&vocab, &model);
+    weights_bind(&weights, &model, false, 0, 0, true, false);
+    token_vec toks = {0};
+    bpe_tokenize_text(&vocab, prompt ? prompt : "", &toks);
+    if (toks.len == 0) { if (errlen) snprintf(err, errlen, "empty prompt"); vocab_free(&vocab); model_close(&model); return 1; }
+    const uint32_t n_ctx = (uint32_t)toks.len + (uint32_t)(n_predict > 0 ? n_predict : 0) + 8u;
+    ds4_q3n_model_desc desc; build_q3n_desc(&desc, &model, &weights, n_ctx);
+    ds4_q3n_gpu *g = ds4_q3n_gpu_create(&desc);
+    if (!g) { if (errlen) snprintf(err, errlen, "qwen3_next GPU create failed (GPU build required)"); free(desc.layers); token_vec_free(&toks); vocab_free(&vocab); model_close(&model); return 1; }
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    int rc = 0; uint32_t pos = 0;
+    fprintf(stderr, "ds4: qwen3_next forward (EXPERIMENTAL, correctness-first) — prefill %u tokens…\n", (unsigned)toks.len);
+    const double t0 = now_sec();
+    for (uint32_t i = 0; i < (uint32_t)toks.len && rc == 0; i++)
+        if (ds4_q3n_gpu_forward(g, &desc, toks.v[i], pos++, logits) != 0) rc = 1;
+    printf("=== ds4 qwen3_next greedy (%d tokens) ===\n", n_predict);
+    for (uint32_t i = 0; i < (uint32_t)toks.len; i++) dense_print_token(&vocab, toks.v[i]);
+    int n_gen = 0;
+    while (rc == 0 && n_gen < n_predict) {
+        int next = sample_argmax(logits, DS4_N_VOCAB);
+        if (next == vocab.eos_id) break;
+        dense_print_token(&vocab, next); fflush(stdout); n_gen++;
+        if (ds4_q3n_gpu_forward(g, &desc, next, pos++, logits) != 0) { rc = 1; break; }
+    }
+    const double t1 = now_sec();
+    printf("\n");
+    if (rc == 0) fprintf(stderr, "ds4: qwen3_next gen %d tokens in %.1fs (%.2f tok/s)\n",
+                         n_gen, t1 - t0, (t1 - t0) > 0 ? (double)(n_gen + (int)toks.len) / (t1 - t0) : 0.0);
+    free(logits); ds4_q3n_gpu_free(g); free(desc.layers);
+    token_vec_free(&toks); vocab_free(&vocab); model_close(&model);
+    if (rc && errlen && !err[0]) snprintf(err, errlen, "qwen3_next forward failed");
+    return rc;
+}
+
 /* Fase 3.5 step 3-6: greedy dense generation on the GPU forward driver. Loads a
  * dense model, tokenizes the raw prompt, prefills, then greedily decodes
  * n_predict tokens. Self-contained (no session). Validate vs llama.cpp greedy. */

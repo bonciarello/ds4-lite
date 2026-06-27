@@ -1464,6 +1464,17 @@ static cli_config parse_options(int argc, char **argv) {
             if (rc != 0) fprintf(stderr, "ds4: dense generate failed: %s\n", st_err);
             exit(rc == 0 ? 0 : 1);
         }
+        if (!strcmp(arg, "--metal-q3n-generate")) {
+            /* EXPERIMENTAL qwen3_next greedy generation. Args: MODEL PROMPT [NPRED]. */
+            const char *mp = (i + 1 < argc) ? argv[++i] : NULL;
+            const char *pr = (i + 1 < argc) ? argv[++i] : NULL;
+            const int np = (i + 1 < argc) ? atoi(argv[++i]) : 12;
+            if (!mp || !pr) { fprintf(stderr, "ds4: --metal-q3n-generate needs MODEL PROMPT [N]\n"); exit(1); }
+            char st_err[256] = {0};
+            const int rc = ds4_q3n_generate(mp, pr, np, st_err, sizeof(st_err));
+            if (rc != 0) fprintf(stderr, "ds4: qwen3_next generate failed: %s\n", st_err);
+            exit(rc == 0 ? 0 : 1);
+        }
         if (!strcmp(arg, "--metal-dense-chat")) {
             /* Interactive multi-turn ChatML REPL. Args: MODEL [CTX] [SYSTEM].
              * Generates until <|im_end|>/EOS (no token limit). */
