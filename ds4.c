@@ -26001,6 +26001,34 @@ static uint64_t ds4_ctx_pow2_floor(uint64_t x) {
     return p;
 }
 
+/* Unified hardware-driven auto context: size the KV cache to the machine's actual RAM
+ * (sysctl hw.memsize) and the model's KV-per-token. Resident-weight models (dense) reserve
+ * their full size; STREAMING models (qwen3_next — experts paged from SSD) instead reserve
+ * most of RAM for the expert page cache, so the KV does not starve them. By default the
+ * context is bounded ONLY by RAM (extended past the native length via RoPE/NTK scaling in
+ * build_*_desc); DS4_CTX_EXTEND=N caps it at N× native (1 = no extension). Snapped to a
+ * power of two. Quality degrades the further past native, so a warning is printed. */
+static uint32_t ds4_auto_context(uint64_t native, uint64_t kv_per_tok, uint64_t model_size,
+                                 bool streaming, const char *tag) {
+    uint64_t ram = 0; size_t rl = sizeof ram;
+    if (sysctlbyname("hw.memsize", &ram, &rl, NULL, 0) != 0 || ram == 0) ram = 16ull << 30;
+    if (native == 0) native = 8192ull;
+    const uint64_t overhead = 1024ull << 20;
+    const uint64_t reserve  = streaming ? (uint64_t)((double)ram * 0.70) : model_size;   /* RAM the model needs */
+    const uint64_t budget   = (uint64_t)((double)ram * 0.85);                             /* leave 15% for the OS */
+    const uint64_t avail    = (budget > reserve + overhead) ? budget - reserve - overhead : 0;
+    uint64_t c = kv_per_tok ? avail / kv_per_tok : native;
+    const char *e = getenv("DS4_CTX_EXTEND");
+    if (e && atol(e) >= 1) { const uint64_t cap = native * (uint64_t)atol(e); if (c > cap) c = cap; }
+    c = ds4_ctx_pow2_floor(c);
+    if (c < 4096ull) c = 4096ull;
+    fprintf(stderr, "ds4: %s auto context %llu tok  (native %llu · KV %.0f KB/tok -> %.1f GB · %.0f GB RAM)%s\n",
+            tag, (unsigned long long)c, (unsigned long long)native, (double)kv_per_tok / 1024.0,
+            (double)c * (double)kv_per_tok / 1e9, (double)ram / 1e9,
+            c > native ? "  [EXTENDED via RoPE — quality degrades past native]" : "");
+    return (uint32_t)c;
+}
+
 static void build_q3n_desc(ds4_q3n_model_desc *desc, const ds4_model *model,
                           const ds4_weights *weights, uint32_t n_ctx) {
     memset(desc, 0, sizeof(*desc));
@@ -27202,32 +27230,15 @@ static int ds4_q3n_chat(const char *model_path, const char *system, int ctx_size
     weights_bind(&weights, &model, false, 0, 0, true, false);
     const int im_start = vocab.user_id, im_end = vocab.assistant_id;
     if (im_start < 0 || im_end < 0) { if (errlen) snprintf(err, errlen, "ChatML tokens missing"); vocab_free(&vocab); model_close(&model); return 1; }
-    /* Auto context: in qwen3_next only the full-attention layers (12/48) keep a growing KV
-     * cache — the 36 Gated-DeltaNet layers use a FIXED recurrent state — so a large context
-     * is cheap. The experts stream from SSD (zero-copy), so we don't subtract the 45GB model;
-     * budget ~1/10 of RAM for the KV cache (leaves the rest for the streamed expert working
-     * set), capped at the model's native context. Streaming the KV itself would be useless
-     * (attention reads ALL positions every token), so it lives in fast unified memory. */
+    /* Auto context (RAM-driven, unified): in qwen3_next only the 12 full-attention layers keep
+     * a growing KV cache — the 36 Gated-DeltaNet layers use a FIXED recurrent state — so it is
+     * cheap. Streaming=true reserves RAM for the SSD expert page cache. */
     uint32_t n_ctx;
     if (ctx_size > 0) n_ctx = (uint32_t)ctx_size;
     else {
-        const uint64_t native = (DS4_ROPE_ORIG_CTX > 0) ? DS4_ROPE_ORIG_CTX : 8192ull;
         uint32_t n_full = 0; for (uint32_t i = 0; i < DS4_N_LAYER; i++) if (ds4_q3n_layer_is_full_attn(i)) n_full++;
-        const uint64_t kv_per_tok = (uint64_t)n_full * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 4ull;  /* f16 K+V */
-        uint64_t ram = 0; size_t rlen = sizeof ram;
-        if (sysctlbyname("hw.memsize", &ram, &rlen, NULL, 0) != 0 || ram == 0) ram = 16ull << 30;
-        /* Auto-extend up to 4× native by default (RoPE-scaled in build_q3n_desc); RAM bounds
-         * it. DS4_CTX_EXTEND=N overrides (1 = cap at native). */
-        uint64_t extend = 4; { const char *e = getenv("DS4_CTX_EXTEND"); if (e && atol(e) >= 1) extend = (uint64_t)atol(e); }
-        const uint64_t max_ctx = native * extend;
-        uint64_t c = kv_per_tok ? (ram / 10ull) / kv_per_tok : max_ctx;
-        if (c > max_ctx) c = max_ctx;
-        c = ds4_ctx_pow2_floor(c); if (c < 4096ull) c = 4096ull;   /* snap to 16k/32k/64k/... */
-        n_ctx = (uint32_t)c;
-        fprintf(stderr, "ds4: qwen3_next auto context %u tok  (native %llu · only %u/%u layers grow · KV %.0f KB/tok -> %.1f GB)%s\n",
-                n_ctx, (unsigned long long)native, n_full, (unsigned)DS4_N_LAYER,
-                (double)kv_per_tok / 1024.0, (double)n_ctx * (double)kv_per_tok / 1e9,
-                (uint64_t)n_ctx > native ? " [EXTENDED via RoPE — quality degrades past native]" : "");
+        n_ctx = ds4_auto_context(DS4_ROPE_ORIG_CTX, (uint64_t)n_full * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 4ull,
+                                 (uint64_t)model.size, true, "qwen3_next");
     }
     ds4_q3n_model_desc desc; build_q3n_desc(&desc, &model, &weights, n_ctx);
     ds4_q3n_gpu *g = ds4_q3n_gpu_create(&desc);
@@ -27334,41 +27345,14 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         return 1;
     }
 
-    /* Context window: explicit if given (>0), else AUTO — fit it to this machine.
-     * The KV cache is f16: bytes/token = n_layer * n_kv * head_dim * 2(K+V) * 2(f16).
-     * Budget ~70% of system RAM minus the model weights and ~1 GB scratch/overhead;
-     * the resulting token count is capped at the model's native context length. */
+    /* Context window: explicit if given (>0), else AUTO — RAM-driven (see ds4_auto_context).
+     * Dense models are resident, so the full model size is reserved. */
     uint32_t n_ctx;
-    if (ctx_size > 0) {
+    if (ctx_size > 0)
         n_ctx = (uint32_t)ctx_size;
-    } else {
-        const uint64_t native = (DS4_ROPE_ORIG_CTX > 0) ? DS4_ROPE_ORIG_CTX : 8192ull;
-        const uint64_t kv_per_tok = (uint64_t)DS4_N_LAYER * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 4ull;
-        uint64_t ram = 0; size_t rlen = sizeof ram;
-        if (sysctlbyname("hw.memsize", &ram, &rlen, NULL, 0) != 0 || ram == 0) ram = 16ull << 30;
-        const uint64_t budget   = (uint64_t)((double)ram * 0.70);
-        const uint64_t overhead = 1024ull << 20;
-        const uint64_t model_sz = (uint64_t)model.size;
-        const uint64_t avail    = (budget > model_sz + overhead) ? budget - model_sz - overhead : 0;
-        /* Auto-extend the context beyond the model's native length, sized by RAM, via RoPE
-         * NTK scaling (in dense_build_desc). By default we allow up to 4× native (where NTK
-         * holds well) — so small models still get large contexts automatically. RAM is the
-         * real bound (avail/kv_per_tok). DS4_CTX_EXTEND=N overrides the multiple (1 = no
-         * extension/cap at native; higher pushes further toward the RAM limit). */
-        uint64_t extend = 4; { const char *e = getenv("DS4_CTX_EXTEND"); if (e && atol(e) >= 1) extend = (uint64_t)atol(e); }
-        const uint64_t max_ctx = native * extend;
-        uint64_t c = kv_per_tok ? avail / kv_per_tok : max_ctx;
-        if (c > max_ctx) c = max_ctx;               /* RAM- and extension-bounded */
-        c = ds4_ctx_pow2_floor(c);                  /* snap to 16k/32k/64k/128k/256k/... */
-        if (c < 4096ull) c = 4096ull;               /* sane floor */
-        n_ctx = (uint32_t)c;
-        printf("\033[2mauto context: %u tok  (model native %llu, KV %.1f KB/tok, %.0f GB RAM)\033[0m\n",
-               n_ctx, (unsigned long long)native, (double)kv_per_tok / 1024.0, (double)ram / 1e9);
-        if ((uint64_t)n_ctx > native)
-            fprintf(stderr, "ds4: context EXTENDED %.1f× beyond native %llu via RoPE scaling — quality degrades past native\n",
-                    (double)n_ctx / (double)native, (unsigned long long)native);
-        fflush(stdout);
-    }
+    else
+        n_ctx = ds4_auto_context(DS4_ROPE_ORIG_CTX, (uint64_t)DS4_N_LAYER * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 4ull,
+                                 (uint64_t)model.size, false, "dense");
     ds4_dense_model_desc desc;
     dense_build_desc(&desc, &model, &weights, n_ctx);
 
