@@ -4577,18 +4577,24 @@ static ds4_gpu_tensor *q3n_cached_weight(ds4_q3n_gpu *g, const void *data, uint6
  * them) — so every touched expert sticks in RSS forever. pread lands the bytes in the kernel
  * buffer cache (system-wide, NOT charged to the process) + directly into the GPU buffer's
  * unified-memory contents, so freeing that GPU buffer actually returns the RAM. */
+static int g_q3n_pread_prof = -1;       /* DS4_Q3N_PREAD_PROFILE: time spent streaming */
+static double g_q3n_pread_ms;
+static uint64_t g_q3n_pread_bytes;
 static ds4_gpu_tensor *q3n_pread_expert(ds4_q3n_gpu *g, const void *data, uint64_t bytes) {
+    if (g_q3n_pread_prof < 0) g_q3n_pread_prof = getenv("DS4_Q3N_PREAD_PROFILE") ? 1 : 0;
     ds4_gpu_tensor *buf = ds4_gpu_tensor_alloc(bytes);
     if (!buf) return NULL;
     void *dst = ds4_gpu_tensor_contents(buf);
     if (!dst) { ds4_gpu_tensor_free(buf); return NULL; }
     const off_t off = (off_t)((const char *)data - (const char *)g->model_base);
+    const double t0 = g_q3n_pread_prof ? ds4_gpu_now_ms() : 0.0;
     size_t got = 0;
     while (got < bytes) {
         const ssize_t r = pread(g->model_fd, (char *)dst + got, (size_t)(bytes - got), off + (off_t)got);
         if (r <= 0) { ds4_gpu_tensor_free(buf); return NULL; }
         got += (size_t)r;
     }
+    if (g_q3n_pread_prof) { g_q3n_pread_ms += ds4_gpu_now_ms() - t0; g_q3n_pread_bytes += bytes; }
     return buf;
 }
 
@@ -4784,6 +4790,10 @@ void ds4_q3n_gpu_free(ds4_q3n_gpu *g) {
                 (unsigned long long)g->ehits, (unsigned long long)g->emisses,
                 100.0*(double)g->ehits/(double)(g->ehits+g->emisses), (unsigned long long)g->eevicts,
                 (double)g->ecache_bytes/(double)(1ull<<30));
+    if (g_q3n_pread_prof > 0 && g_q3n_pread_ms > 0)
+        fprintf(stderr, "ds4: qwen3_next pread: %.0f ms total, %.2f GiB (%.0f MB/s effective)\n",
+                g_q3n_pread_ms, (double)g_q3n_pread_bytes/(double)(1ull<<30),
+                (double)g_q3n_pread_bytes/(1024.0*1024.0)/(g_q3n_pread_ms/1000.0));
     for (NSNumber *key in g->wcache) ds4_gpu_tensor_free((ds4_gpu_tensor *)[g->wcache[key] pointerValue]);
     g->wcache = nil; g->elru = nil; g->ebytes = nil;
     free(g);
@@ -4943,6 +4953,43 @@ static bool q3n_axpy(ds4_gpu_tensor *acc, ds4_gpu_tensor *x, float scale, uint32
     return ds4_gpu_run_simple("kernel_dense_axpy_f32", &a, sizeof(a), b, 2, n, "q3n moe axpy");
 }
 
+/* DS4_Q3N_PREAD_PARALLEL: pread this layer's selected (and not-yet-cached) experts CONCURRENTLY
+ * before the matvec loop, so the SSD queue is filled instead of serving the ~18 reads one at a
+ * time. The cold preads run in parallel (dispatch_apply); the cache bookkeeping stays serial on
+ * the main thread (NSDictionary/OrderedSet aren't thread-safe), so the matvec loop then hits. */
+static void q3n_prefetch_experts(ds4_q3n_gpu *g, const ds4_q3n_layer_desc *L,
+                                  const uint32_t *sel, uint32_t nused,
+                                  uint32_t nexp, uint32_t ne, uint32_t nff) {
+    static int par = -1;
+    if (par < 0) par = getenv("DS4_Q3N_PREAD_PARALLEL") ? 1 : 0;
+    if (!par || !g->expert_pread) return;
+    const void *data[24]; uint64_t bytes[24]; int n = 0;
+    for (uint32_t i = 0; i < nused && n <= 21; i++) {
+        const ds4_dense_wdesc wv[3] = { q3n_expert_slice(&L->ffn_gate_exps, sel[i], nexp, ne, nff),
+                                        q3n_expert_slice(&L->ffn_up_exps,   sel[i], nexp, ne, nff),
+                                        q3n_expert_slice(&L->ffn_down_exps, sel[i], nexp, nff, ne) };
+        for (int j = 0; j < 3; j++) {
+            NSNumber *key = @((unsigned long long)(uintptr_t)wv[j].data);
+            if (!g->wcache[key]) { data[n] = wv[j].data; bytes[n] = wv[j].bytes; n++; }
+        }
+    }
+    if (n < 2) return;                                   /* nothing to parallelize */
+    ds4_gpu_tensor *bufs[24];
+    for (int k = 0; k < n; k++) bufs[k] = NULL;
+    /* capture pointers (blocks can't capture C arrays); the preads are independent */
+    ds4_gpu_tensor **pbufs = bufs; const void * const *pdata = data; const uint64_t *pbytes = bytes;
+    dispatch_apply((size_t)n, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                   ^(size_t k){ pbufs[k] = q3n_pread_expert(g, pdata[k], pbytes[k]); });
+    for (int k = 0; k < n; k++) {                        /* serial insert (cache not thread-safe) */
+        if (!bufs[k]) continue;
+        NSNumber *key = @((unsigned long long)(uintptr_t)data[k]);
+        if (g->wcache[key]) { ds4_gpu_tensor_free(bufs[k]); continue; }
+        g->wcache[key] = [NSValue valueWithPointer:bufs[k]];
+        g->ebytes[key] = @(bytes[k]); [g->elru addObject:key];
+        g->ecache_bytes += bytes[k]; g->emisses++;
+    }
+}
+
 /* MoE FFN (every layer): post_attn rmsnorm -> softmax router top-k -> routed experts +
  * shared expert (sigmoid-gated) -> residual. Routing on the CPU; the expert matvecs +
  * accumulation are batched into ONE command buffer (GPU axpy), so the ~33 dispatches per
@@ -5001,6 +5048,9 @@ static bool q3n_moe_ffn(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d, const ds4_q
         if (wsg) for (uint32_t k=0;k<ne;k++) dot += (double)(float)wsg[k]*hh[k];
         sg = 1.0f/(1.0f+expf(-(float)dot));
     }
+    /* optional: pread the selected experts in parallel (fills the SSD queue) before the matvec
+     * loop, which then hits the cache instead of preading one expert at a time. */
+    q3n_prefetch_experts(g, L, sel, nused, nexp, ne, nff);
     /* zero the accumulator, then batch all expert matvecs + axpy into one command buffer */
     void *accp = ds4_gpu_tensor_contents(g->moe_acc); if (accp) memset(accp, 0, (size_t)ne*4);
     const bool batch = ds4_gpu_begin_commands() != 0;
