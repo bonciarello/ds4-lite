@@ -26000,6 +26000,13 @@ static void build_q3n_desc(ds4_q3n_model_desc *desc, const ds4_model *model,
     desc->n_head = DS4_N_HEAD; desc->n_kv = DS4_N_HEAD_KV; desc->head_dim = DS4_N_HEAD_DIM; desc->n_rot = DS4_N_ROT;
     desc->n_expert = g_ds4_shape.n_expert; desc->n_expert_used = g_ds4_shape.n_expert_used; desc->n_ff_exp = g_ds4_shape.n_ff_exp;
     desc->rms_eps = DS4_RMS_EPS; desc->rope_base = DS4_ROPE_FREQ_BASE;
+    /* NTK-aware RoPE extension when the context exceeds the native one (d = rope dim = n_rot). */
+    if (DS4_ROPE_ORIG_CTX > 0 && (uint64_t)n_ctx > DS4_ROPE_ORIG_CTX && DS4_N_ROT > 2) {
+        const double s = (double)n_ctx / (double)DS4_ROPE_ORIG_CTX, d = (double)DS4_N_ROT;
+        desc->rope_base = (float)((double)DS4_ROPE_FREQ_BASE * pow(s, d / (d - 2.0)));
+        fprintf(stderr, "ds4: qwen3_next NTK context extension: ctx %u > native %llu, rope_base %.0f -> %.0f\n",
+                n_ctx, (unsigned long long)DS4_ROPE_ORIG_CTX, (double)DS4_ROPE_FREQ_BASE, (double)desc->rope_base);
+    }
     desc->full_attn_interval = g_ds4_shape.full_attn_interval ? g_ds4_shape.full_attn_interval : 4u;
     /* DeltaNet derived dims */
     desc->dn_n_v_heads  = g_ds4_shape.ssm_dt_rank;                 /* 32 */
@@ -27201,13 +27208,17 @@ static int ds4_q3n_chat(const char *model_path, const char *system, int ctx_size
         const uint64_t kv_per_tok = (uint64_t)n_full * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 4ull;  /* f16 K+V */
         uint64_t ram = 0; size_t rlen = sizeof ram;
         if (sysctlbyname("hw.memsize", &ram, &rlen, NULL, 0) != 0 || ram == 0) ram = 16ull << 30;
-        uint64_t c = kv_per_tok ? (ram / 10ull) / kv_per_tok : native;
-        if (c > native) c = native;
+        /* DS4_CTX_EXTEND=N allows up to N× the native context (RoPE-scaled in build_q3n_desc). */
+        uint64_t extend = 1; { const char *e = getenv("DS4_CTX_EXTEND"); if (e && atol(e) > 1) extend = (uint64_t)atol(e); }
+        const uint64_t max_ctx = native * extend;
+        uint64_t c = kv_per_tok ? (ram / 10ull) / kv_per_tok : max_ctx;
+        if (c > max_ctx) c = max_ctx;
         c = (c / 1024ull) * 1024ull; if (c < 4096ull) c = 4096ull;
         n_ctx = (uint32_t)c;
-        fprintf(stderr, "ds4: qwen3_next auto context %u tok  (native %llu · only %u/%u layers grow · KV %.0f KB/tok -> %.1f GB)\n",
+        fprintf(stderr, "ds4: qwen3_next auto context %u tok  (native %llu · only %u/%u layers grow · KV %.0f KB/tok -> %.1f GB)%s\n",
                 n_ctx, (unsigned long long)native, n_full, (unsigned)DS4_N_LAYER,
-                (double)kv_per_tok / 1024.0, (double)n_ctx * (double)kv_per_tok / 1e9);
+                (double)kv_per_tok / 1024.0, (double)n_ctx * (double)kv_per_tok / 1e9,
+                (uint64_t)n_ctx > native ? " [EXTENDED via RoPE — quality degrades past native]" : "");
     }
     ds4_q3n_model_desc desc; build_q3n_desc(&desc, &model, &weights, n_ctx);
     ds4_q3n_gpu *g = ds4_q3n_gpu_create(&desc);
@@ -27330,14 +27341,21 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         const uint64_t overhead = 1024ull << 20;
         const uint64_t model_sz = (uint64_t)model.size;
         const uint64_t avail    = (budget > model_sz + overhead) ? budget - model_sz - overhead : 0;
-        uint64_t c = kv_per_tok ? avail / kv_per_tok : native;
-        if (c > native) c = native;                 /* never exceed the model's native ctx */
+        /* DS4_CTX_EXTEND=N lets the auto context grow up to N× the model's native context
+         * (RAM permitting), via RoPE NTK scaling in dense_build_desc. Default 1 = cap at
+         * native. Beyond ~native, quality degrades (the model never trained that far). */
+        uint64_t extend = 1; { const char *e = getenv("DS4_CTX_EXTEND"); if (e && atol(e) > 1) extend = (uint64_t)atol(e); }
+        const uint64_t max_ctx = native * extend;
+        uint64_t c = kv_per_tok ? avail / kv_per_tok : max_ctx;
+        if (c > max_ctx) c = max_ctx;               /* RAM- and extension-bounded */
         c = (c / 1024ull) * 1024ull;                /* round down to a multiple of 1024 */
         if (c < 2048ull) c = 2048ull;               /* sane floor */
-        if (c > native) c = native;
         n_ctx = (uint32_t)c;
         printf("\033[2mauto context: %u tok  (model native %llu, KV %.1f KB/tok, %.0f GB RAM)\033[0m\n",
                n_ctx, (unsigned long long)native, (double)kv_per_tok / 1024.0, (double)ram / 1e9);
+        if ((uint64_t)n_ctx > native)
+            fprintf(stderr, "ds4: context EXTENDED %.1f× beyond native %llu via RoPE scaling — quality degrades past native\n",
+                    (double)n_ctx / (double)native, (unsigned long long)native);
         fflush(stdout);
     }
     ds4_dense_model_desc desc;
