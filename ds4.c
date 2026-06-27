@@ -27195,6 +27195,9 @@ static void dense_print_topbar(void) {
 /* Two-line status rendered under the prompt: the bottom border of the input box, then
  * the Claude-Code-style context bar (used/total tokens left, progress bar + % right).
  * Both span the box width; colors inline (linenoise treats CSI as zero-width). */
+/* Model basename shown in the input footer's shortcut line (set by ds4_dense_chat). */
+static char g_dense_status_model[64] = "";
+
 static void dense_ctx_status(char *out, size_t cap, uint32_t used, uint32_t total) {
     const int W = dense_box_w();
     size_t o = 0;
@@ -27221,7 +27224,50 @@ static void dense_ctx_status(char *out, size_t cap, uint32_t used, uint32_t tota
     SAPP("\033[2m");                                                     /* empty = dim  */
     for (int i = filled; i < barw; i++) SAPP("░");
     SAPP(" %s\033[0m", pctbuf);
+    /* claude-code-style shortcut footer: model · keys. One dim line under the bar. */
+    SAPP("\n\033[2m");
+    if (g_dense_status_model[0]) SAPP("%s \xc2\xb7 ", g_dense_status_model);   /* model · */
+    SAPP("\xe2\x8f\x8e send \xc2\xb7 esc stop \xc2\xb7 / commands \xc2\xb7 ^D exit\033[0m");
 #undef SAPP
+}
+
+/* Slash commands shown in the live autocomplete menu (and the banner). */
+static const struct { const char *cmd, *desc; } DENSE_CMDS[] = {
+    {"/help",  "all commands"},
+    {"/model", "switch / download model"},
+    {"/ctx",   "show / resize context"},
+    {"/temp",  "temperature"},
+    {"/topp",  "nucleus sampling (top-p)"},
+    {"/topk",  "top-k sampling"},
+    {"/read",  "read a file as the message"},
+    {"/save",  "save the session to a file"},
+    {"/load",  "load a session from a file"},
+    {"/exit",  "quit (Ctrl-D)"},
+};
+
+/* When the input line starts with '/', render a filtered command menu as the status
+ * footer (claude-code-style live autocomplete) — the closest prefix match is highlighted.
+ * Returns 1 if it wrote a menu, 0 otherwise (caller falls back to the context bar). */
+static int dense_slash_menu(char *out, size_t cap, const char *typed, size_t tlen) {
+    if (tlen == 0 || typed[0] != '/') return 0;
+    /* only while typing the command word itself (no space yet) */
+    for (size_t i = 0; i < tlen; i++) if (typed[i] == ' ') return 0;
+    const int W = dense_box_w();
+    size_t o = 0;
+#define MAPP(...) do { if (o < cap) { int _r = snprintf(out + o, cap - o, __VA_ARGS__); \
+        if (_r > 0) o += (size_t)_r; if (o >= cap) o = cap - 1; } } while (0)
+    MAPP("\033[2m╰"); for (int i = 0; i < W - 2; i++) MAPP("─"); MAPP("╯\033[0m");
+    int shown = 0, first = 1;
+    for (size_t i = 0; i < sizeof(DENSE_CMDS)/sizeof(DENSE_CMDS[0]) && shown < 8; i++) {
+        if (strncasecmp(DENSE_CMDS[i].cmd, typed, tlen) != 0) continue;
+        MAPP("\n");
+        if (first) { MAPP("\033[36m\xe2\x9d\xaf %-7s\033[0m \033[2m%s\033[0m", DENSE_CMDS[i].cmd, DENSE_CMDS[i].desc); first = 0; }
+        else       { MAPP("\033[2m  %-7s %s\033[0m", DENSE_CMDS[i].cmd, DENSE_CMDS[i].desc); }
+        shown++;
+    }
+    if (shown == 0) MAPP("\n\033[2m  (no matching command — Enter sends as text)\033[0m");
+#undef MAPP
+    return 1;
 }
 
 /* Live status update: recompute used = base + ~tokens(typed) on every refresh so the
@@ -27230,9 +27276,12 @@ struct dense_ctx_priv { uint32_t base, total; };
 static int dense_layout_cb(struct linenoiseState *l, size_t pr, size_t sr, void *priv) {
     (void)pr; (void)sr;
     struct dense_ctx_priv *c = (struct dense_ctx_priv *)priv;
-    const uint32_t est = c->base + (uint32_t)((l->len + 3) / 4);   /* ~4 bytes/token */
     char st[4096];
-    dense_ctx_status(st, sizeof st, est, c->total);
+    /* typing a slash command -> show the command menu instead of the context bar */
+    if (!dense_slash_menu(st, sizeof st, l->buf, l->len)) {
+        const uint32_t est = c->base + (uint32_t)((l->len + 3) / 4);   /* ~4 bytes/token */
+        dense_ctx_status(st, sizeof st, est, c->total);
+    }
     linenoiseEditSetStatus(l, st, NULL, NULL);
     return 0;
 }
@@ -27650,6 +27699,11 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     const int is_gemma = ds4_arch_is_gemma3();    /* gemma3 uses its own turn template */
     vocab_load(&vocab, &model);
     weights_bind(&weights, &model, false, 0, 0, true, false);
+
+    /* model basename (no dir, no .gguf) for the input-box shortcut footer */
+    { const char *b = strrchr(model_path, '/'); b = b ? b + 1 : model_path;
+      snprintf(g_dense_status_model, sizeof g_dense_status_model, "%s", b);
+      char *dot = strstr(g_dense_status_model, ".gguf"); if (dot) *dot = '\0'; }
 
     /* Turn markers + assistant primer. ChatML: <|im_start|>/<|im_end|> + "assistant".
      * gemma: <start_of_turn>/<end_of_turn> (loaded into user_id/assistant_id) + "model",
