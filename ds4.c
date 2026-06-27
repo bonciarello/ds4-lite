@@ -27799,9 +27799,10 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     const char *base_sys = (system && system[0]) ? system : "You are a helpful assistant.";
-    /* function-calling ON by default for dense; OFF for qwen3_next — the tools prompt is
-     * hundreds of tokens and prefilling it at qwen3_next's ~1-3 tok/s would take minutes. */
-    const bool tools_on = getenv("DS4_DENSE_NO_TOOLS") == NULL && !is_q3n && !is_gemma;
+    /* function-calling ON by default for dense + gemma; OFF for qwen3_next (the tools prompt
+     * is hundreds of tokens and prefilling it at q3n's ~1-3 tok/s would take minutes). For
+     * gemma the prompt is injected into the first user turn (no system role) — see below. */
+    const bool tools_on = getenv("DS4_DENSE_NO_TOOLS") == NULL && !is_q3n;
     char *sys_buf = NULL;
     const char *sys = base_sys;
     if (tools_on) {
@@ -27821,6 +27822,8 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     uint32_t pos = 0;
     int rc = 0;
     bool first = true;
+    /* gemma has no system role: inject the system/tools prompt into the FIRST user turn. */
+    bool gemma_sys_pending = is_gemma;
     bool think = !is_q3n && !is_gemma;   /* reflection on for dense; off for qwen3_next (too slow)
                              * and gemma (no <think> training). Toggle with /think. */
 
@@ -28026,15 +28029,19 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         }
 
         token_vec t = {0};
-        if (think_turn) {
-            /* user message + reflection directive (this turn only) */
-            char *um = xmalloc((size_t)nr + strlen(think_directive) + 1);
-            memcpy(um, line, (size_t)nr);
-            strcpy(um + nr, think_directive);
+        /* Build the user message: gemma prepends the system/tools prompt to its FIRST turn
+         * (it has no system role); /think turns append the reflection directive. */
+        {
+            size_t cap = (size_t)nr + 8;
+            if (gemma_sys_pending) cap += strlen(sys) + 4;
+            if (think_turn) cap += strlen(think_directive);
+            char *um = xmalloc(cap);
+            size_t up = 0;
+            if (gemma_sys_pending) { up += (size_t)snprintf(um + up, cap - up, "%s\n\n", sys); gemma_sys_pending = false; }
+            memcpy(um + up, line, (size_t)nr); up += (size_t)nr; um[up] = '\0';
+            if (think_turn) { strcpy(um + up, think_directive); }
             dense_chat_append_block(&t, &vocab, im_start, im_end, "user", um);
             free(um);
-        } else {
-            dense_chat_append_block(&t, &vocab, im_start, im_end, "user", line);
         }
         token_vec_push(&t, im_start);
         bpe_tokenize_text(&vocab, asst_primer, &t);
