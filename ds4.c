@@ -25993,6 +25993,14 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
  * dense_build_desc; fills full-attention, Gated-DeltaNet and MoE tensors per layer plus
  * the derived DeltaNet dims. Caller owns desc->layers (xcalloc'd; free after use). */
 DS4_MAYBE_UNUSED
+/* Largest power of two <= x, so the auto context snaps to 16k/32k/64k/128k/256k/512k/... */
+static uint64_t ds4_ctx_pow2_floor(uint64_t x) {
+    if (x < 2) return x;
+    uint64_t p = 1;
+    while ((p << 1) <= x && (p << 1) != 0) p <<= 1;
+    return p;
+}
+
 static void build_q3n_desc(ds4_q3n_model_desc *desc, const ds4_model *model,
                           const ds4_weights *weights, uint32_t n_ctx) {
     memset(desc, 0, sizeof(*desc));
@@ -27213,7 +27221,7 @@ static int ds4_q3n_chat(const char *model_path, const char *system, int ctx_size
         const uint64_t max_ctx = native * extend;
         uint64_t c = kv_per_tok ? (ram / 10ull) / kv_per_tok : max_ctx;
         if (c > max_ctx) c = max_ctx;
-        c = (c / 1024ull) * 1024ull; if (c < 4096ull) c = 4096ull;
+        c = ds4_ctx_pow2_floor(c); if (c < 4096ull) c = 4096ull;   /* snap to 16k/32k/64k/... */
         n_ctx = (uint32_t)c;
         fprintf(stderr, "ds4: qwen3_next auto context %u tok  (native %llu · only %u/%u layers grow · KV %.0f KB/tok -> %.1f GB)%s\n",
                 n_ctx, (unsigned long long)native, n_full, (unsigned)DS4_N_LAYER,
@@ -27348,8 +27356,8 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         const uint64_t max_ctx = native * extend;
         uint64_t c = kv_per_tok ? avail / kv_per_tok : max_ctx;
         if (c > max_ctx) c = max_ctx;               /* RAM- and extension-bounded */
-        c = (c / 1024ull) * 1024ull;                /* round down to a multiple of 1024 */
-        if (c < 2048ull) c = 2048ull;               /* sane floor */
+        c = ds4_ctx_pow2_floor(c);                  /* snap to 16k/32k/64k/128k/256k/... */
+        if (c < 4096ull) c = 4096ull;               /* sane floor */
         n_ctx = (uint32_t)c;
         printf("\033[2mauto context: %u tok  (model native %llu, KV %.1f KB/tok, %.0f GB RAM)\033[0m\n",
                n_ctx, (unsigned long long)native, (double)kv_per_tok / 1024.0, (double)ram / 1e9);
