@@ -22554,6 +22554,7 @@ typedef enum {
     DS4_PRETOK_JOYAI = 0,   /* DeepSeek V4 ("joyai-llm") */
     DS4_PRETOK_QWEN2 = 1,   /* Qwen2/GPT-2 byte-level split */
     DS4_PRETOK_SPM   = 2,   /* SentencePiece (llama/gemma): score-driven merge, no BPE merges */
+    DS4_PRETOK_GPT4O = 3,   /* o200k / gpt-4o (gpt-oss): case-aware letters, \p{N}{1,3} */
 } ds4_pretok;
 
 struct ds4_vocab {
@@ -23015,6 +23016,90 @@ static void qwen2_tokenize_text(const ds4_vocab *vocab, const char *text, token_
     }
 }
 
+static inline bool ascii_upper(uint8_t c) { return c >= 'A' && c <= 'Z'; }
+
+/* o200k / gpt-4o byte-level pre-tokenization (gpt-oss). Mirrors llama.cpp's GPT4O split:
+ *
+ *   [^\r\n\p{L}\p{N}]? \p{Lu}* \p{Ll}+ (?i:'s|'t|'re|'ve|'m|'ll|'d)?   |   ...\p{Lu}+ \p{Ll}*...
+ *   | \p{N}{1,3}                       digits in groups of up to three
+ *   |  ?[^\s\p{L}\p{N}]+[\r\n/]*        optional space + symbols + trailing newlines and '/'
+ *   | \s*[\r\n]+ | \s+(?!\S) | \s+      whitespace (as qwen2)
+ *
+ * vs the qwen2 split: letters are CASE-AWARE (a run of uppercase then lowercase, so
+ * "HelloWorld" -> "Hello","World"); numbers group 1-3 ("12345" -> "123","45"); the
+ * contraction attaches to the word; symbols keep trailing '/'. ASCII upper = A-Z; any
+ * non-ASCII letter is treated as lowercase (consumed in the \p{Ll} run) — pragmatic, like
+ * the qwen2 path. Validate vs `llama-tokenize` on the gpt-oss GGUF. */
+static void gpt4o_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    const uint64_t len = strlen(text);
+    uint64_t pos = 0;
+    while (pos < len) {
+        const uint64_t start = pos;
+        const uint8_t c = (uint8_t)text[pos];
+
+        /* LETTER: optional lead, then uppercase* lowercase* (>=1 letter), then optional contraction */
+        {
+            uint64_t p = pos;
+            if (!ascii_newline(c) && !ascii_digit(c) && !joyai_letter_like_at(text, len, p)) {
+                const uint64_t after = next_utf8_char(text, len, p);
+                if (after < len && joyai_letter_like_at(text, len, after)) p = after;
+            }
+            const uint64_t letters_start = p;
+            while (p < len && ascii_upper((uint8_t)text[p])) p = next_utf8_char(text, len, p);
+            while (p < len && joyai_letter_like_at(text, len, p) && !ascii_upper((uint8_t)text[p]))
+                p = next_utf8_char(text, len, p);
+            if (p > letters_start) {                       /* matched >=1 letter */
+                if (p < len && text[p] == '\'' && p + 1 < len) {     /* contraction (case-insensitive) */
+                    const uint8_t a = (uint8_t)text[p+1] | 0x20;
+                    const uint8_t b = (p + 2 < len) ? ((uint8_t)text[p+2] | 0x20) : 0;
+                    if (a=='s'||a=='t'||a=='m'||a=='d') p += 2;
+                    else if ((a=='r'&&b=='e')||(a=='v'&&b=='e')||(a=='l'&&b=='l')) p += 3;
+                }
+                pos = p;
+            }
+        }
+
+        /* NUMBER: 1-3 digits. */
+        if (pos == start && ascii_digit(c)) {
+            uint64_t p = pos; int nd = 0;
+            while (p < len && ascii_digit((uint8_t)text[p]) && nd < 3) { p++; nd++; }
+            pos = p;
+        }
+
+        /* SYMBOL:  ?[^\s\p{L}\p{N}]+[\r\n/]* */
+        if (pos == start) {
+            uint64_t p = pos;
+            if (c == ' ') {
+                const uint64_t after = p + 1;
+                if (after < len && !ascii_space((uint8_t)text[after]) && !ascii_digit((uint8_t)text[after]) &&
+                    !joyai_letter_like_at(text, len, after)) p = after;
+            }
+            if (p < len && !ascii_space((uint8_t)text[p]) && !ascii_digit((uint8_t)text[p]) &&
+                !joyai_letter_like_at(text, len, p)) {
+                while (p < len && !ascii_space((uint8_t)text[p]) && !ascii_digit((uint8_t)text[p]) &&
+                       !joyai_letter_like_at(text, len, p)) p = next_utf8_char(text, len, p);
+                while (p < len && (ascii_newline((uint8_t)text[p]) || text[p] == '/')) p++;
+                pos = p;
+            }
+        }
+
+        /* WHITESPACE (same as qwen2): newline-run kept together; trailing space leads next word. */
+        if (pos == start && ascii_space(c)) {
+            uint64_t p = pos, last_nl_end = 0;
+            while (p < len && ascii_space((uint8_t)text[p])) {
+                if (ascii_newline((uint8_t)text[p])) last_nl_end = p + 1;
+                p++;
+            }
+            if (last_nl_end) pos = last_nl_end;
+            else if (p < len && p > pos + 1) pos = p - 1;
+            else pos = p;
+        }
+
+        if (pos == start) pos = next_utf8_char(text, len, pos);
+        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+    }
+}
+
 /* Emit one final SPM symbol: its token if present, else byte-fallback (<0xXX>),
  * else the unk token. */
 static void spm_emit_symbol(const ds4_vocab *vocab, const char *ptr, uint32_t n, token_vec *out) {
@@ -23094,6 +23179,10 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
     }
     if (vocab->pre_type == DS4_PRETOK_QWEN2) {
         qwen2_tokenize_text(vocab, text, out);
+        return;
+    }
+    if (vocab->pre_type == DS4_PRETOK_GPT4O) {
+        gpt4o_tokenize_text(vocab, text, out);
         return;
     }
     const uint64_t len = strlen(text);
@@ -23241,9 +23330,9 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
          * DeepSeek V4 declares "joyai-llm". Default to JOYAI for back-compat. */
         ds4_str pre = {0};
         vocab->pre_type = DS4_PRETOK_JOYAI;
-        if (model_get_string(model, "tokenizer.ggml.pre", &pre) &&
-            ds4_str_eq_cstr(pre, "qwen2")) {
-            vocab->pre_type = DS4_PRETOK_QWEN2;
+        if (model_get_string(model, "tokenizer.ggml.pre", &pre)) {
+            if (ds4_str_eq_cstr(pre, "qwen2"))       vocab->pre_type = DS4_PRETOK_QWEN2;
+            else if (ds4_str_eq_cstr(pre, "gpt-4o")) vocab->pre_type = DS4_PRETOK_GPT4O;  /* gpt-oss / o200k */
         }
     }
 
