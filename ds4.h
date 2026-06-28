@@ -256,6 +256,40 @@ typedef struct {
     int                   model_fd;   /* open model fd (for pread-streaming experts; -1 if none) */
 } ds4_q3n_model_desc;
 
+typedef struct {
+    ds4_dense_wdesc attn_norm, post_attn_norm;                 /* pre-attn + pre-MoE RMSNorms */
+    ds4_dense_wdesc attn_q, attn_q_bias, attn_k, attn_k_bias,  /* GQA, all with bias */
+                    attn_v, attn_v_bias, attn_out, attn_out_bias;
+    ds4_dense_wdesc attn_sinks;                                /* per-head sink logits [n_head] */
+    ds4_dense_wdesc ffn_gate_inp, ffn_gate_inp_bias;           /* MoE router (+bias) */
+    ds4_dense_wdesc ffn_gate_exps, ffn_gate_exps_bias,         /* top-4/32 experts (3D) + biases */
+                    ffn_up_exps, ffn_up_exps_bias,
+                    ffn_down_exps, ffn_down_exps_bias;
+} ds4_gptoss_layer_desc;
+
+typedef struct {
+    unsigned n_layer, n_embd, n_vocab, n_ctx;
+    unsigned n_head, n_kv, head_dim, n_rot;
+    unsigned n_expert, n_expert_used, n_ff_exp;
+    unsigned n_swa;                  /* sliding-window size (128); alternates with full per layer */
+    float    rms_eps, rope_base;
+    /* YaRN rope (gpt-oss): ext_factor=1, attn_factor=1, beta_fast=32, beta_slow=1. */
+    float    yarn_freq_scale;        /* 1/scaling_factor (1/32) */
+    float    yarn_mscale;            /* attn_factor*(1+0.1*ln(1/freq_scale)) ~ 1.347 */
+    float    yarn_corr0, yarn_corr1; /* rope_yarn ramp correction dims (precomputed) */
+    ds4_dense_wdesc        token_embd, output_norm, output;
+    ds4_gptoss_layer_desc *layers;   /* [n_layer] */
+    const void            *model_base;
+    unsigned long long     model_size;
+    int                    model_fd;
+} ds4_gptoss_model_desc;
+
+typedef struct ds4_gptoss_gpu ds4_gptoss_gpu;
+ds4_gptoss_gpu *ds4_gptoss_gpu_create(const ds4_gptoss_model_desc *desc);
+void ds4_gptoss_gpu_free(ds4_gptoss_gpu *g);
+int ds4_gptoss_gpu_forward(ds4_gptoss_gpu *g, const ds4_gptoss_model_desc *desc,
+                           int token, unsigned pos, float *logits);
+
 typedef struct ds4_q3n_gpu ds4_q3n_gpu;
 ds4_q3n_gpu *ds4_q3n_gpu_create(const ds4_q3n_model_desc *desc);
 void ds4_q3n_gpu_free(ds4_q3n_gpu *g);

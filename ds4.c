@@ -26520,9 +26520,48 @@ int ds4_q3n_generate(const char *model_path, const char *prompt, int n_predict,
     return rc;
 }
 
-/* gpt-oss entry. Phase 2a: load + bind the weights and report (the forward — GQA with
- * attention sinks + alternating sliding-window + YaRN + MoE top-4 with clamped-SwiGLU and
- * expert biases — is Phase 2b). Validates that every gpt-oss tensor binds. */
+/* Build the GPU-ready descriptor from the bound weights (Phase 2b data layer). Mirrors
+ * build_q3n_desc; precomputes the YaRN rope params (gpt-oss: scaling factor 32, orig_ctx 4096,
+ * ext_factor=1, attn_factor=1, beta_fast=32, beta_slow=1) including the ramp correction dims. */
+static void build_gptoss_desc(ds4_gptoss_model_desc *desc, const ds4_model *model,
+                              const ds4_weights *weights, uint32_t n_ctx) {
+    memset(desc, 0, sizeof(*desc));
+    desc->n_layer = DS4_N_LAYER; desc->n_embd = DS4_N_EMBD; desc->n_vocab = DS4_N_VOCAB; desc->n_ctx = n_ctx;
+    desc->n_head = DS4_N_HEAD; desc->n_kv = DS4_N_HEAD_KV; desc->head_dim = DS4_N_HEAD_DIM; desc->n_rot = DS4_N_ROT;
+    desc->n_expert = g_ds4_shape.n_expert; desc->n_expert_used = g_ds4_shape.n_expert_used; desc->n_ff_exp = g_ds4_shape.n_ff_exp;
+    desc->n_swa = g_ds4_shape.n_swa;
+    desc->rms_eps = DS4_RMS_EPS; desc->rope_base = DS4_ROPE_FREQ_BASE;
+    const float factor = 32.0f, base = desc->rope_base, orig = (float)DS4_ROPE_ORIG_CTX, nd = (float)desc->n_rot;
+    desc->yarn_freq_scale = 1.0f / factor;
+    desc->yarn_mscale     = 1.0f + 0.1f * logf(factor);   /* attn_factor=1; log(1/freq_scale)=log(factor) */
+    const float cf = nd * logf(orig / (32.0f * 2.0f * (float)M_PI)) / (2.0f * logf(base));   /* corr_dim(beta_fast) */
+    const float cs = nd * logf(orig / (1.0f  * 2.0f * (float)M_PI)) / (2.0f * logf(base));   /* corr_dim(beta_slow) */
+    desc->yarn_corr0 = floorf(fmaxf(0.0f, cf));
+    desc->yarn_corr1 = ceilf(fminf(nd - 1.0f, cs));
+    desc->token_embd  = dense_wdesc_of(model, weights->token_embd);
+    desc->output_norm = dense_wdesc_of(model, weights->output_norm);
+    desc->output      = dense_wdesc_of(model, weights->output);
+    desc->model_base = model->map; desc->model_size = model->size; desc->model_fd = model->fd;
+    desc->layers = xmalloc(sizeof(ds4_gptoss_layer_desc) * desc->n_layer);
+    for (uint32_t il = 0; il < desc->n_layer; il++) {
+        ds4_gptoss_layer_desc *L = &desc->layers[il];
+        const ds4_layer_weights *lw = &weights->layer[il];
+        L->attn_norm      = dense_wdesc_of(model, lw->attn_norm);
+        L->post_attn_norm = dense_wdesc_of(model, lw->ffn_norm);   /* post_attention_norm bound into ffn_norm */
+        L->attn_q   = dense_wdesc_of(model, lw->attn_q);    L->attn_q_bias   = dense_wdesc_of(model, lw->attn_q_bias);
+        L->attn_k   = dense_wdesc_of(model, lw->attn_k);    L->attn_k_bias   = dense_wdesc_of(model, lw->attn_k_bias);
+        L->attn_v   = dense_wdesc_of(model, lw->attn_v);    L->attn_v_bias   = dense_wdesc_of(model, lw->attn_v_bias);
+        L->attn_out = dense_wdesc_of(model, lw->attn_out);  L->attn_out_bias = dense_wdesc_of(model, lw->attn_out_bias);
+        L->attn_sinks    = dense_wdesc_of(model, lw->attn_sinks);
+        L->ffn_gate_inp  = dense_wdesc_of(model, lw->ffn_gate_inp);  L->ffn_gate_inp_bias  = dense_wdesc_of(model, lw->ffn_gate_inp_bias);
+        L->ffn_gate_exps = dense_wdesc_of(model, lw->ffn_gate_exps); L->ffn_gate_exps_bias = dense_wdesc_of(model, lw->ffn_gate_exps_bias);
+        L->ffn_up_exps   = dense_wdesc_of(model, lw->ffn_up_exps);   L->ffn_up_exps_bias   = dense_wdesc_of(model, lw->ffn_up_exps_bias);
+        L->ffn_down_exps = dense_wdesc_of(model, lw->ffn_down_exps); L->ffn_down_exps_bias = dense_wdesc_of(model, lw->ffn_down_exps_bias);
+    }
+}
+
+/* gpt-oss entry. Phases 0-2a + 2b data layer done: load, bind, build the GPU descriptor and
+ * report. The GPU forward driver (ds4_gptoss_gpu_*) is the remaining Phase 2b compute. */
 int ds4_gptoss_generate(const char *model_path, const char *prompt, int n_predict,
                         char *err, size_t errlen) {
     (void)prompt; (void)n_predict;
@@ -26532,12 +26571,18 @@ int ds4_gptoss_generate(const char *model_path, const char *prompt, int n_predic
     if (!ds4_arch_is_gptoss()) { if (errlen) snprintf(err, errlen, "not a gpt-oss model"); model_close(&model); return 1; }
     vocab_load(&vocab, &model);
     weights_bind(&weights, &model, false, 0, 0, true, false);   /* dies if any tensor is missing */
-    fprintf(stderr, "ds4: gpt-oss weights bound OK — %u layers, %u embd, GQA %u/%u, %u/%u experts (ff_exp %u), "
-            "sinks + q/k/v/o + router + expert biases all present\n",
-            (unsigned)DS4_N_LAYER, (unsigned)DS4_N_EMBD, (unsigned)DS4_N_HEAD, (unsigned)DS4_N_HEAD_KV,
-            (unsigned)DS4_N_EXPERT_USED, (unsigned)DS4_N_EXPERT, (unsigned)DS4_N_FF_EXP);
+    const uint32_t n_ctx = 256u;
+    ds4_gptoss_model_desc desc; build_gptoss_desc(&desc, &model, &weights, n_ctx);
+    fprintf(stderr, "ds4: gpt-oss desc built OK — %u layers, %u embd, GQA %u/%u (head_dim %u, n_rot %u), "
+            "%u/%u experts (ff_exp %u), swa %u, rope_base %.0f, YaRN freq_scale %.4f mscale %.4f "
+            "corr[%.1f,%.1f]; token_embd type=%d, output type=%d, sinks[L0] type=%d dim=%u\n",
+            desc.n_layer, desc.n_embd, desc.n_head, desc.n_kv, desc.head_dim, desc.n_rot,
+            desc.n_expert_used, desc.n_expert, desc.n_ff_exp, desc.n_swa, (double)desc.rope_base,
+            (double)desc.yarn_freq_scale, (double)desc.yarn_mscale, (double)desc.yarn_corr0, (double)desc.yarn_corr1,
+            desc.token_embd.type, desc.output.type, desc.layers[0].attn_sinks.type, desc.layers[0].attn_sinks.dim0);
+    free(desc.layers);
     vocab_free(&vocab); model_close(&model);
-    if (errlen) snprintf(err, errlen, "gpt-oss forward not yet built (Phase 2b)");
+    if (errlen) snprintf(err, errlen, "gpt-oss forward compute not yet built (ds4_gptoss_gpu_*)");
     return 1;
 }
 
