@@ -1643,6 +1643,21 @@ kernel void kernel_dense_swiglu_f32(
     out[gid] = (g / (1.0f + exp(-g))) * up[gid];
 }
 
+// gpt-oss clamped-SwiGLU (ggml_swiglu_oai, alpha=1.702, limit=7.0):
+//   x = min(gate, 7); y = clamp(up, -7, 7); out = (x*sigmoid(1.702*x)) * (y+1)
+kernel void kernel_gptoss_swiglu_f32(
+        constant uint & n [[buffer(0)]],
+        device const float * gate [[buffer(1)]],
+        device const float * up   [[buffer(2)]],
+        device       float * out  [[buffer(3)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    const float limit = 7.0f, alpha = 1.702f;
+    const float x = min(gate[gid], limit);
+    const float y = clamp(up[gid], -limit, limit);
+    out[gid] = (x / (1.0f + exp(-alpha * x))) * (y + 1.0f);
+}
+
 // RMSNorm with learned weight: out[i] = x[i] / rms(x) * w[i]. Single-thread
 // reference reduction (correctness first; optimize later). One thread total.
 struct ds4_dense_rmsnorm_args { uint n; float eps; };

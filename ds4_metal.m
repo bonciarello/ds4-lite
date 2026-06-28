@@ -5911,6 +5911,35 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "swiglu max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
     }
 
+    /* --- Case 4b: gpt-oss clamped-SwiGLU (kernel_gptoss_swiglu_f32) vs CPU swiglu_oai --- */
+    {
+        const uint32_t n = 64u;
+        const float L = 7.0f, alpha = 1.702f;
+        float gate[64], up[64], sref[64], sgot[64];
+        /* span the clamp region: gate/up sweep past +/-7 to exercise min()/clamp() */
+        for (uint32_t i = 0; i < n; i++) { gate[i] = 0.30f*(float)i - 9.0f; up[i] = -0.28f*(float)i + 8.0f; }
+        for (uint32_t i = 0; i < n; i++) {
+            const float x = fminf(gate[i], L), y = fmaxf(-L, fminf(up[i], L));
+            sref[i] = (x/(1.0f+expf(-alpha*x))) * (y + 1.0f);
+        }
+        ds4_gpu_tensor *gb = ds4_gpu_tensor_alloc((uint64_t)n*sizeof(float));
+        ds4_gpu_tensor *ub = ds4_gpu_tensor_alloc((uint64_t)n*sizeof(float));
+        ds4_gpu_tensor *ob = ds4_gpu_tensor_alloc((uint64_t)n*sizeof(float));
+        ds4_gpu_tensor *bufs[3] = { gb, ub, ob };
+        bool ok = gb && ub && ob;
+        if (ok) {
+            ds4_gpu_tensor_write(gb, 0, gate, (uint64_t)n*sizeof(float));
+            ds4_gpu_tensor_write(ub, 0, up,   (uint64_t)n*sizeof(float));
+            ok = ds4_gpu_run_simple("kernel_gptoss_swiglu_f32", &n, sizeof(n), bufs, 3, n, "selftest gptoss swiglu");
+        }
+        if (ok) ds4_gpu_tensor_read(ob, 0, sgot, (uint64_t)n*sizeof(float));
+        ds4_gpu_tensor_free(gb); ds4_gpu_tensor_free(ub); ds4_gpu_tensor_free(ob);
+        if (!ok) { if (errlen) snprintf(err, errlen, "gptoss swiglu GPU run failed"); goto free_gpu; }
+        float maxerr = 0.0f;
+        for (uint32_t i = 0; i < n; i++) { const float e = fabsf(sgot[i]-sref[i]); if (e>maxerr) maxerr=e; }
+        if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "gptoss swiglu max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
+    }
+
     /* --- Case 5: RMSNorm with weight (kernel_dense_rms_norm_f32) --- */
     {
         const uint32_t n = 128u;
