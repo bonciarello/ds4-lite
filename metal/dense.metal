@@ -1712,6 +1712,25 @@ kernel void kernel_dense_rms_norm_f32(
     for (uint i = 0; i < a.n; i++) out[i] = x[i] * scale * w[i];
 }
 
+// LayerNorm with learned gamma + beta: out[i] = (x[i]-mean)/sqrt(var+eps)*w[i] + b[i].
+// For non-RMS dense archs (phi-2, GPT-NeoX, starcoder2). Single-thread reference; one thread total.
+kernel void kernel_dense_layer_norm_f32(
+        constant ds4_dense_rmsnorm_args & a [[buffer(0)]],
+        device const float * x   [[buffer(1)]],
+        device const float * w   [[buffer(2)]],   // gamma
+        device const float * b   [[buffer(3)]],   // beta
+        device       float * out [[buffer(4)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid != 0u) return;
+    float mean = 0.0f;
+    for (uint i = 0; i < a.n; i++) mean += x[i];
+    mean /= (float)a.n;
+    float var = 0.0f;
+    for (uint i = 0; i < a.n; i++) { const float d = x[i] - mean; var += d * d; }
+    const float inv = 1.0f / sqrt(var / (float)a.n + a.eps);
+    for (uint i = 0; i < a.n; i++) out[i] = (x[i] - mean) * inv * w[i] + b[i];
+}
+
 // Parallel RMSNorm (Fase opt). One threadgroup of 128 threads; sum-of-squares
 // via per-simdgroup simd_sum + threadgroup reduction, then a parallel write.
 // Replaces the single-thread kernel above. Dispatch: grid=(1,1,1) tpg=(128,1,1).

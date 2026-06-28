@@ -4200,6 +4200,8 @@ struct ds4_dense_gpu {
     uint32_t swa_window, swa_pattern;   /* gemma sliding window: local layers cap their KV
                                          * cache at swa_window slots (ring buffer); 0 = off */
     ds4_gpu_tensor *x, *h, *h2, *q, *k, *v, *att, *o, *gate, *up, *act, *down, *logits;
+    /* MoE FFN scratch (NULL on a dense model): router logits + per-expert gate/up/act/down + accumulator. */
+    ds4_gpu_tensor *moe_router, *moe_gate, *moe_up, *moe_act, *moe_down, *moe_acc;
     ds4_dense_kv_layer *kv;          /* [n_layer] */
     float *embedscratch;             /* n_embd */
     float *hostscratch;              /* n_vocab (for f32 matvec readback path) */
@@ -4297,6 +4299,22 @@ static bool dense_rms(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *x, 
         return ds4_gpu_run_simple("kernel_dense_rms_norm_f32", &a, sizeof(a), bufs, 3, 1u, "fwd rms");
     return ds4_gpu_run_grid("kernel_dense_rms_norm_f32_sg", &a, sizeof(a), bufs, 3,
                             MTLSizeMake(1, 1, 1), MTLSizeMake(128, 1, 1), "fwd rms sg");
+}
+
+/* RMSNorm, or LayerNorm when a norm bias (beta) is present (phi-2 / GPT-NeoX / starcoder2). One
+ * helper so the dense forward picks the right norm from the model's caps without branching inline. */
+static bool dense_norm(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *x,
+                       const ds4_dense_wdesc *norm, const ds4_dense_wdesc *norm_bias,
+                       uint32_t n, float eps) {
+    if (norm_bias && norm_bias->data) {                   /* LayerNorm: (x-mean)/sqrt(var+eps)*gamma + beta */
+        ds4_gpu_tensor *wb = dense_cached_weight(g, norm->data, norm->bytes);
+        ds4_gpu_tensor *bb = dense_cached_weight(g, norm_bias->data, norm_bias->bytes);
+        if (!wb || !bb) return false;
+        struct __attribute__((packed)) { uint32_t n; float eps; } a = { n, eps };
+        ds4_gpu_tensor *bufs[4] = { x, wb, bb, out };
+        return ds4_gpu_run_simple("kernel_dense_layer_norm_f32", &a, sizeof(a), bufs, 4, 1u, "fwd ln");
+    }
+    return dense_rms(g, out, x, norm, n, eps);            /* RMSNorm */
 }
 
 static bool dense_add_bias(ds4_dense_gpu *g, ds4_gpu_tensor *buf, const ds4_dense_wdesc *bias, uint32_t n) {
@@ -4480,6 +4498,14 @@ ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
     g->k=ds4_gpu_tensor_alloc((uint64_t)g->kvd*4); g->v=ds4_gpu_tensor_alloc((uint64_t)g->kvd*4);
     g->gate=ds4_gpu_tensor_alloc((uint64_t)g->n_ff*4); g->up=ds4_gpu_tensor_alloc((uint64_t)g->n_ff*4);
     g->act=ds4_gpu_tensor_alloc((uint64_t)g->n_ff*4); g->logits=ds4_gpu_tensor_alloc((uint64_t)g->n_vocab*4);
+    if (d->n_expert > 0) {                               /* MoE FFN scratch (router + one-expert work buffers) */
+        g->moe_router = ds4_gpu_tensor_alloc((uint64_t)d->n_expert*4);
+        g->moe_gate   = ds4_gpu_tensor_alloc((uint64_t)d->n_ff_exp*4);
+        g->moe_up     = ds4_gpu_tensor_alloc((uint64_t)d->n_ff_exp*4);
+        g->moe_act    = ds4_gpu_tensor_alloc((uint64_t)d->n_ff_exp*4);
+        g->moe_down   = ds4_gpu_tensor_alloc((uint64_t)g->n_embd*4);
+        g->moe_acc    = ds4_gpu_tensor_alloc((uint64_t)g->n_embd*4);
+    }
     g->kv = calloc(d->n_layer, sizeof(g->kv[0]));
     for (uint32_t il = 0; il < d->n_layer; il++) {
         const uint64_t cap = dense_kv_cap(g, il);   /* sliding layers cap at swa_window slots */
@@ -4526,6 +4552,8 @@ void ds4_dense_gpu_free(ds4_dense_gpu *g) {
     ds4_gpu_tensor_free(g->att); ds4_gpu_tensor_free(g->k); ds4_gpu_tensor_free(g->v);
     ds4_gpu_tensor_free(g->gate); ds4_gpu_tensor_free(g->up); ds4_gpu_tensor_free(g->act);
     ds4_gpu_tensor_free(g->logits);
+    ds4_gpu_tensor_free(g->moe_router); ds4_gpu_tensor_free(g->moe_gate); ds4_gpu_tensor_free(g->moe_up);
+    ds4_gpu_tensor_free(g->moe_act); ds4_gpu_tensor_free(g->moe_down); ds4_gpu_tensor_free(g->moe_acc);
     ds4_gpu_tensor_free(g->pm); ds4_gpu_tensor_free(g->pl); ds4_gpu_tensor_free(g->pacc);
     ds4_gpu_tensor_free(g->vXb); ds4_gpu_tensor_free(g->vHb); ds4_gpu_tensor_free(g->vOb);
     ds4_gpu_tensor_free(g->vQb); ds4_gpu_tensor_free(g->vattb); ds4_gpu_tensor_free(g->vgateb);
@@ -5262,6 +5290,61 @@ static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d
     }
 }
 
+/* MoE FFN for one token: route h2 to the top-k experts and accumulate their weighted SwiGLU
+ * outputs into g->moe_acc[ne]. moe_gating==0 (qwen3moe): softmax over ALL experts, take top-k by
+ * probability, renormalize the selected weights. moe_gating==1 (gpt-oss-style): top-k by logit,
+ * then softmax over the selected. No expert bias (qwen3moe-style). Reuses q3n_expert_slice. */
+static bool dense_moe_ffn(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
+                          const ds4_dense_layer_desc *L, ds4_gpu_tensor *h2, uint32_t ne) {
+    const uint32_t nexp = d->n_expert, nused = d->n_expert_used, nff = d->n_ff_exp;
+    if (nexp == 0 || nused == 0 || nexp > 512 || nused > 64) return false;
+    if (!dense_matvec(g, &L->ffn_gate_inp, h2, g->moe_router)) return false;   /* router logits */
+    float r[512]; ds4_gpu_tensor_read(g->moe_router, 0, r, (uint64_t)nexp*4);
+    uint32_t sel[64]; float w[64]; bool used[512] = {false};
+    if (d->moe_gating == 0) {                                  /* softmax over all -> top-k -> renorm */
+        float mx=-1e30f; for (uint32_t e=0;e<nexp;e++) if (r[e]>mx) mx=r[e];
+        double s=0; for (uint32_t e=0;e<nexp;e++){ r[e]=expf(r[e]-mx); s+=r[e]; }
+        const float inv=(float)(1.0/s); for (uint32_t e=0;e<nexp;e++) r[e]*=inv;
+        double wsum=0;
+        for (uint32_t i=0;i<nused;i++){ int bi=-1; float bv=-1.0f; for(uint32_t e=0;e<nexp;e++) if(!used[e]&&r[e]>bv){bv=r[e];bi=(int)e;} sel[i]=(uint32_t)bi; used[bi]=true; w[i]=r[bi]; wsum+=w[i]; }
+        const float winv = wsum>0 ? (float)(1.0/wsum) : 1.0f;
+        for (uint32_t i=0;i<nused;i++) w[i]*=winv;
+    } else {                                                   /* top-k by logit -> softmax over selected */
+        for (uint32_t i=0;i<nused;i++){ int bi=-1; float bv=-1e30f; for(uint32_t e=0;e<nexp;e++) if(!used[e]&&r[e]>bv){bv=r[e];bi=(int)e;} sel[i]=(uint32_t)bi; used[bi]=true; }
+        float mx=-1e30f; for(uint32_t i=0;i<nused;i++) if(r[sel[i]]>mx) mx=r[sel[i]];
+        double s=0; for(uint32_t i=0;i<nused;i++){ w[i]=expf(r[sel[i]]-mx); s+=w[i]; }
+        const float inv=(float)(1.0/s); for(uint32_t i=0;i<nused;i++) w[i]*=inv;
+    }
+    const float wscale = d->expert_weights_scale > 0.0f ? d->expert_weights_scale : 1.0f;
+    void *accp = ds4_gpu_tensor_contents(g->moe_acc); if (accp) memset(accp, 0, (size_t)ne*4);
+    bool ok = accp != NULL;
+    for (uint32_t i=0; ok && i<nused; i++){
+        const uint32_t e=sel[i];
+        ds4_dense_wdesc wg=q3n_expert_slice(&L->ffn_gate_exps,e,nexp,ne,nff),
+                        wu=q3n_expert_slice(&L->ffn_up_exps,e,nexp,ne,nff),
+                        wd=q3n_expert_slice(&L->ffn_down_exps,e,nexp,nff,ne);
+        ok = dense_matvec(g,&wg,h2,g->moe_gate)
+          && dense_matvec(g,&wu,h2,g->moe_up)
+          && dense_swiglu(g->moe_act,g->moe_gate,g->moe_up,nff)
+          && dense_matvec(g,&wd,g->moe_act,g->moe_down)
+          && q3n_axpy(g->moe_acc,g->moe_down,w[i]*wscale,ne);
+    }
+    return ok;
+}
+
+/* FFN from `in` (the appropriately-normed input): MoE or dense, GeGLU or SwiGLU. The output tensor
+ * (g->moe_acc for MoE, g->down for dense) is returned in *out for the caller to add to the residual. */
+static bool dense_ffn(ds4_dense_gpu *g, const ds4_dense_model_desc *d, const ds4_dense_layer_desc *L,
+                      ds4_gpu_tensor *in, ds4_gpu_tensor **out, uint32_t nff) {
+    if (d->n_expert > 0) { *out = g->moe_acc; return dense_moe_ffn(g, d, L, in, g->n_embd); }
+    *out = g->down;
+    return dense_matvec(g, &L->ffn_gate, in, g->gate)
+        && dense_matvec(g, &L->ffn_up, in, g->up)
+        && (d->ffn_geglu ? gemma_geglu(g->act, g->gate, g->up, nff)
+                         : dense_swiglu(g->act, g->gate, g->up, nff))
+        && dense_matvec(g, &L->ffn_down, g->act, g->down);
+}
+
 int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
                           int token, unsigned pos, float *logits) {
     if (d->gemma) return ds4_gemma_gpu_forward(g, d, token, pos, logits);
@@ -5295,7 +5378,7 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
             /* KV: compute K/V in f32 scratch (g->k/g->v), bias + rope there, then append
              * to the cache slot at pos (f16, or int8 + scale under DS4_KV_INT8). */
             const double ta0 = g->profile ? ds4_gpu_now_ms() : 0.0;
-            ok = dense_rms(g, g->h, g->x, &L->attn_norm, ne, eps)
+            ok = dense_norm(g, g->h, g->x, &L->attn_norm, &L->attn_norm_bias, ne, eps)
               && dense_matvec(g, &L->attn_q, g->h, g->q)
               && dense_matvec(g, &L->attn_k, g->h, g->k)
               && dense_matvec(g, &L->attn_v, g->h, g->v)
@@ -5309,16 +5392,23 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
               && dense_rope(g->k, nkv, hd, nrot, pos, base)
               && dense_kv_write(g, kv, pos, kvd)
               && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv, hd, pos+1, scale)
-              && dense_matvec(g, &L->attn_out, g->att, g->o)
-              && dense_add(g->x, g->o, ne);
+              && dense_matvec(g, &L->attn_out, g->att, g->o);   /* g->o = attention output (pre-residual) */
             const double ta1 = g->profile ? ds4_gpu_now_ms() : 0.0;
-            ok = ok
-              && dense_rms(g, g->h2, g->x, &L->ffn_norm, ne, eps)
-              && dense_matvec(g, &L->ffn_gate, g->h2, g->gate)
-              && dense_matvec(g, &L->ffn_up, g->h2, g->up)
-              && dense_swiglu(g->act, g->gate, g->up, nff)
-              && dense_matvec(g, &L->ffn_down, g->act, g->down)
-              && dense_add(g->x, g->down, ne);
+            if (ok) {
+                ds4_gpu_tensor *ffn_out = NULL;
+                if (d->parallel_residual) {
+                    /* phi-2 / GPT-NeoX: attn and FFN both read the SAME input norm (g->h); x += attn + ffn. */
+                    ok = dense_ffn(g, d, L, g->h, &ffn_out, nff)
+                      && dense_add(g->x, g->o, ne)
+                      && dense_add(g->x, ffn_out, ne);
+                } else {
+                    /* sequential (llama / qwen / qwen3moe): x += attn, then FFN from norm(x). */
+                    ok = dense_add(g->x, g->o, ne)
+                      && dense_norm(g, g->h2, g->x, &L->ffn_norm, &L->ffn_norm_bias, ne, eps)
+                      && dense_ffn(g, d, L, g->h2, &ffn_out, nff)
+                      && dense_add(g->x, ffn_out, ne);
+                }
+            }
             const double ta2 = g->profile ? ds4_gpu_now_ms() : 0.0;
             if (g->profile) { g->t_attn += ta1 - ta0; g->t_ffn += ta2 - ta1; }
             if (ddbg && (il<2 || il==d->n_layer-1)) { const float *x=(const float*)ds4_gpu_tensor_contents(g->x);
@@ -5326,7 +5416,7 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
                 fprintf(stderr,"   L%02u: |x|=%.4f\n", il, sqrt(s)); }
         }
         const double to0 = g->profile ? ds4_gpu_now_ms() : 0.0;
-        ok = ok && dense_rms(g, g->h, g->x, &d->output_norm, ne, eps)
+        ok = ok && dense_norm(g, g->h, g->x, &d->output_norm, &d->output_norm_bias, ne, eps)
                 && dense_matvec(g, &d->output, g->h, g->logits);
         const double to1 = g->profile ? ds4_gpu_now_ms() : 0.0;
         if (g->profile) { g->t_out += to1 - to0; g->n_fwd++; }
@@ -5858,7 +5948,7 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
      * time through the decode forward, which builds the KV cache in the right format. Slower
      * prefill, but correct. */
     const bool has_qk_norm = d->n_layer > 0 && d->layers[0].attn_q_norm.data != NULL;
-    if (d->gemma || g->kv_int8 || has_qk_norm) {
+    if (d->gemma || g->kv_int8 || has_qk_norm || d->n_expert > 0) {   /* MoE: batched prefill has no MoE FFN */
         float *throwaway = all_logits ? NULL : malloc((size_t)d->n_vocab * sizeof(float));
         int rc = 0;
         for (uint32_t i = 0; i < M && rc == 0; i++) {

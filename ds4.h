@@ -182,8 +182,13 @@ typedef struct {
     ds4_dense_wdesc attn_norm, attn_q, attn_q_bias, attn_k, attn_k_bias,
                     attn_v, attn_v_bias, attn_out;
     ds4_dense_wdesc ffn_norm, ffn_gate, ffn_up, ffn_down;
-    /* gemma3 only (NULL data otherwise): QK-norm [head_dim], post-attn & post-ffn norms. */
+    /* gemma3 only (NULL data otherwise): QK-norm [head_dim], post-attn & post-ffn norms.
+     * attn_q_norm/attn_k_norm are also used by qwen3 (per-head QK-norm). */
     ds4_dense_wdesc attn_q_norm, attn_k_norm, attn_post_norm, ffn_post_norm;
+    /* MoE FFN (NULL data on a dense model): router + per-expert gate/up/down (3D [.., n_expert]). */
+    ds4_dense_wdesc ffn_gate_inp, ffn_gate_exps, ffn_up_exps, ffn_down_exps;
+    /* LayerNorm bias (beta) for the input/ffn norms — NULL on RMSNorm models. */
+    ds4_dense_wdesc attn_norm_bias, ffn_norm_bias;
 } ds4_dense_layer_desc;
 
 typedef struct {
@@ -202,6 +207,18 @@ typedef struct {
     float    rope_scale_local;  /* sliding-layer RoPE freq_scale (gemma: 1.0) */
     unsigned swa_window;        /* sliding-window size (gemma: 1024); 0 -> full attention */
     unsigned swa_pattern;       /* 1 global every swa_pattern layers (gemma: 6) */
+    /* MoE FFN (n_expert==0 -> plain dense FFN). qwen3moe etc.: router top-k of n_expert experts. */
+    unsigned n_expert;          /* total experts; 0 = dense */
+    unsigned n_expert_used;     /* experts routed per token (top-k) */
+    unsigned n_ff_exp;          /* per-expert FFN hidden dim */
+    float    expert_weights_scale; /* scale applied to the routed weights (qwen3moe: usually 1) */
+    int      moe_gating;        /* routing: 0 = softmax-over-all then top-k then renorm (qwen3moe);
+                                 *          1 = top-k by logit then softmax over the selected (gpt-oss) */
+    /* Capability flags for non-llama-style dense archs (all 0 = plain llama). */
+    int      ffn_geglu;         /* FFN activation: 1 = GeGLU (gelu), 0 = SwiGLU (silu) */
+    int      norm_layernorm;    /* norm type: 1 = LayerNorm (mean+var+gamma+beta), 0 = RMSNorm */
+    int      parallel_residual; /* 1 = attn + ffn both read the input norm, summed (phi-2, GPT-NeoX) */
+    ds4_dense_wdesc output_norm_bias;  /* LayerNorm beta for the final norm (NULL on RMSNorm) */
 } ds4_dense_model_desc;
 
 typedef struct ds4_dense_gpu ds4_dense_gpu;

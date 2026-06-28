@@ -3113,6 +3113,7 @@ typedef struct {
     ds4_tensor *hc_attn_scale;
     ds4_tensor *hc_attn_base;
     ds4_tensor *attn_norm;
+    ds4_tensor *attn_norm_bias;   /* LayerNorm beta (phi-2/NeoX); NULL on RMSNorm */
     ds4_tensor *attn_q_a;
     ds4_tensor *attn_q_a_norm;
     ds4_tensor *attn_q_b;
@@ -3135,6 +3136,7 @@ typedef struct {
     ds4_tensor *hc_ffn_scale;
     ds4_tensor *hc_ffn_base;
     ds4_tensor *ffn_norm;
+    ds4_tensor *ffn_norm_bias;    /* LayerNorm beta; NULL on RMSNorm */
     ds4_tensor *ffn_gate_tid2eid;
     ds4_tensor *ffn_gate_inp;
     ds4_tensor *ffn_exp_probs_b;
@@ -3191,6 +3193,7 @@ typedef struct {
     ds4_tensor *output_hc_fn;
     ds4_tensor *output_hc_scale;
     ds4_tensor *output_norm;
+    ds4_tensor *output_norm_bias;   /* LayerNorm beta for the final norm; NULL on RMSNorm */
     ds4_tensor *output;
     ds4_layer_weights layer[DS4_MAX_LAYER];
 } ds4_weights;
@@ -4134,7 +4137,12 @@ static void config_build_dense_shape(const ds4_model *m, const char *ns) {
     s.rope_freq_base    = rope_base;
     s.rope_scale_factor = 1.0f;
 
-    /* Everything DeepSeek-specific stays at 0 (disabled) via memset:
+    /* MoE (qwen3moe, …): expert counts. Absent on dense models -> stay 0 -> plain dense FFN. */
+    model_get_u32_ns(m, ns, "expert_count", &s.n_expert);
+    model_get_u32_ns(m, ns, "expert_used_count", &s.n_expert_used);
+    model_get_u32_ns(m, ns, "expert_feed_forward_length", &s.n_ff_exp);
+
+    /* Everything else DeepSeek-specific stays at 0 (disabled) via memset:
      * n_expert*, n_lora_*, n_indexer_*, n_hc*, n_hash_layer, n_swa, n_out_group,
      * swiglu_clamp_exp, hc_eps, compress_rope_freq_base, yarn betas. */
 
@@ -4522,9 +4530,16 @@ static void weights_validate_layout_dense(const ds4_weights *w, uint32_t start,
         dense_expect_dims_opt(l->attn_k_bias, 1, kv_dim, 0);
         dense_expect_dims_opt(l->attn_v_bias, 1, kv_dim, 0);
         dense_expect_dims(l->ffn_norm, 1, n_embd, 0);
-        dense_expect_dims(l->ffn_gate, 2, n_embd, n_ff);
-        dense_expect_dims(l->ffn_up,   2, n_embd, n_ff);
-        dense_expect_dims(l->ffn_down, 2, n_ff,   n_embd);
+        if (l->ffn_gate_inp) {                          /* MoE: router (2D) + 3D expert tensors */
+            dense_expect_dims(l->ffn_gate_inp, 2, n_embd, DS4_N_EXPERT);
+            tensor_expect_layout(l->ffn_gate_exps, l->ffn_gate_exps->type, 3, n_embd,       DS4_N_FF_EXP, DS4_N_EXPERT);
+            tensor_expect_layout(l->ffn_up_exps,   l->ffn_up_exps->type,   3, n_embd,       DS4_N_FF_EXP, DS4_N_EXPERT);
+            tensor_expect_layout(l->ffn_down_exps, l->ffn_down_exps->type, 3, DS4_N_FF_EXP, n_embd,       DS4_N_EXPERT);
+        } else {                                        /* dense FFN */
+            dense_expect_dims(l->ffn_gate, 2, n_embd, n_ff);
+            dense_expect_dims(l->ffn_up,   2, n_embd, n_ff);
+            dense_expect_dims(l->ffn_down, 2, n_ff,   n_embd);
+        }
     }
 }
 
@@ -4537,6 +4552,7 @@ static void weights_bind_output_dense(ds4_weights *w, const ds4_model *m,
     w->token_embd = require_token_embd ? required_tensor(m, "token_embd.weight")
                                        : model_find_tensor(m, "token_embd.weight");
     w->output_norm = required_tensor(m, "output_norm.weight");
+    w->output_norm_bias = model_find_tensor(m, "output_norm.bias");   /* LayerNorm beta (optional) */
     /* Some dense models tie embeddings: no separate output.weight, reuse embd. */
     w->output = model_find_tensor(m, "output.weight");
     if (!w->output && require_output) w->output = w->token_embd;
@@ -4544,6 +4560,7 @@ static void weights_bind_output_dense(ds4_weights *w, const ds4_model *m,
 
 static void weights_bind_layer_dense(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     l->attn_norm   = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->attn_norm_bias = tensor_by_namef(m, "blk.%u.attn_norm.bias", il);   /* LayerNorm beta (optional) */
     l->attn_q      = required_tensorf(m, "blk.%u.attn_q.weight", il);
     l->attn_k      = required_tensorf(m, "blk.%u.attn_k.weight", il);
     l->attn_v      = required_tensorf(m, "blk.%u.attn_v.weight", il);
@@ -4553,9 +4570,19 @@ static void weights_bind_layer_dense(ds4_layer_weights *l, const ds4_model *m, u
     l->attn_k_bias = tensor_by_namef(m, "blk.%u.attn_k.bias", il);
     l->attn_v_bias = tensor_by_namef(m, "blk.%u.attn_v.bias", il);
     l->ffn_norm    = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
-    l->ffn_gate    = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
-    l->ffn_up      = required_tensorf(m, "blk.%u.ffn_up.weight", il);
-    l->ffn_down    = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+    l->ffn_norm_bias = tensor_by_namef(m, "blk.%u.ffn_norm.bias", il);     /* LayerNorm beta (optional) */
+    /* FFN: MoE (router + per-expert gate/up/down) when blk.N.ffn_gate_inp exists (qwen3moe, …),
+     * otherwise the plain dense gate/up/down. */
+    l->ffn_gate_inp = tensor_by_namef(m, "blk.%u.ffn_gate_inp.weight", il);
+    if (l->ffn_gate_inp) {
+        l->ffn_gate_exps = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+        l->ffn_up_exps   = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+        l->ffn_down_exps = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    } else {
+        l->ffn_gate    = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+        l->ffn_up      = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+        l->ffn_down    = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+    }
     /* Per-head QK-norm on q/k (qwen3, gemma3, …): optional — NULL data when the tensor is absent
      * (qwen2/llama/mistral). The dense forward applies it (before RoPE) only when present. */
     l->attn_q_norm = tensor_by_namef(m, "blk.%u.attn_q_norm.weight", il);
@@ -26336,6 +26363,19 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
     desc->n_vocab = DS4_N_VOCAB; desc->n_rot = DS4_N_ROT; desc->n_ctx = n_ctx;
     desc->rms_eps = DS4_RMS_EPS; desc->rope_base = DS4_ROPE_FREQ_BASE;
     desc->rope_scale = 1.0f;   /* plain dense: no linear RoPE freq_scale */
+    /* MoE FFN config (n_expert==0 -> plain dense FFN). qwen3moe-style routing: softmax over all
+     * experts, take top-k, renormalize the selected weights (moe_gating=0). */
+    desc->n_expert = DS4_N_EXPERT; desc->n_expert_used = DS4_N_EXPERT_USED; desc->n_ff_exp = DS4_N_FF_EXP;
+    desc->expert_weights_scale = 1.0f; desc->moe_gating = 0;
+    desc->output_norm_bias = dense_wdesc_of(model, weights->output_norm_bias);
+    /* Capability flags for non-llama-style archs (per-arch table; LayerNorm is auto-detected via the
+     * norm bias tensors). Matches the llama.cpp per-arch graph builders. */
+    {
+        const char *arch = g_ds4_shape.name ? g_ds4_shape.name : "";
+        desc->ffn_geglu = (strcmp(arch, "gemma2") == 0);
+        desc->parallel_residual = (strcmp(arch, "gptneox") == 0 || strcmp(arch, "phi2") == 0 ||
+                                   strcmp(arch, "stablelm") == 0 || strcmp(arch, "persimmon") == 0);
+    }
     /* gemma3: dense transformer with gemma quirks. Embedding scaling, attention
      * scale on query_pre_attn_scalar (= n_embd/n_head for the 27B), GeGLU, per-head
      * QK-norm, 4 norms/layer, and sliding-window attention with a separate RoPE base
@@ -26389,6 +26429,13 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
         L->attn_k_norm    = dense_wdesc_of(model, lw->attn_k_norm);
         L->attn_post_norm = dense_wdesc_of(model, lw->attn_post_norm);
         L->ffn_post_norm  = dense_wdesc_of(model, lw->ffn_post_norm);
+        /* MoE FFN tensors (NULL data on a dense model -> the dense FFN path runs instead). */
+        L->ffn_gate_inp  = dense_wdesc_of(model, lw->ffn_gate_inp);
+        L->ffn_gate_exps = dense_wdesc_of(model, lw->ffn_gate_exps);
+        L->ffn_up_exps   = dense_wdesc_of(model, lw->ffn_up_exps);
+        L->ffn_down_exps = dense_wdesc_of(model, lw->ffn_down_exps);
+        L->attn_norm_bias = dense_wdesc_of(model, lw->attn_norm_bias);   /* LayerNorm beta (NULL on RMSNorm) */
+        L->ffn_norm_bias  = dense_wdesc_of(model, lw->ffn_norm_bias);
     }
 }
 
