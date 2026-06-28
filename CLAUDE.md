@@ -278,8 +278,12 @@ minificato); le feature sono reimplementate da zero in C.
 - **Menu slash autocomplete**: digitando `/` la status footer diventa un menu comandi filtrato live
   (match più vicino evidenziato) via il meccanismo status multi-riga di linenoise (`dense_slash_menu`
   in `dense_layout_cb`). `DENSE_CMDS[]` è la lista comandi.
-- **Tools/function-calling** (`read_file`/`bash`/`web_fetch`/`web_search`, formato Hermes
-  `<tool_call>`): ON anche per **gemma** — il prompt-tool è iniettato nel **primo turno user**
-  (`gemma_sys_pending`, gemma non ha system role). Validato end-to-end su gemma-3-27b (emette
-  `<tool_call>` ben formato, esegue, risponde dal risultato). Il tool loop rende chiamata (🔧) +
-  box risultato (`dense_tool_render`). Disabilita con `DS4_DENSE_NO_TOOLS`.
+- **Tools/function-calling** (`read_file`/`bash`/`web_fetch`/`web_search`/`write_file`/`edit_file`/
+  `glob`/`grep`, formato Hermes `<tool_call>`): **ON per OGNI architettura** — dense, gemma e
+  **qwen3_next** (`tools_on = getenv("DS4_DENSE_NO_TOOLS")==NULL`, nessuna esclusione per arch). Per
+  gemma il prompt-tool è iniettato nel **primo turno user** (`gemma_sys_pending`, gemma non ha system
+  role); gli altri usano il system role. Il loop di esecuzione tool è condiviso da dense + q3n.
+  Validato end-to-end su gemma-3-27b e **Qwen3-Next-80B IQ2_XXS** (emette `<tool_call>` ben formato,
+  esegue write_file + bash, risponde dal risultato reale). NB: il prompt-tool è ~624 token → su q3n
+  lento aggiunge un prefill iniziale una tantum (più rapido con IQ2_XXS). Il tool loop rende chiamata
+  (🔧) + box risultato (`dense_tool_render`). Disabilita con `DS4_DENSE_NO_TOOLS`.

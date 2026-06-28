@@ -27907,10 +27907,11 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     const char *base_sys = (system && system[0]) ? system : "You are a helpful assistant.";
-    /* function-calling ON by default for dense + gemma; OFF for qwen3_next (the tools prompt
-     * is hundreds of tokens and prefilling it at q3n's ~1-3 tok/s would take minutes). For
-     * gemma the prompt is injected into the first user turn (no system role) — see below. */
-    const bool tools_on = getenv("DS4_DENSE_NO_TOOLS") == NULL && !is_q3n;
+    /* function-calling ON by default for EVERY architecture (dense, gemma, qwen3_next).
+     * Disable only with DS4_DENSE_NO_TOOLS. For gemma the tools prompt is injected into the
+     * first user turn (no system role); the others use the system role — see below. Note: the
+     * tools prompt is ~624 tokens, so on slow q3n it adds a one-time prefill at chat start. */
+    const bool tools_on = getenv("DS4_DENSE_NO_TOOLS") == NULL;
     char *sys_buf = NULL;
     const char *sys = base_sys;
     if (tools_on) {
