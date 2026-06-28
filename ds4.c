@@ -26571,19 +26571,32 @@ int ds4_gptoss_generate(const char *model_path, const char *prompt, int n_predic
     if (!ds4_arch_is_gptoss()) { if (errlen) snprintf(err, errlen, "not a gpt-oss model"); model_close(&model); return 1; }
     vocab_load(&vocab, &model);
     weights_bind(&weights, &model, false, 0, 0, true, false);   /* dies if any tensor is missing */
-    const uint32_t n_ctx = 256u;
+    token_vec toks = {0};
+    bpe_tokenize_text(&vocab, prompt ? prompt : "", &toks);
+    if (toks.len == 0) { if (errlen) snprintf(err, errlen, "empty prompt"); vocab_free(&vocab); model_close(&model); return 1; }
+    const uint32_t n_ctx = (uint32_t)toks.len + (uint32_t)(n_predict > 0 ? n_predict : 0) + 8u;
     ds4_gptoss_model_desc desc; build_gptoss_desc(&desc, &model, &weights, n_ctx);
-    fprintf(stderr, "ds4: gpt-oss desc built OK — %u layers, %u embd, GQA %u/%u (head_dim %u, n_rot %u), "
-            "%u/%u experts (ff_exp %u), swa %u, rope_base %.0f, YaRN freq_scale %.4f mscale %.4f "
-            "corr[%.1f,%.1f]; token_embd type=%d, output type=%d, sinks[L0] type=%d dim=%u\n",
-            desc.n_layer, desc.n_embd, desc.n_head, desc.n_kv, desc.head_dim, desc.n_rot,
-            desc.n_expert_used, desc.n_expert, desc.n_ff_exp, desc.n_swa, (double)desc.rope_base,
-            (double)desc.yarn_freq_scale, (double)desc.yarn_mscale, (double)desc.yarn_corr0, (double)desc.yarn_corr1,
-            desc.token_embd.type, desc.output.type, desc.layers[0].attn_sinks.type, desc.layers[0].attn_sinks.dim0);
-    free(desc.layers);
-    vocab_free(&vocab); model_close(&model);
-    if (errlen) snprintf(err, errlen, "gpt-oss forward compute not yet built (ds4_gptoss_gpu_*)");
-    return 1;
+    ds4_gptoss_gpu *g = ds4_gptoss_gpu_create(&desc);
+    if (!g) { if (errlen) snprintf(err, errlen, "gpt-oss GPU create failed"); free(desc.layers); token_vec_free(&toks); vocab_free(&vocab); model_close(&model); return 1; }
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    int rc = 0; uint32_t pos = 0;
+    fprintf(stderr, "ds4: gpt-oss forward (EXPERIMENTAL) — prefill %u tokens…\n", (unsigned)toks.len);
+    for (uint32_t i = 0; i < (uint32_t)toks.len && rc == 0; i++)
+        if (ds4_gptoss_gpu_forward(g, &desc, toks.v[i], pos++, logits) != 0) rc = 1;
+    printf("=== ds4 gpt-oss greedy (%d tokens) ===\n", n_predict);
+    for (uint32_t i = 0; i < (uint32_t)toks.len; i++) dense_print_token(&vocab, toks.v[i]);
+    int n_gen = 0;
+    while (rc == 0 && n_gen < n_predict) {
+        int next = sample_argmax(logits, DS4_N_VOCAB);
+        if (next == vocab.eos_id) break;
+        dense_print_token(&vocab, next); fflush(stdout); n_gen++;
+        if (ds4_gptoss_gpu_forward(g, &desc, next, pos++, logits) != 0) { rc = 1; break; }
+    }
+    printf("\n");
+    free(logits); ds4_gptoss_gpu_free(g); free(desc.layers);
+    token_vec_free(&toks); vocab_free(&vocab); model_close(&model);
+    if (rc && errlen && !err[0]) snprintf(err, errlen, "gpt-oss forward failed");
+    return rc;
 }
 
 /* Fase 3.5 step 3-6: greedy dense generation on the GPU forward driver. Loads a
