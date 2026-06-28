@@ -4226,6 +4226,7 @@ static ds4_gpu_tensor *dense_cached_weight(ds4_dense_gpu *g, const void *data, u
 
 static const char *dense_kquant_kernel(int type) {
     switch (type) {
+        case 8:  return "kernel_dense_mul_mv_q8_0_f32";    /* Q8_0 (32-block; gpt-oss) */
         case 10: return "kernel_dense_mul_mv_q2_K_f32";
         case 11: return "kernel_dense_mul_mv_q3_K_f32";
         case 12: return "kernel_dense_mul_mv_q4_K_f32";

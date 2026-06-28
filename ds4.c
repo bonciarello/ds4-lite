@@ -156,6 +156,7 @@ typedef enum {
     DS4_ARCH_DENSE     = 1,  /* standard attention + dense SwiGLU FFN  */
     DS4_ARCH_QWEN3NEXT = 2,  /* hybrid Gated-DeltaNet linear-attn + MoE (see docs/QWEN3NEXT_PLAN.md) */
     DS4_ARCH_GEMMA3    = 3,  /* dense transformer + gemma quirks: 4 norms/layer, QK-norm, GeGLU, sliding-window */
+    DS4_ARCH_GPTOSS    = 4,  /* gpt-oss: MoE (top-4/32) + GQA + attention sinks + sliding-window + YaRN + MXFP4 */
 } ds4_arch_family;
 
 typedef struct {
@@ -378,6 +379,7 @@ static int g_ds4_lock_fd = -1;
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_deepseek(void) { return DS4_ARCH == DS4_ARCH_DEEPSEEK; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_qwen3next(void) { return DS4_ARCH == DS4_ARCH_QWEN3NEXT; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma3(void) { return DS4_ARCH == DS4_ARCH_GEMMA3; }
+DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gptoss(void) { return DS4_ARCH == DS4_ARCH_GPTOSS; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_moe(void)     { return DS4_N_EXPERT != 0; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_mla(void)     { return DS4_N_LORA_Q != 0; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_indexer(void) { return DS4_N_INDEXER_HEAD != 0; }
@@ -4189,6 +4191,51 @@ static void config_build_gemma3_shape(const ds4_model *m) {
     g_ds4_shape.n_swa = swa ? swa : 1024u;
 }
 
+/* gpt-oss (general.architecture == "gpt-oss"): MoE (top-4/32) transformer with GQA,
+ * per-head attention sinks, alternating sliding-window/full attention, YaRN RoPE, and a
+ * clamped-SwiGLU expert activation. Phase 0: read the shape; the forward is NOT built yet
+ * (the engine rejects it cleanly), the experts requantize MXFP4->Q8_0 for ds4's kernels. */
+static void config_build_gptoss_shape(const ds4_model *m) {
+    const char *ns = "gpt-oss";
+    ds4_shape s; memset(&s, 0, sizeof(s));
+    s.arch = DS4_ARCH_GPTOSS; s.meta_ns = ns; s.name = "GPT-OSS";
+    model_get_u32_ns(m, ns, "block_count",             &s.n_layer);
+    model_get_u32_ns(m, ns, "embedding_length",        &s.n_embd);
+    model_get_u32_ns(m, ns, "attention.head_count",    &s.n_head);
+    model_get_u32_ns(m, ns, "attention.head_count_kv", &s.n_head_kv);
+    if (!model_get_u32_ns(m, ns, "vocab_size", &s.n_vocab) || s.n_vocab == 0) {
+        ds4_array_ref tokens;
+        if (model_get_array(m, "tokenizer.ggml.tokens", &tokens)) s.n_vocab = (uint32_t)tokens.len;
+    }
+    model_get_u32_ns(m, ns, "expert_count",      &s.n_expert);
+    model_get_u32_ns(m, ns, "expert_used_count", &s.n_expert_used);
+    if (!model_get_u32_ns(m, ns, "expert_feed_forward_length", &s.n_ff_exp))
+        model_get_u32_ns(m, ns, "feed_forward_length", &s.n_ff_exp);
+    if (!model_get_u32_ns(m, ns, "attention.key_length", &s.n_head_dim) || s.n_head_dim == 0)
+        s.n_head_dim = (s.n_head ? s.n_embd / s.n_head : 0);
+    model_get_u32_ns(m, ns, "rope.dimension_count", &s.n_rot);
+    if (s.n_rot == 0) s.n_rot = s.n_head_dim;          /* gpt-oss ropes the full head_dim */
+    model_get_f32_ns(m, ns, "attention.layer_norm_rms_epsilon", &s.rms_eps);
+    if (s.rms_eps == 0.0f) s.rms_eps = 1e-5f;
+    model_get_f32_ns(m, ns, "rope.freq_base", &s.rope_freq_base);
+    if (s.rope_freq_base == 0.0f) s.rope_freq_base = 150000.0f;
+    uint32_t swa = 0;
+    model_get_u32_ns(m, ns, "attention.sliding_window", &swa);
+    s.n_swa = swa;                                     /* 128; alternating sliding/full per layer */
+    uint64_t ctx_train = 0;
+    if ((!model_get_u64_ns(m, ns, "rope.scaling.original_context_length", &ctx_train) || ctx_train == 0) &&
+        (!model_get_u64_ns(m, ns, "context_length", &ctx_train) || ctx_train == 0))
+        ctx_train = DS4_DEFAULT_ROPE_ORIG_CTX;
+    s.rope_orig_ctx = ctx_train;
+    g_ds4_shape = s;
+    if (getenv("DS4_GPTOSS_SHAPE"))
+        fprintf(stderr, "ds4: gpt-oss shape — layers=%u n_embd=%u n_head=%u n_kv=%u head_dim=%u n_rot=%u "
+                "vocab=%u experts=%u/%u ff_exp=%u swa=%u rope_base=%.0f eps=%.0e orig_ctx=%llu\n",
+                s.n_layer, s.n_embd, s.n_head, s.n_head_kv, s.n_head_dim, s.n_rot, s.n_vocab,
+                s.n_expert_used, s.n_expert, s.n_ff_exp, s.n_swa, (double)s.rope_freq_base,
+                (double)s.rms_eps, (unsigned long long)s.rope_orig_ctx);
+}
+
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
 static void config_validate_model(const ds4_model *m) {
@@ -4211,6 +4258,10 @@ static void config_validate_model(const ds4_model *m) {
     }
     if (ds4_str_eq_cstr(arch, "gemma3")) {           /* dense + gemma quirks (runs the dense driver) */
         config_build_gemma3_shape(m);
+        return;
+    }
+    if (ds4_str_eq_cstr(arch, "gpt-oss")) {          /* MoE + sinks + sliding-window + YaRN (Phase 0: shape only) */
+        config_build_gptoss_shape(m);
         return;
     }
 

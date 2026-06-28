@@ -2577,6 +2577,31 @@ kernel void kernel_dense_mul_mv_q2_K_f32(
     out[row] = acc;
 }
 
+// Q8_0 matvec (1 thread/row), {in_dim,out_dim} args. block_q8_0 = { half d; int8 qs[32] }
+// = 34 bytes; out = sum_blocks d * sum_l(qs[l] * x[l]). gpt-oss weights (in_dim 2880, not a
+// 256-multiple → no K-quant) requantize to Q8_0; this is the dense-path Q8_0 dispatch.
+kernel void kernel_dense_mul_mv_q8_0_f32(
+        constant ds4_dense_mvq_args & a [[buffer(0)]],
+        device const char  * W   [[buffer(1)]],
+        device const float * x   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= a.out_dim) return;
+    const uint nblk = a.in_dim / 32u;
+    const uint BLK = 34u;
+    float acc = 0.0f;
+    for (uint bi = 0; bi < nblk; bi++) {
+        device const char   * blk = W + (ulong)(row * nblk + bi) * BLK;
+        const float d = (float)(*(device const half *)(blk + 0));
+        device const int8_t * qs = (device const int8_t *)(blk + 2);
+        device const float  * xb = x + (ulong)bi * 32u;
+        float s = 0.0f;
+        for (uint l = 0; l < 32u; l++) s += (float)qs[l] * xb[l];
+        acc += d * s;
+    }
+    out[row] = acc;
+}
+
 // ===========================================================================
 // Optimized simdgroup K-quant matvec kernels (Fase opt step 1).
 // Faithful ports of llama.cpp/ggml kernel_mul_mv_q4_K_f32 and _q6_K_f32
