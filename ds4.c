@@ -27933,8 +27933,9 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     bool first = true;
     /* gemma has no system role: inject the system/tools prompt into the FIRST user turn. */
     bool gemma_sys_pending = is_gemma;
-    bool think = !is_q3n && !is_gemma;   /* reflection on for dense; off for qwen3_next (too slow)
-                             * and gemma (no <think> training). Toggle with /think. */
+    bool think = !is_gemma;  /* reflection on for dense + qwen3_next (Qwen reasoning models); off
+                              * for gemma (no <think> training). Per-turn toggle: /think /nothink.
+                              * On slow q3n each turn adds a <think> pass — /nothink to skip it. */
 
     /* sampling: greedy by default; /temp /topp /topk adjust it live */
     float temp = 0.0f, top_p = 0.95f;
