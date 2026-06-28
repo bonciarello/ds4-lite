@@ -5312,7 +5312,7 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
 
 /* ===== gpt-oss forward driver ============================================== */
 struct ds4_gptoss_gpu {
-    uint32_t n_layer, n_embd, n_vocab, n_ctx, n_head, n_kv, head_dim, n_rot, qd, kvd, nff, n_expert, n_expert_used;
+    uint32_t n_layer, n_embd, n_vocab, n_ctx, n_head, n_kv, head_dim, n_rot, qd, kvd, nff, n_expert, n_expert_used, n_swa;
     float rms_eps, rope_base, yfreq_scale, ymscale, ycorr0, ycorr1, attn_scale;
     ds4_gpu_tensor *x, *h, *h2, *q, *k, *v, *att, *o;
     ds4_gpu_tensor *moe_router, *moe_gate, *moe_up, *moe_act, *moe_down, *moe_acc, *logits;
@@ -5400,7 +5400,7 @@ ds4_gptoss_gpu *ds4_gptoss_gpu_create(const ds4_gptoss_model_desc *d) {
     g->n_layer=d->n_layer; g->n_embd=d->n_embd; g->n_vocab=d->n_vocab; g->n_ctx=d->n_ctx;
     g->n_head=d->n_head; g->n_kv=d->n_kv; g->head_dim=d->head_dim; g->n_rot=d->n_rot;
     g->qd=d->n_head*d->head_dim; g->kvd=d->n_kv*d->head_dim; g->nff=d->n_ff_exp;
-    g->n_expert=d->n_expert; g->n_expert_used=d->n_expert_used;
+    g->n_expert=d->n_expert; g->n_expert_used=d->n_expert_used; g->n_swa=d->n_swa;
     g->rms_eps=d->rms_eps; g->rope_base=d->rope_base; g->yfreq_scale=d->yarn_freq_scale; g->ymscale=d->yarn_mscale;
     g->ycorr0=d->yarn_corr0; g->ycorr1=d->yarn_corr1; g->attn_scale=1.0f/sqrtf((float)d->n_rot);
     g->model_base=d->model_base; g->model_size=d->model_size; g->model_fd=d->model_fd;
@@ -5435,7 +5435,10 @@ int ds4_gptoss_gpu_forward(ds4_gptoss_gpu *g, const ds4_gptoss_model_desc *d, in
             const ds4_gptoss_layer_desc *L = &d->layers[il];
             ds4_gpu_tensor *kslot=ds4_gpu_tensor_view(g->kc[il],(uint64_t)pos*kvd*2,(uint64_t)kvd*2);
             ds4_gpu_tensor *vslot=ds4_gpu_tensor_view(g->vc[il],(uint64_t)pos*kvd*2,(uint64_t)kvd*2);
-            struct __attribute__((packed)) { uint32_t n_head,n_kv,head_dim,n_ctx; float scale; } at={nh,nkv,hd,pos+1u,scale};
+            /* SWA: set_swa_pattern(2), dense_first=false → even layers slide (window n_swa), odd full.
+               k0 = first key index attended (full layers and short contexts attend from 0). */
+            const uint32_t k0 = (g->n_swa && (il % 2u == 0u) && (pos + 1u) > g->n_swa) ? (pos + 1u - g->n_swa) : 0u;
+            struct __attribute__((packed)) { uint32_t n_head,n_kv,head_dim,n_ctx,k0; float scale; } at={nh,nkv,hd,pos+1u,k0,scale};
             ds4_gpu_tensor *sinksb=gptoss_cached_weight(g,L->attn_sinks.data,L->attn_sinks.bytes);
             ds4_gpu_tensor *attb[5]={g->q,g->kc[il],g->vc[il],g->att,sinksb};
             ok = kslot&&vslot&&sinksb
@@ -6294,7 +6297,7 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
                 for (uint32_t d=0;d<hd;d++) oh[d] += w*(float)vt[d];
             }
         }
-        struct __attribute__((packed)) { uint32_t n_head,n_kv,head_dim,n_ctx; float scale; } aa = {nh,nkv,hd,nctx,scale};
+        struct __attribute__((packed)) { uint32_t n_head,n_kv,head_dim,n_ctx,k0; float scale; } aa = {nh,nkv,hd,nctx,0u,scale};
         ds4_gpu_tensor *qb=ds4_gpu_tensor_alloc(qdim*4), *kb=ds4_gpu_tensor_alloc((uint64_t)nctx*kvdim*2),
                        *vb=ds4_gpu_tensor_alloc((uint64_t)nctx*kvdim*2), *ob=ds4_gpu_tensor_alloc(qdim*4),
                        *snb=ds4_gpu_tensor_alloc(nh*4);

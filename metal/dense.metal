@@ -1865,8 +1865,11 @@ kernel void kernel_dense_attn_decode_f32_sg(
 // exp(sink - max) to l but nothing to the v sum (it lets a head attend to nothing). The sink
 // is a RAW logit at the scaled-score level (not multiplied by a.scale). Mirrors ggml's
 // ggml_soft_max_add_sinks. sinks at buffer(5), one f32 per query head.
+/* like ds4_dense_attn_args + k0 = first key index to attend (sliding window: k0 = max(0,
+ * end-window); full attention: k0 = 0). attends keys [k0, n_ctx). */
+struct ds4_gptoss_attn_args { uint n_head, n_kv, head_dim, n_ctx, k0; float scale; };
 kernel void kernel_gptoss_attn_decode_sink_f32(
-        constant ds4_dense_attn_args & a [[buffer(0)]],
+        constant ds4_gptoss_attn_args & a [[buffer(0)]],
         device const float * q      [[buffer(1)]],
         device const float * kcache [[buffer(2)]],
         device const float * vcache [[buffer(3)]],
@@ -1894,7 +1897,7 @@ kernel void kernel_gptoss_attn_decode_sink_f32(
     float m = -INFINITY;
     float l = 0.0f;
 
-    for (uint t = 0; t < a.n_ctx; t++) {
+    for (uint t = a.k0; t < a.n_ctx; t++) {
         device const half * kt = (device const half *)kcache + (ulong)t*kvdim + hkv*hd;
         float p = 0.0f;
         for (uint j = 0; j < ndl; j++) {
