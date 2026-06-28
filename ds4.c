@@ -3148,6 +3148,12 @@ typedef struct {
     ds4_tensor *attn_v;
     ds4_tensor *attn_v_bias;
     ds4_tensor *attn_out;
+    ds4_tensor *attn_out_bias;        /* gpt-oss: attn_output has a bias */
+    /* gpt-oss MoE biases (router + per-expert gate/up/down). */
+    ds4_tensor *ffn_gate_inp_bias;
+    ds4_tensor *ffn_gate_exps_bias;
+    ds4_tensor *ffn_up_exps_bias;
+    ds4_tensor *ffn_down_exps_bias;
     ds4_tensor *ffn_gate;
     ds4_tensor *ffn_up;
     ds4_tensor *ffn_down;
@@ -4594,6 +4600,37 @@ static void weights_bind_qwen3next(ds4_weights *w, const ds4_model *m, bool requ
         weights_bind_layer_qwen3next(&w->layer[il], m, il);
 }
 
+/* gpt-oss: GQA attention (q/k/v/o all with bias) + per-head attention sinks + MoE (router
+ * with bias, top-4 of 32 experts each with gate/up/down biases). Every layer is the same. */
+static void weights_bind_layer_gptoss(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->ffn_norm  = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);   /* pre-MoE norm */
+    l->attn_q       = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->attn_q_bias  = required_tensorf(m, "blk.%u.attn_q.bias", il);
+    l->attn_k       = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->attn_k_bias  = required_tensorf(m, "blk.%u.attn_k.bias", il);
+    l->attn_v       = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->attn_v_bias  = required_tensorf(m, "blk.%u.attn_v.bias", il);
+    l->attn_out      = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    l->attn_out_bias = required_tensorf(m, "blk.%u.attn_output.bias", il);
+    l->attn_sinks    = required_tensorf(m, "blk.%u.attn_sinks.weight", il);
+    l->ffn_gate_inp      = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+    l->ffn_gate_inp_bias = required_tensorf(m, "blk.%u.ffn_gate_inp.bias", il);
+    l->ffn_gate_exps      = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+    l->ffn_gate_exps_bias = required_tensorf(m, "blk.%u.ffn_gate_exps.bias", il);
+    l->ffn_up_exps        = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+    l->ffn_up_exps_bias   = required_tensorf(m, "blk.%u.ffn_up_exps.bias", il);
+    l->ffn_down_exps      = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    l->ffn_down_exps_bias = required_tensorf(m, "blk.%u.ffn_down_exps.bias", il);
+}
+
+static void weights_bind_gptoss(ds4_weights *w, const ds4_model *m, bool require_output) {
+    memset(w, 0, sizeof(*w));
+    weights_bind_output_dense(w, m, true, require_output);    /* token_embd + output_norm + output */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        weights_bind_layer_gptoss(&w->layer[il], m, il);
+}
+
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
  * where stringly GGUF metadata becomes direct model-specific pointers. */
 static void weights_bind(
@@ -4606,6 +4643,10 @@ static void weights_bind(
         bool             optional_output) {
     if (ds4_arch_is_qwen3next()) {
         weights_bind_qwen3next(w, m, require_output || !load_slice);
+        return;
+    }
+    if (ds4_arch_is_gptoss()) {
+        weights_bind_gptoss(w, m, require_output || !load_slice);
         return;
     }
     if (!ds4_arch_is_deepseek()) {
@@ -26477,6 +26518,27 @@ int ds4_q3n_generate(const char *model_path, const char *prompt, int n_predict,
     token_vec_free(&toks); vocab_free(&vocab); model_close(&model);
     if (rc && errlen && !err[0]) snprintf(err, errlen, "qwen3_next forward failed");
     return rc;
+}
+
+/* gpt-oss entry. Phase 2a: load + bind the weights and report (the forward — GQA with
+ * attention sinks + alternating sliding-window + YaRN + MoE top-4 with clamped-SwiGLU and
+ * expert biases — is Phase 2b). Validates that every gpt-oss tensor binds. */
+int ds4_gptoss_generate(const char *model_path, const char *prompt, int n_predict,
+                        char *err, size_t errlen) {
+    (void)prompt; (void)n_predict;
+    ds4_model model; ds4_vocab vocab; ds4_weights weights;
+    model_open(&model, model_path, false, true);
+    config_validate_model(&model);
+    if (!ds4_arch_is_gptoss()) { if (errlen) snprintf(err, errlen, "not a gpt-oss model"); model_close(&model); return 1; }
+    vocab_load(&vocab, &model);
+    weights_bind(&weights, &model, false, 0, 0, true, false);   /* dies if any tensor is missing */
+    fprintf(stderr, "ds4: gpt-oss weights bound OK — %u layers, %u embd, GQA %u/%u, %u/%u experts (ff_exp %u), "
+            "sinks + q/k/v/o + router + expert biases all present\n",
+            (unsigned)DS4_N_LAYER, (unsigned)DS4_N_EMBD, (unsigned)DS4_N_HEAD, (unsigned)DS4_N_HEAD_KV,
+            (unsigned)DS4_N_EXPERT_USED, (unsigned)DS4_N_EXPERT, (unsigned)DS4_N_FF_EXP);
+    vocab_free(&vocab); model_close(&model);
+    if (errlen) snprintf(err, errlen, "gpt-oss forward not yet built (Phase 2b)");
+    return 1;
 }
 
 /* Fase 3.5 step 3-6: greedy dense generation on the GPU forward driver. Loads a

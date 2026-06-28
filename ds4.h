@@ -265,6 +265,8 @@ int ds4_q3n_gpu_forward(ds4_q3n_gpu *g, const ds4_q3n_model_desc *desc,
 /* Load a qwen3_next model and greedily generate n_predict tokens (EXPERIMENTAL). */
 int ds4_q3n_generate(const char *model_path, const char *prompt, int n_predict,
                      char *err, size_t errlen);
+int ds4_gptoss_generate(const char *model_path, const char *prompt, int n_predict,
+                        char *err, size_t errlen);
 
 /* Interactive multi-turn ChatML chat REPL for dense models. Keeps the KV cache
  * across turns and generates until <|im_end|>/EOS (no token limit). ctx_size<=0
