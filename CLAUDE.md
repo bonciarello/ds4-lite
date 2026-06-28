@@ -173,7 +173,8 @@ llama-simple** ("1, 2, 3, 4, 5, 6, 7," → " 8, 9, 10, 11, 12, 13"); chat rispon
   scores; `spm_tokenize_text` (spazio→▁ U+2581, merge guidato dagli score sui simboli
   adiacenti, byte-fallback `<0xXX>`); detokenizzazione SPM in `dense_token_bytes`/
   `dense_print_token` (▁→spazio). Chat template: `<bos><start_of_turn>user\n{q}<end_of_turn>\n
-  <start_of_turn>model\n`, stop su `<end_of_turn>`(106)/eos; reflection+tools OFF per gemma.
+  <start_of_turn>model\n`, stop su `<end_of_turn>`(106)/eos. Tool ON anche per gemma (iniettati nel
+  primo turno user); reflection OFF solo per gemma (nessun training su `<think>`) — dense + qwen3_next sì.
 - **Bug latente risolto**: `DS4_MAX_LAYER` era 61 (DeepSeek Pro) ma gemma-3-27b ha 62 →
   off-by-one OOB su `ds4_weights.layer[]` che corrompeva lo stack adiacente (il vocab in chat;
   il generate usa `desc->layers` su heap quindi sembrava ok). Alzato a 64 + guardia runtime in
