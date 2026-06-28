@@ -2727,6 +2727,34 @@ kernel void kernel_dense_mul_mv_q8_0_f32(
     out[row] = acc;
 }
 
+/* Dense matvec for f16 weights (full-precision models): one thread per output row. */
+kernel void kernel_dense_mul_mv_f16_f32(
+        constant ds4_dense_mvq_args & a [[buffer(0)]],
+        device const half  * W   [[buffer(1)]],
+        device const float * x   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= a.out_dim) return;
+    device const half * w = W + (ulong)row * a.in_dim;
+    float acc = 0.0f;
+    for (uint i = 0; i < a.in_dim; i++) acc += (float)w[i] * x[i];
+    out[row] = acc;
+}
+
+/* Dense matvec for bf16 weights: bf16 is the top 16 bits of an f32, so expand by a 16-bit shift. */
+kernel void kernel_dense_mul_mv_bf16_f32(
+        constant ds4_dense_mvq_args & a [[buffer(0)]],
+        device const ushort * W  [[buffer(1)]],
+        device const float * x   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= a.out_dim) return;
+    device const ushort * w = W + (ulong)row * a.in_dim;
+    float acc = 0.0f;
+    for (uint i = 0; i < a.in_dim; i++) { uint b = (uint)w[i] << 16; acc += as_type<float>(b) * x[i]; }
+    out[row] = acc;
+}
+
 // ===========================================================================
 // Optimized simdgroup K-quant matvec kernels (Fase opt step 1).
 // Faithful ports of llama.cpp/ggml kernel_mul_mv_q4_K_f32 and _q6_K_f32

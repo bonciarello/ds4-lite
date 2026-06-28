@@ -4145,20 +4145,51 @@ static void ds4_q3k_dequant_block(const uint8_t *blk, float *y) {
     }
 }
 
-/* Dequantize embedding row `token` of token_embd (any supported K-quant) into
- * out[nblk*256]. Returns false for an unsupported type. */
-static bool ds4_dense_embed_row(int type, const void *data, uint32_t token, uint32_t nblk, float *out) {
-    uint32_t bb; void (*deq)(const uint8_t*, float*);
+/* IEEE-754 half (f16) -> float. */
+static inline float ds4_half_to_float(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1Fu, mant = h & 0x3FFu, bits;
+    if (exp == 0) {
+        if (mant == 0) bits = sign;                                    /* +/-0 */
+        else { exp = 127 - 15 + 1; while (!(mant & 0x400u)) { mant <<= 1; exp--; } mant &= 0x3FFu; bits = sign | (exp << 23) | (mant << 13); }
+    } else if (exp == 0x1F) {
+        bits = sign | 0x7F800000u | (mant << 13);                      /* inf/nan */
+    } else {
+        bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float f; memcpy(&f, &bits, 4); return f;
+}
+
+/* Dequantize embedding row `token` of token_embd (n_embd = `ne` elements) into out[ne]. Handles the
+ * full-precision types (f32/f16/bf16) directly and the 256-block K-quants; false for unsupported. */
+static bool ds4_dense_embed_row(int type, const void *data, uint32_t token, uint32_t ne, float *out) {
     switch (type) {
-        case 10: bb = 84;  deq = ds4_q2k_dequant_block; break;
-        case 11: bb = 110; deq = ds4_q3k_dequant_block; break;
-        case 12: bb = 144; deq = ds4_q4k_dequant_block; break;
-        case 14: bb = 210; deq = ds4_q6k_dequant_block; break;
+        case 0: {  /* f32 */
+            const float *r = (const float *)data + (size_t)token*ne;
+            memcpy(out, r, (size_t)ne*4); return true;
+        }
+        case 1: {  /* f16 */
+            const uint16_t *r = (const uint16_t *)data + (size_t)token*ne;
+            for (uint32_t i = 0; i < ne; i++) out[i] = ds4_half_to_float(r[i]); return true;
+        }
+        case 30: { /* bf16 = top 16 bits of f32 */
+            const uint16_t *r = (const uint16_t *)data + (size_t)token*ne;
+            for (uint32_t i = 0; i < ne; i++) { uint32_t b = (uint32_t)r[i] << 16; float f; memcpy(&f, &b, 4); out[i] = f; }
+            return true;
+        }
+        case 10: case 11: case 12: case 14: {  /* K-quants (256-element blocks) */
+            uint32_t bb; void (*deq)(const uint8_t*, float*);
+            if      (type==10) { bb=84;  deq=ds4_q2k_dequant_block; }
+            else if (type==11) { bb=110; deq=ds4_q3k_dequant_block; }
+            else if (type==12) { bb=144; deq=ds4_q4k_dequant_block; }
+            else               { bb=210; deq=ds4_q6k_dequant_block; }
+            const uint32_t nblk = ne / 256u;
+            const uint8_t *row = (const uint8_t *)data + (size_t)token*nblk*bb;
+            for (uint32_t b = 0; b < nblk; b++) deq(row + (size_t)b*bb, out + b*256);
+            return true;
+        }
         default: return false;
     }
-    const uint8_t *row = (const uint8_t *)data + (size_t)token*nblk*bb;
-    for (uint32_t b = 0; b < nblk; b++) deq(row + (size_t)b*bb, out + b*256);
-    return true;
 }
 
 typedef struct { ds4_gpu_tensor *k, *v, *kscale, *vscale; } ds4_dense_kv_layer;
@@ -4226,6 +4257,8 @@ static ds4_gpu_tensor *dense_cached_weight(ds4_dense_gpu *g, const void *data, u
 
 static const char *dense_kquant_kernel(int type) {
     switch (type) {
+        case 1:  return "kernel_dense_mul_mv_f16_f32";     /* F16 (full-precision models) */
+        case 30: return "kernel_dense_mul_mv_bf16_f32";    /* BF16 (common HF native format) */
         case 8:  return "kernel_dense_mul_mv_q8_0_f32";    /* Q8_0 (32-block; gpt-oss) */
         case 10: return "kernel_dense_mul_mv_q2_K_f32";
         case 11: return "kernel_dense_mul_mv_q3_K_f32";
@@ -5087,8 +5120,8 @@ int ds4_q3n_gpu_forward(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d,
                         int token, unsigned pos, float *logits) {
     @autoreleasepool {
         /* embedding: dequant token_embd row `token` (any K-quant) and upload */
-        const uint32_t ne = d->n_embd, nblk = ne/256u;
-        if (!ds4_dense_embed_row(d->token_embd.type, d->token_embd.data, (uint32_t)token, nblk, g->embedscratch)) return 2;
+        const uint32_t ne = d->n_embd;
+        if (!ds4_dense_embed_row(d->token_embd.type, d->token_embd.data, (uint32_t)token, ne, g->embedscratch)) return 2;
         ds4_gpu_tensor_write(g->x, 0, g->embedscratch, (uint64_t)ne*4);
 
         const bool dbg = getenv("DS4_Q3N_DBG") != NULL;
@@ -5168,8 +5201,7 @@ static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d
         const uint32_t pattern = d->swa_pattern ? d->swa_pattern : 6u;
 
         /* embedding row: dequant token_embd[token] (any K-quant), then scale ×sqrt(ne). */
-        const uint32_t nblk = ne/256u;
-        if (!ds4_dense_embed_row(d->token_embd.type, d->token_embd.data, (uint32_t)token, nblk, g->embedscratch)) return 2;
+        if (!ds4_dense_embed_row(d->token_embd.type, d->token_embd.data, (uint32_t)token, ne, g->embedscratch)) return 2;
         const float es = d->embed_scale > 0.0f ? d->embed_scale : 1.0f;
         for (uint32_t i = 0; i < ne; i++) g->embedscratch[i] *= es;
         ds4_gpu_tensor_write(g->x, 0, g->embedscratch, (uint64_t)ne*4);
@@ -5239,8 +5271,7 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
         const float eps=d->rms_eps, base=d->rope_base, scale=1.0f/sqrtf((float)hd);
 
         /* embedding: dequant token_embd row `token` (any K-quant) and upload. */
-        const uint32_t nblk = ne/256u;
-        if (!ds4_dense_embed_row(d->token_embd.type, d->token_embd.data, (uint32_t)token, nblk, g->embedscratch)) return 2;
+        if (!ds4_dense_embed_row(d->token_embd.type, d->token_embd.data, (uint32_t)token, ne, g->embedscratch)) return 2;
         ds4_gpu_tensor_write(g->x, 0, g->embedscratch, (uint64_t)ne*4);
         const bool ddbg = getenv("DS4_DENSE_DBG") != NULL;
         if (ddbg) { const float *e=g->embedscratch; double s=0; for(uint32_t i=0;i<ne;i++) s+=(double)e[i]*e[i];
@@ -5271,6 +5302,9 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
               && dense_add_bias(g, g->q, &L->attn_q_bias, qd)
               && dense_add_bias(g, g->k, &L->attn_k_bias, kvd)
               && dense_add_bias(g, g->v, &L->attn_v_bias, kvd)
+              /* QK-norm (qwen3-style): per-head RMSNorm on q/k before RoPE, only if the model has it. */
+              && (L->attn_q_norm.data ? gemma_qk_norm(g, g->q, &L->attn_q_norm, nh,  hd, eps) : true)
+              && (L->attn_k_norm.data ? gemma_qk_norm(g, g->k, &L->attn_k_norm, nkv, hd, eps) : true)
               && dense_rope(g->q, nh,  hd, nrot, pos, base)
               && dense_rope(g->k, nkv, hd, nrot, pos, base)
               && dense_kv_write(g, kv, pos, kvd)
@@ -5819,10 +5853,12 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
                           const int *tokens, uint32_t M, uint32_t start_pos,
                           float *last_logits, float *all_logits) {
     if (M == 0) return 1;
-    /* gemma3 (no batched prefill) and int8 KV (batched prefill writes f16) fall back to
-     * processing the prompt one token at a time through the decode forward, which builds
-     * the KV cache incrementally in the right format. Slower prefill, but correct. */
-    if (d->gemma || g->kv_int8) {
+    /* gemma3 (no batched prefill), int8 KV (batched prefill writes f16), and QK-norm models
+     * (the batched path has no qk-norm step) fall back to processing the prompt one token at a
+     * time through the decode forward, which builds the KV cache in the right format. Slower
+     * prefill, but correct. */
+    const bool has_qk_norm = d->n_layer > 0 && d->layers[0].attn_q_norm.data != NULL;
+    if (d->gemma || g->kv_int8 || has_qk_norm) {
         float *throwaway = all_logits ? NULL : malloc((size_t)d->n_vocab * sizeof(float));
         int rc = 0;
         for (uint32_t i = 0; i < M && rc == 0; i++) {
@@ -5837,7 +5873,6 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
         const uint32_t ne=d->n_embd, nff=d->n_ff, nh=d->n_head, nkv=d->n_kv, hd=d->head_dim;
         const uint32_t qd=g->qd, kvd=g->kvd, nrot=d->n_rot;
         const float eps=d->rms_eps, base=d->rope_base, scale=1.0f/sqrtf((float)hd);
-        const uint32_t nblk = ne/256u;
 
         /* reuse pre-allocated scratch for small batches (speculative verify) */
         const bool use_pre = (M <= DS4_VERIFY_MAX && g->vXb != NULL);
@@ -5859,7 +5894,7 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
                   && (all_logits || (Hrow && logitsT));
 
         for (uint32_t m=0; ok && m<M; m++) {
-            if (!ds4_dense_embed_row(d->token_embd.type, d->token_embd.data, tokens[m], nblk, emb)) { ok = false; break; }
+            if (!ds4_dense_embed_row(d->token_embd.type, d->token_embd.data, tokens[m], ne, emb)) { ok = false; break; }
             ds4_gpu_tensor_write(Xb, (uint64_t)m*ne*4, emb, (uint64_t)ne*4);
         }
 
