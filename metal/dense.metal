@@ -1821,6 +1821,75 @@ kernel void kernel_dense_attn_decode_f32_sg(
     }
 }
 
+// gpt-oss attention decode WITH per-head attention sinks. Identical online-softmax to
+// kernel_dense_attn_decode_f32_sg, plus a virtual "sink" token (score = sinks[head], value 0)
+// folded into the denominator at the end: max = MAX(max_k score, sink); the sink adds
+// exp(sink - max) to l but nothing to the v sum (it lets a head attend to nothing). The sink
+// is a RAW logit at the scaled-score level (not multiplied by a.scale). Mirrors ggml's
+// ggml_soft_max_add_sinks. sinks at buffer(5), one f32 per query head.
+kernel void kernel_gptoss_attn_decode_sink_f32(
+        constant ds4_dense_attn_args & a [[buffer(0)]],
+        device const float * q      [[buffer(1)]],
+        device const float * kcache [[buffer(2)]],
+        device const float * vcache [[buffer(3)]],
+        device       float * out    [[buffer(4)]],
+        device const float * sinks  [[buffer(5)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]]) {
+    const uint hq = tgpig.x;
+    if (hq >= a.n_head) return;
+    const uint group = a.n_head / a.n_kv;
+    const uint hkv = hq / group;
+    const uint hd = a.head_dim;
+    const uint kvdim = a.n_kv * hd;
+    device const float * qh = q + hq * hd;
+    device       float * oh = out + hq * hd;
+
+    const uint ndl = (hd + 31u) / 32u;
+    float qreg[8];
+    float acc[8];
+    for (uint j = 0; j < ndl; j++) {
+        const uint d = lane + 32u*j;
+        qreg[j] = (d < hd) ? qh[d] : 0.0f;
+        acc[j]  = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (uint t = 0; t < a.n_ctx; t++) {
+        device const half * kt = (device const half *)kcache + (ulong)t*kvdim + hkv*hd;
+        float p = 0.0f;
+        for (uint j = 0; j < ndl; j++) {
+            const uint d = lane + 32u*j;
+            if (d < hd) p += qreg[j] * kt[d];
+        }
+        const float s = simd_sum(p) * a.scale;
+        const float m_new = max(m, s);
+        const float corr  = exp(m - m_new);
+        const float pe    = exp(s - m_new);
+        l = l * corr + pe;
+        device const half * vt = (device const half *)vcache + (ulong)t*kvdim + hkv*hd;
+        for (uint j = 0; j < ndl; j++) {
+            const uint d = lane + 32u*j;
+            if (d < hd) acc[j] = acc[j]*corr + pe * vt[d];
+        }
+        m = m_new;
+    }
+    /* fold in the per-head sink (virtual token, value 0): adds exp(sink - max) to the denom. */
+    {
+        const float s     = sinks[hq];
+        const float m_new = max(m, s);
+        const float corr  = exp(m - m_new);
+        l = l * corr + exp(s - m_new);
+        for (uint j = 0; j < ndl; j++) acc[j] *= corr;
+    }
+    const float inv = 1.0f / l;
+    for (uint j = 0; j < ndl; j++) {
+        const uint d = lane + 32u*j;
+        if (d < hd) oh[d] = acc[j] * inv;
+    }
+}
+
 // ---- int8 KV cache (DS4_KV_INT8): half the KV RAM -------------------------
 // Quantize one f32 KV slot (n values) to int8 with a single per-slot absmax scale.
 // Dispatch: grid=(1,1,1) tpg=(128,1,1).

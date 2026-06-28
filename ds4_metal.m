@@ -6085,6 +6085,56 @@ int ds4_gpu_dense_matvec_selftest(char *err, size_t errlen) {
         if (maxerr >= 1e-5f) { if (errlen) snprintf(err, errlen, "attn max err %.6g >= 1e-5", (double)maxerr); goto free_gpu; }
     }
 
+    /* --- Case 7b: gpt-oss attention decode WITH per-head sinks (kernel_gptoss_attn_decode_sink_f32) --- */
+    {
+        const uint32_t nh = 4u, nkv = 2u, hd = 8u, nctx = 3u;
+        const uint32_t group = nh/nkv, kvdim = nkv*hd, qdim = nh*hd;
+        const float scale = 1.0f/sqrtf((float)hd);
+        float q[32], oref[32], ogot[32], sinks[4] = { 0.5f, -1.0f, 2.0f, 0.0f };
+        __fp16 kc[48], vc[48];                                   /* f16 KV (as the forward stores it) */
+        for (uint32_t i=0;i<qdim;i++) q[i] = 0.05f*(float)i - 0.4f;
+        for (uint32_t i=0;i<nctx*kvdim;i++){ kc[i]=(__fp16)(0.03f*(float)i-0.3f); vc[i]=(__fp16)(0.02f*(float)i-0.2f); }
+        /* CPU reference: the sink is a virtual token (score=sink_h, value 0) in the softmax denom */
+        for (uint32_t hqi=0; hqi<nh; hqi++){
+            const uint32_t hkv = hqi/group;
+            const float *qh = q + (size_t)hqi*hd;
+            float sc[3], maxs = sinks[hqi];                      /* include the sink in the max */
+            for (uint32_t t=0;t<nctx;t++){
+                const __fp16 *kt = kc + (size_t)t*kvdim + (size_t)hkv*hd;
+                double dot=0; for(uint32_t d=0;d<hd;d++) dot += (double)qh[d]*(float)kt[d];
+                sc[t] = (float)dot*scale; if (sc[t]>maxs) maxs=sc[t];
+            }
+            double sum = expf(sinks[hqi]-maxs);                  /* sink contributes to the denom only */
+            for (uint32_t t=0;t<nctx;t++){ sc[t]=expf(sc[t]-maxs); sum += sc[t]; }
+            float *oh = oref + (size_t)hqi*hd;
+            for (uint32_t d=0;d<hd;d++) oh[d]=0.0f;
+            for (uint32_t t=0;t<nctx;t++){
+                const __fp16 *vt = vc + (size_t)t*kvdim + (size_t)hkv*hd;
+                const float w = (float)(sc[t]/sum);
+                for (uint32_t d=0;d<hd;d++) oh[d] += w*(float)vt[d];
+            }
+        }
+        struct __attribute__((packed)) { uint32_t n_head,n_kv,head_dim,n_ctx; float scale; } aa = {nh,nkv,hd,nctx,scale};
+        ds4_gpu_tensor *qb=ds4_gpu_tensor_alloc(qdim*4), *kb=ds4_gpu_tensor_alloc((uint64_t)nctx*kvdim*2),
+                       *vb=ds4_gpu_tensor_alloc((uint64_t)nctx*kvdim*2), *ob=ds4_gpu_tensor_alloc(qdim*4),
+                       *snb=ds4_gpu_tensor_alloc(nh*4);
+        bool ok = qb&&kb&&vb&&ob&&snb;
+        if (ok){
+            ds4_gpu_tensor_write(qb,0,q,qdim*4);
+            ds4_gpu_tensor_write(kb,0,kc,(uint64_t)nctx*kvdim*2);
+            ds4_gpu_tensor_write(vb,0,vc,(uint64_t)nctx*kvdim*2);
+            ds4_gpu_tensor_write(snb,0,sinks,nh*4);
+            ds4_gpu_tensor *bufs[5]={qb,kb,vb,ob,snb};
+            ok = ds4_gpu_run_grid("kernel_gptoss_attn_decode_sink_f32", &aa, sizeof(aa), bufs, 5,
+                                  MTLSizeMake(nh,1,1), MTLSizeMake(32,1,1), "gptoss attn sink");
+            if (ok) ds4_gpu_tensor_read(ob,0,ogot,qdim*4);
+        }
+        ds4_gpu_tensor_free(qb);ds4_gpu_tensor_free(kb);ds4_gpu_tensor_free(vb);ds4_gpu_tensor_free(ob);ds4_gpu_tensor_free(snb);
+        if (!ok){ if(errlen) snprintf(err,errlen,"gptoss attn sink GPU run failed"); goto free_gpu; }
+        float maxerr=0.0f; for(uint32_t i=0;i<qdim;i++){ const float e=fabsf(ogot[i]-oref[i]); if(e>maxerr)maxerr=e; }
+        if (maxerr >= 1e-3f){ if(errlen) snprintf(err,errlen,"gptoss attn sink max err %.6g >= 1e-3",(double)maxerr); goto free_gpu; }
+    }
+
     /* --- Case 8: full dense attention block (rmsnorm->qkv+bias->rope->attn->out->residual) --- */
     {
         const uint32_t ne = 64u, nh = 4u, nkv = 2u, hd = 16u, pos = 2u, nctx = 3u;
