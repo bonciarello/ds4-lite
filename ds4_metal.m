@@ -4330,6 +4330,12 @@ static bool dense_add(ds4_gpu_tensor *a, ds4_gpu_tensor *b, uint32_t n) {
     return ds4_gpu_run_simple("kernel_dense_add_f32", &n, sizeof(n), bufs, 2, n, "fwd residual");
 }
 
+/* In-place GELU activation for non-gated FFNs (phi-2: up -> gelu -> down). */
+static bool dense_gelu(ds4_gpu_tensor *x, uint32_t n) {
+    ds4_gpu_tensor *bufs[1] = { x };
+    return ds4_gpu_run_simple("kernel_dense_gelu_f32", &n, sizeof(n), bufs, 1, n, "fwd gelu");
+}
+
 static bool dense_rope(ds4_gpu_tensor *x, uint32_t nh, uint32_t hd, uint32_t nrot, uint32_t pos, float base) {
     struct __attribute__((packed)) { uint32_t n_head, head_dim, n_rot, pos; float fb; } a = { nh, hd, nrot, pos, base };
     ds4_gpu_tensor *bufs[1] = { x };
@@ -5338,6 +5344,13 @@ static bool dense_ffn(ds4_dense_gpu *g, const ds4_dense_model_desc *d, const ds4
                       ds4_gpu_tensor *in, ds4_gpu_tensor **out, uint32_t nff) {
     if (d->n_expert > 0) { *out = g->moe_acc; return dense_moe_ffn(g, d, L, in, g->n_embd); }
     *out = g->down;
+    if (!L->ffn_gate.data) {                                  /* non-gated GELU MLP (phi-2): up(+b) -> gelu -> down(+b) */
+        return dense_matvec(g, &L->ffn_up, in, g->up)
+            && dense_add_bias(g, g->up, &L->ffn_up_bias, nff)
+            && dense_gelu(g->up, nff)
+            && dense_matvec(g, &L->ffn_down, g->up, g->down)
+            && dense_add_bias(g, g->down, &L->ffn_down_bias, g->n_embd);
+    }
     return dense_matvec(g, &L->ffn_gate, in, g->gate)
         && dense_matvec(g, &L->ffn_up, in, g->up)
         && (d->ffn_geglu ? gemma_geglu(g->act, g->gate, g->up, nff)
@@ -5392,7 +5405,8 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
               && dense_rope(g->k, nkv, hd, nrot, pos, base)
               && dense_kv_write(g, kv, pos, kvd)
               && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv, hd, pos+1, scale)
-              && dense_matvec(g, &L->attn_out, g->att, g->o);   /* g->o = attention output (pre-residual) */
+              && dense_matvec(g, &L->attn_out, g->att, g->o)
+              && dense_add_bias(g, g->o, &L->attn_out_bias, ne);   /* g->o = attention output (pre-residual) + bias (phi-2) */
             const double ta1 = g->profile ? ds4_gpu_now_ms() : 0.0;
             if (ok) {
                 ds4_gpu_tensor *ffn_out = NULL;
@@ -5948,7 +5962,13 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
      * time through the decode forward, which builds the KV cache in the right format. Slower
      * prefill, but correct. */
     const bool has_qk_norm = d->n_layer > 0 && d->layers[0].attn_q_norm.data != NULL;
-    if (d->gemma || g->kv_int8 || has_qk_norm || d->n_expert > 0) {   /* MoE: batched prefill has no MoE FFN */
+    /* The batched prefill only handles plain llama (RMSNorm + sequential + gated SwiGLU). Anything else
+     * — LayerNorm, parallel-residual, non-gated/GeGLU FFN, qk-norm, MoE, int8 KV — uses the per-token
+     * decode forward, which builds the KV in the right format and applies all the caps. */
+    const bool nonstd = d->parallel_residual || d->ffn_geglu ||
+                        (d->n_layer > 0 && (d->layers[0].attn_norm_bias.data != NULL ||   /* LayerNorm */
+                                            d->layers[0].ffn_gate.data == NULL));          /* non-gated FFN */
+    if (d->gemma || g->kv_int8 || has_qk_norm || d->n_expert > 0 || nonstd) {
         float *throwaway = all_logits ? NULL : malloc((size_t)d->n_vocab * sizeof(float));
         int rc = 0;
         for (uint32_t i = 0; i < M && rc == 0; i++) {

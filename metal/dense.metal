@@ -2097,6 +2097,19 @@ kernel void kernel_gemma_geglu_f32(
     out[gid] = g * up[gid];
 }
 
+// In-place GELU (tanh approx) for non-gated MLPs (phi-2): x[i] = 0.5 x (1 + tanh(0.7978845608
+// (x + 0.044715 x^3))). Same arg-clamp as the GeGLU kernel to avoid Metal fast-math tanh overflow.
+kernel void kernel_dense_gelu_f32(
+        constant uint & n [[buffer(0)]],
+        device       float * x [[buffer(1)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    const float v = x[gid];
+    float arg = 0.7978845608028654f * (v + 0.044715f * v*v*v);
+    arg = clamp(arg, -15.0f, 15.0f);
+    x[gid] = 0.5f * v * (1.0f + tanh(arg));
+}
+
 // Gemma NEOX RoPE with a linear freq_scale: theta = pos * freq_scale * freq.
 struct ds4_gemma_rope_args { uint n_head; uint head_dim; uint n_rot; uint pos; float freq_base; float freq_scale; };
 kernel void kernel_gemma_rope_neox_f32(

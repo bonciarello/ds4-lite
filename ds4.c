@@ -3158,6 +3158,9 @@ typedef struct {
     ds4_tensor *attn_v_bias;
     ds4_tensor *attn_out;
     ds4_tensor *attn_out_bias;        /* gpt-oss: attn_output has a bias */
+    ds4_tensor *attn_qkv_bias;        /* phi-2: fused QKV bias (split into q/k/v) */
+    ds4_tensor *ffn_up_bias;          /* phi-2: FFN up/down biases (non-gated MLP) */
+    ds4_tensor *ffn_down_bias;
     /* gpt-oss MoE biases (router + per-expert gate/up/down). */
     ds4_tensor *ffn_gate_inp_bias;
     ds4_tensor *ffn_gate_exps_bias;
@@ -4534,14 +4537,16 @@ static void weights_validate_layout_dense(const ds4_weights *w, uint32_t start,
         dense_expect_dims_opt(l->attn_q_bias, 1, q_dim,  0);
         dense_expect_dims_opt(l->attn_k_bias, 1, kv_dim, 0);
         dense_expect_dims_opt(l->attn_v_bias, 1, kv_dim, 0);
-        dense_expect_dims(l->ffn_norm, 1, n_embd, 0);
+        dense_expect_dims_opt(l->ffn_norm, 1, n_embd, 0);   /* absent on parallel-residual (phi-2) */
         if (l->ffn_gate_inp) {                          /* MoE: router (2D) + 3D expert tensors */
             dense_expect_dims(l->ffn_gate_inp, 2, n_embd, DS4_N_EXPERT);
             tensor_expect_layout(l->ffn_gate_exps, l->ffn_gate_exps->type, 3, n_embd,       DS4_N_FF_EXP, DS4_N_EXPERT);
             tensor_expect_layout(l->ffn_up_exps,   l->ffn_up_exps->type,   3, n_embd,       DS4_N_FF_EXP, DS4_N_EXPERT);
             tensor_expect_layout(l->ffn_down_exps, l->ffn_down_exps->type, 3, DS4_N_FF_EXP, n_embd,       DS4_N_EXPERT);
-        } else if (!l->ffn_gate) {                      /* phi-3 fused gate_up: ffn_up is [n_embd, 2*n_ff] */
-            dense_expect_dims(l->ffn_up,   2, n_embd, 2u*n_ff);
+        } else if (!l->ffn_gate) {                      /* gateless: phi-3 fused gate_up (2*n_ff) OR phi-2 non-gated (n_ff) */
+            const uint32_t up = (l->ffn_up && l->ffn_up->ndim >= 2) ? (uint32_t)l->ffn_up->dim[1] : 0;
+            if (up != n_ff && up != 2u*n_ff) ds4_die("unexpected ffn_up width for a gateless FFN");
+            dense_expect_dims(l->ffn_up,   2, n_embd, up);
             dense_expect_dims(l->ffn_down, 2, n_ff,   n_embd);
         } else {                                        /* dense FFN */
             dense_expect_dims(l->ffn_gate, 2, n_embd, n_ff);
@@ -4571,17 +4576,19 @@ static void weights_bind_layer_dense(ds4_layer_weights *l, const ds4_model *m, u
     l->attn_norm_bias = tensor_by_namef(m, "blk.%u.attn_norm.bias", il);   /* LayerNorm beta (optional) */
     /* QKV: fused (phi-3 `attn_qkv`) -> split into q/k/v in dense_build_desc, else separate tensors. */
     l->attn_qkv = tensor_by_namef(m, "blk.%u.attn_qkv.weight", il);
+    l->attn_qkv_bias = tensor_by_namef(m, "blk.%u.attn_qkv.bias", il);     /* phi-2 fused QKV bias */
     if (!l->attn_qkv) {
         l->attn_q  = required_tensorf(m, "blk.%u.attn_q.weight", il);
         l->attn_k  = required_tensorf(m, "blk.%u.attn_k.weight", il);
         l->attn_v  = required_tensorf(m, "blk.%u.attn_v.weight", il);
     }
-    l->attn_out    = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    l->attn_out      = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    l->attn_out_bias = tensor_by_namef(m, "blk.%u.attn_output.bias", il);  /* phi-2 / gpt-oss */
     /* QKV biases: present in Qwen2, absent in Llama -> optional. */
     l->attn_q_bias = tensor_by_namef(m, "blk.%u.attn_q.bias", il);
     l->attn_k_bias = tensor_by_namef(m, "blk.%u.attn_k.bias", il);
     l->attn_v_bias = tensor_by_namef(m, "blk.%u.attn_v.bias", il);
-    l->ffn_norm    = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+    l->ffn_norm    = tensor_by_namef(m, "blk.%u.ffn_norm.weight", il);     /* absent on parallel-residual (phi-2) */
     l->ffn_norm_bias = tensor_by_namef(m, "blk.%u.ffn_norm.bias", il);     /* LayerNorm beta (optional) */
     /* FFN: MoE (router + per-expert gate/up/down) when blk.N.ffn_gate_inp exists (qwen3moe, …),
      * otherwise the plain dense gate/up/down. */
@@ -4594,6 +4601,8 @@ static void weights_bind_layer_dense(ds4_layer_weights *l, const ds4_model *m, u
         l->ffn_gate    = tensor_by_namef(m, "blk.%u.ffn_gate.weight", il);   /* absent when fused into ffn_up (phi-3) */
         l->ffn_up      = required_tensorf(m, "blk.%u.ffn_up.weight", il);
         l->ffn_down    = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+        l->ffn_up_bias   = tensor_by_namef(m, "blk.%u.ffn_up.bias", il);     /* phi-2 non-gated MLP biases */
+        l->ffn_down_bias = tensor_by_namef(m, "blk.%u.ffn_down.bias", il);
     }
     /* Per-head QK-norm on q/k (qwen3, gemma3, …): optional — NULL data when the tensor is absent
      * (qwen2/llama/mistral). The dense forward applies it (before RoPE) only when present. */
@@ -23447,7 +23456,9 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         /* Pre-tokenizer family from GGUF. Dense models (Qwen2) declare "qwen2";
          * DeepSeek V4 declares "joyai-llm". Default to JOYAI for back-compat. */
         ds4_str pre = {0};
-        vocab->pre_type = DS4_PRETOK_JOYAI;
+        /* DeepSeek declares no pre and relies on JOYAI; other BPE families (gpt2/llama, e.g. phi-2 /
+         * gptneox without a recognized pre) use the GPT-2/Qwen2 split. */
+        vocab->pre_type = ds4_arch_is_deepseek() ? DS4_PRETOK_JOYAI : DS4_PRETOK_QWEN2;
         if (model_get_string(model, "tokenizer.ggml.pre", &pre)) {
             if (ds4_str_eq_cstr(pre, "qwen2"))       vocab->pre_type = DS4_PRETOK_QWEN2;
             else if (ds4_str_eq_cstr(pre, "gpt-4o")) vocab->pre_type = DS4_PRETOK_GPT4O;  /* gpt-oss / o200k */
@@ -26358,6 +26369,16 @@ static ds4_dense_wdesc dense_wdesc_rows(ds4_dense_wdesc w, uint32_t r0, uint32_t
     return w;
 }
 
+/* Slice elements [off, off+len) of a 1D wdesc (a fused QKV bias -> per-q/k/v bias). */
+static ds4_dense_wdesc dense_wdesc_slice1d(ds4_dense_wdesc w, uint32_t off, uint32_t len) {
+    if (!w.data || w.dim0 == 0) { ds4_dense_wdesc z = {0}; return z; }
+    const uint64_t eb = w.bytes / w.dim0;
+    w.data  = (const char *)w.data + (size_t)off * eb;
+    w.bytes = (uint64_t)len * eb;
+    w.dim0  = len;
+    return w;
+}
+
 static int ds4_hex_digit(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
@@ -26451,22 +26472,29 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
         const ds4_layer_weights *lw = &weights->layer[il];
         ds4_dense_layer_desc *L = &desc->layers[il];
         L->attn_norm   = dense_wdesc_of(model, lw->attn_norm);
-        if (lw->attn_qkv) {                                  /* phi-3 fused QKV -> split by output rows (Q|K|V) */
+        if (lw->attn_qkv) {                                  /* phi-3/phi-2 fused QKV -> split by output rows (Q|K|V) */
             const ds4_dense_wdesc qkv = dense_wdesc_of(model, lw->attn_qkv);
             const uint32_t qd = DS4_N_HEAD * DS4_N_HEAD_DIM, kvd = DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
             L->attn_q = dense_wdesc_rows(qkv, 0,        qd);
             L->attn_k = dense_wdesc_rows(qkv, qd,       kvd);
             L->attn_v = dense_wdesc_rows(qkv, qd + kvd, kvd);
+            if (lw->attn_qkv_bias) {                          /* split the fused bias too (phi-2) */
+                const ds4_dense_wdesc qb = dense_wdesc_of(model, lw->attn_qkv_bias);
+                L->attn_q_bias = dense_wdesc_slice1d(qb, 0,        qd);
+                L->attn_k_bias = dense_wdesc_slice1d(qb, qd,       kvd);
+                L->attn_v_bias = dense_wdesc_slice1d(qb, qd + kvd, kvd);
+            }
         } else {
             L->attn_q = dense_wdesc_of(model, lw->attn_q);
             L->attn_k = dense_wdesc_of(model, lw->attn_k);
             L->attn_v = dense_wdesc_of(model, lw->attn_v);
+            L->attn_q_bias = dense_wdesc_of(model, lw->attn_q_bias);
+            L->attn_k_bias = dense_wdesc_of(model, lw->attn_k_bias);
+            L->attn_v_bias = dense_wdesc_of(model, lw->attn_v_bias);
         }
-        L->attn_q_bias = dense_wdesc_of(model, lw->attn_q_bias);
-        L->attn_k_bias = dense_wdesc_of(model, lw->attn_k_bias);
-        L->attn_v_bias = dense_wdesc_of(model, lw->attn_v_bias);
-        L->attn_out    = dense_wdesc_of(model, lw->attn_out);
-        L->ffn_norm    = dense_wdesc_of(model, lw->ffn_norm);
+        L->attn_out      = dense_wdesc_of(model, lw->attn_out);
+        L->attn_out_bias = dense_wdesc_of(model, lw->attn_out_bias);
+        L->ffn_norm      = dense_wdesc_of(model, lw->ffn_norm);
         if (!lw->ffn_gate && lw->ffn_up) {                   /* phi-3 fused gate_up in ffn_up -> split (gate|up) */
             const ds4_dense_wdesc gu = dense_wdesc_of(model, lw->ffn_up);
             if (gu.dim1 == 2u * DS4_N_FF) {
@@ -26478,6 +26506,8 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
             L->ffn_up   = dense_wdesc_of(model, lw->ffn_up);
         }
         L->ffn_down    = dense_wdesc_of(model, lw->ffn_down);
+        L->ffn_up_bias   = dense_wdesc_of(model, lw->ffn_up_bias);     /* phi-2 non-gated MLP biases */
+        L->ffn_down_bias = dense_wdesc_of(model, lw->ffn_down_bias);
         /* gemma3 extra norms (NULL data for non-gemma -> ignored by the forward). */
         L->attn_q_norm    = dense_wdesc_of(model, lw->attn_q_norm);
         L->attn_k_norm    = dense_wdesc_of(model, lw->attn_k_norm);

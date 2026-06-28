@@ -189,6 +189,8 @@ typedef struct {
     ds4_dense_wdesc ffn_gate_inp, ffn_gate_exps, ffn_up_exps, ffn_down_exps;
     /* LayerNorm bias (beta) for the input/ffn norms — NULL on RMSNorm models. */
     ds4_dense_wdesc attn_norm_bias, ffn_norm_bias;
+    /* phi-2: bias on attn_output + the FFN up/down projections (NULL when absent). */
+    ds4_dense_wdesc attn_out_bias, ffn_up_bias, ffn_down_bias;
 } ds4_dense_layer_desc;
 
 typedef struct {
