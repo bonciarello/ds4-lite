@@ -3151,6 +3151,7 @@ typedef struct {
      * Llama does not). Unused on the DeepSeek path. */
     ds4_tensor *attn_q;
     ds4_tensor *attn_q_bias;
+    ds4_tensor *attn_qkv;             /* fused QKV (phi-3); split into q/k/v when present */
     ds4_tensor *attn_k;
     ds4_tensor *attn_k_bias;
     ds4_tensor *attn_v;
@@ -4522,9 +4523,13 @@ static void weights_validate_layout_dense(const ds4_weights *w, uint32_t start,
     for (uint32_t il = start; il <= end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         dense_expect_dims(l->attn_norm, 1, n_embd, 0);
-        dense_expect_dims(l->attn_q,    2, n_embd, q_dim);
-        dense_expect_dims(l->attn_k,    2, n_embd, kv_dim);
-        dense_expect_dims(l->attn_v,    2, n_embd, kv_dim);
+        if (l->attn_qkv) {                              /* phi-3 fused QKV: [n_embd, q_dim + 2*kv_dim] */
+            dense_expect_dims(l->attn_qkv, 2, n_embd, q_dim + 2u*kv_dim);
+        } else {
+            dense_expect_dims(l->attn_q,  2, n_embd, q_dim);
+            dense_expect_dims(l->attn_k,  2, n_embd, kv_dim);
+            dense_expect_dims(l->attn_v,  2, n_embd, kv_dim);
+        }
         dense_expect_dims(l->attn_out,  2, q_dim,  n_embd);
         dense_expect_dims_opt(l->attn_q_bias, 1, q_dim,  0);
         dense_expect_dims_opt(l->attn_k_bias, 1, kv_dim, 0);
@@ -4535,6 +4540,9 @@ static void weights_validate_layout_dense(const ds4_weights *w, uint32_t start,
             tensor_expect_layout(l->ffn_gate_exps, l->ffn_gate_exps->type, 3, n_embd,       DS4_N_FF_EXP, DS4_N_EXPERT);
             tensor_expect_layout(l->ffn_up_exps,   l->ffn_up_exps->type,   3, n_embd,       DS4_N_FF_EXP, DS4_N_EXPERT);
             tensor_expect_layout(l->ffn_down_exps, l->ffn_down_exps->type, 3, DS4_N_FF_EXP, n_embd,       DS4_N_EXPERT);
+        } else if (!l->ffn_gate) {                      /* phi-3 fused gate_up: ffn_up is [n_embd, 2*n_ff] */
+            dense_expect_dims(l->ffn_up,   2, n_embd, 2u*n_ff);
+            dense_expect_dims(l->ffn_down, 2, n_ff,   n_embd);
         } else {                                        /* dense FFN */
             dense_expect_dims(l->ffn_gate, 2, n_embd, n_ff);
             dense_expect_dims(l->ffn_up,   2, n_embd, n_ff);
@@ -4561,9 +4569,13 @@ static void weights_bind_output_dense(ds4_weights *w, const ds4_model *m,
 static void weights_bind_layer_dense(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     l->attn_norm   = required_tensorf(m, "blk.%u.attn_norm.weight", il);
     l->attn_norm_bias = tensor_by_namef(m, "blk.%u.attn_norm.bias", il);   /* LayerNorm beta (optional) */
-    l->attn_q      = required_tensorf(m, "blk.%u.attn_q.weight", il);
-    l->attn_k      = required_tensorf(m, "blk.%u.attn_k.weight", il);
-    l->attn_v      = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    /* QKV: fused (phi-3 `attn_qkv`) -> split into q/k/v in dense_build_desc, else separate tensors. */
+    l->attn_qkv = tensor_by_namef(m, "blk.%u.attn_qkv.weight", il);
+    if (!l->attn_qkv) {
+        l->attn_q  = required_tensorf(m, "blk.%u.attn_q.weight", il);
+        l->attn_k  = required_tensorf(m, "blk.%u.attn_k.weight", il);
+        l->attn_v  = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    }
     l->attn_out    = required_tensorf(m, "blk.%u.attn_output.weight", il);
     /* QKV biases: present in Qwen2, absent in Llama -> optional. */
     l->attn_q_bias = tensor_by_namef(m, "blk.%u.attn_q.bias", il);
@@ -4579,7 +4591,7 @@ static void weights_bind_layer_dense(ds4_layer_weights *l, const ds4_model *m, u
         l->ffn_up_exps   = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
         l->ffn_down_exps = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
     } else {
-        l->ffn_gate    = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+        l->ffn_gate    = tensor_by_namef(m, "blk.%u.ffn_gate.weight", il);   /* absent when fused into ffn_up (phi-3) */
         l->ffn_up      = required_tensorf(m, "blk.%u.ffn_up.weight", il);
         l->ffn_down    = required_tensorf(m, "blk.%u.ffn_down.weight", il);
     }
@@ -22669,6 +22681,8 @@ struct ds4_vocab {
     int unk_id;             /* SPM byte-fallback fallback token (-1 if none) */
     int user_id;
     int assistant_id;
+    int asst_start_id;      /* phi-3: <|assistant|> (role-specific turn-start marker); -1 = ChatML/gemma */
+    int sys_start_id;       /* phi-3: <|system|>; -1 if none */
     int think_start_id;
     int think_end_id;
     int dsml_id;
@@ -23449,6 +23463,7 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->think_start_id = vocab_lookup(vocab, "<think>");
         vocab->think_end_id = vocab_lookup(vocab, "</think>");
         vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
+        vocab->asst_start_id = -1; vocab->sys_start_id = -1;
     } else {
         /* Qwen2/gemma and other dense families: take bos/eos/unk from metadata ids;
          * the DeepSeek-specific markers do not exist, so leave them at -1. */
@@ -23460,9 +23475,20 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
          * start, == user_id role) and <end_of_turn> (turn end, == im_end stop token). */
         vocab->user_id        = vocab_lookup_optional(vocab, "<|im_start|>");
         vocab->assistant_id   = vocab_lookup_optional(vocab, "<|im_end|>");
+        vocab->asst_start_id  = -1;
+        vocab->sys_start_id   = -1;
         if (vocab->user_id < 0) {
             vocab->user_id      = vocab_lookup_optional(vocab, "<start_of_turn>");
             vocab->assistant_id = vocab_lookup_optional(vocab, "<end_of_turn>");
+        }
+        if (vocab->user_id < 0) {                            /* phi-3: role-specific <|user|>/<|assistant|>/<|end|> */
+            const int pu = vocab_lookup_optional(vocab, "<|user|>");
+            const int pa = vocab_lookup_optional(vocab, "<|assistant|>");
+            const int pe = vocab_lookup_optional(vocab, "<|end|>");
+            if (pu >= 0 && pa >= 0 && pe >= 0) {
+                vocab->user_id = pu; vocab->asst_start_id = pa; vocab->assistant_id = pe;  /* im_end = <|end|> (stop) */
+                vocab->sys_start_id = vocab_lookup_optional(vocab, "<|system|>");
+            }
         }
         vocab->think_start_id = -1;
         vocab->think_end_id   = -1;
@@ -26320,6 +26346,18 @@ static ds4_dense_wdesc dense_wdesc_of(const ds4_model *m, const ds4_tensor *t) {
     return w;
 }
 
+/* Slice output rows [r0, r0+nrows) of a 2D weight wdesc — used to split a fused QKV (phi-3 attn_qkv:
+ * Q|K|V) or a fused gate_up (ffn_up: gate|up) into separate matvec weights. Rows are contiguous in the
+ * [out_dim, in_dim] layout, including K-quants (one output row = in_dim/256 blocks). */
+static ds4_dense_wdesc dense_wdesc_rows(ds4_dense_wdesc w, uint32_t r0, uint32_t nrows) {
+    if (!w.data || w.dim1 == 0) { ds4_dense_wdesc z = {0}; return z; }
+    const uint64_t row_bytes = w.bytes / w.dim1;
+    w.data  = (const char *)w.data + (size_t)r0 * row_bytes;
+    w.bytes = (uint64_t)nrows * row_bytes;
+    w.dim1  = nrows;
+    return w;
+}
+
 static int ds4_hex_digit(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
@@ -26413,16 +26451,32 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
         const ds4_layer_weights *lw = &weights->layer[il];
         ds4_dense_layer_desc *L = &desc->layers[il];
         L->attn_norm   = dense_wdesc_of(model, lw->attn_norm);
-        L->attn_q      = dense_wdesc_of(model, lw->attn_q);
+        if (lw->attn_qkv) {                                  /* phi-3 fused QKV -> split by output rows (Q|K|V) */
+            const ds4_dense_wdesc qkv = dense_wdesc_of(model, lw->attn_qkv);
+            const uint32_t qd = DS4_N_HEAD * DS4_N_HEAD_DIM, kvd = DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+            L->attn_q = dense_wdesc_rows(qkv, 0,        qd);
+            L->attn_k = dense_wdesc_rows(qkv, qd,       kvd);
+            L->attn_v = dense_wdesc_rows(qkv, qd + kvd, kvd);
+        } else {
+            L->attn_q = dense_wdesc_of(model, lw->attn_q);
+            L->attn_k = dense_wdesc_of(model, lw->attn_k);
+            L->attn_v = dense_wdesc_of(model, lw->attn_v);
+        }
         L->attn_q_bias = dense_wdesc_of(model, lw->attn_q_bias);
-        L->attn_k      = dense_wdesc_of(model, lw->attn_k);
         L->attn_k_bias = dense_wdesc_of(model, lw->attn_k_bias);
-        L->attn_v      = dense_wdesc_of(model, lw->attn_v);
         L->attn_v_bias = dense_wdesc_of(model, lw->attn_v_bias);
         L->attn_out    = dense_wdesc_of(model, lw->attn_out);
         L->ffn_norm    = dense_wdesc_of(model, lw->ffn_norm);
-        L->ffn_gate    = dense_wdesc_of(model, lw->ffn_gate);
-        L->ffn_up      = dense_wdesc_of(model, lw->ffn_up);
+        if (!lw->ffn_gate && lw->ffn_up) {                   /* phi-3 fused gate_up in ffn_up -> split (gate|up) */
+            const ds4_dense_wdesc gu = dense_wdesc_of(model, lw->ffn_up);
+            if (gu.dim1 == 2u * DS4_N_FF) {
+                L->ffn_gate = dense_wdesc_rows(gu, 0,        DS4_N_FF);
+                L->ffn_up   = dense_wdesc_rows(gu, DS4_N_FF, DS4_N_FF);
+            } else { L->ffn_up = gu; }
+        } else {
+            L->ffn_gate = dense_wdesc_of(model, lw->ffn_gate);
+            L->ffn_up   = dense_wdesc_of(model, lw->ffn_up);
+        }
         L->ffn_down    = dense_wdesc_of(model, lw->ffn_down);
         /* gemma3 extra norms (NULL data for non-gemma -> ignored by the forward). */
         L->attn_q_norm    = dense_wdesc_of(model, lw->attn_q_norm);
@@ -26890,11 +26944,22 @@ static void dense_sbuf_append(char **buf, size_t *len, size_t *cap, const char *
     (*buf)[*len] = '\0';
 }
 
-/* Append a ChatML "<|im_start|>{role}\n{content}<|im_end|>\n" block to `t`. */
+/* Append one chat turn to `t`. ChatML/gemma: "<|im_start|>{role}\n{content}<|im_end|>\n". phi-3
+ * (role-specific markers, vocab->asst_start_id>=0): "<|{role}|>\n{content}<|end|>\n" — the marker
+ * IS the role, so no role string. im_end is the common terminator (<|end|> for phi-3). */
 static void dense_chat_append_block(token_vec *t, const ds4_vocab *vocab,
                                     int im_start, int im_end,
                                     const char *role, const char *content) {
-    token_vec_push(t, im_start);
+    const bool role_markers = vocab->asst_start_id >= 0;     /* phi-3 */
+    if (role_markers) {
+        int start = vocab->user_id;
+        if      (!strcmp(role, "assistant")) start = vocab->asst_start_id;
+        else if (!strcmp(role, "system") && vocab->sys_start_id >= 0) start = vocab->sys_start_id;
+        token_vec_push(t, start);
+        role = "";                                           /* drop the role string */
+    } else {
+        token_vec_push(t, im_start);
+    }
     const size_t rl = strlen(role), cl = content ? strlen(content) : 0;
     char *buf = xmalloc(rl + cl + 2);
     memcpy(buf, role, rl); buf[rl] = '\n';
@@ -26904,6 +26969,12 @@ static void dense_chat_append_block(token_vec *t, const ds4_vocab *vocab,
     free(buf);
     token_vec_push(t, im_end);
     bpe_tokenize_text(vocab, "\n", t);
+}
+
+/* Open an assistant turn: phi-3 -> "<|assistant|>\n"; ChatML/gemma -> "<|im_start|>{assistant|model}\n". */
+static void dense_open_asst(token_vec *t, const ds4_vocab *vocab, int im_start, const char *asst_primer) {
+    if (vocab->asst_start_id >= 0) { token_vec_push(t, vocab->asst_start_id); bpe_tokenize_text(vocab, "\n", t); }
+    else { token_vec_push(t, im_start); bpe_tokenize_text(vocab, asst_primer, t); }
 }
 
 /* ---- Streaming markdown renderer (claude-code-style chat output) -----------
@@ -28738,8 +28809,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
             dense_chat_append_block(&t, &vocab, im_start, im_end, "user", um);
             free(um);
         }
-        token_vec_push(&t, im_start);
-        bpe_tokenize_text(&vocab, asst_primer, &t);
+        dense_open_asst(&t, &vocab, im_start, asst_primer);
 
         /* Sliding window: if this turn won't fit, drop the oldest stored turns and
          * rebuild the KV from base_pos (system) + the most recent turns that fit,
@@ -28842,7 +28912,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                 int wn = snprintf(wrap, rl + 64, "<tool_response>\n%s\n</tool_response>", res ? res : "");
                 dense_chat_append_block(&tr, &vocab, im_start, im_end, "user", wrap);
                 free(wrap); free(res);
-                token_vec_push(&tr, im_start); bpe_tokenize_text(&vocab, asst_primer, &tr);
+                dense_open_asst(&tr, &vocab, im_start, asst_primer);
                 if (think_turn) bpe_tokenize_text(&vocab, "<think>\n", &tr);
                 (void)wn;
                 for (uint32_t i = 0; i < (uint32_t)tr.len && pos < n_ctx - 1u && rc == 0; i++)
@@ -28874,8 +28944,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
              * both as the stripped KV content and as the sliding-window transcript. */
             token_vec turn_clean = {0};
             dense_chat_append_block(&turn_clean, &vocab, im_start, im_end, "user", line);
-            token_vec_push(&turn_clean, im_start);
-            bpe_tokenize_text(&vocab, asst_primer, &turn_clean);
+            dense_open_asst(&turn_clean, &vocab, im_start, asst_primer);
             if (ans_trim[0]) bpe_tokenize_text(&vocab, ans_trim, &turn_clean);
             token_vec_push(&turn_clean, im_end);
             bpe_tokenize_text(&vocab, "\n", &turn_clean);   /* ...<|im_end|>\n */
