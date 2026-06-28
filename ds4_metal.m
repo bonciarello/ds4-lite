@@ -5825,6 +5825,22 @@ static bool dense_rms_batch(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tenso
                             MTLSizeMake(M, 1, 1), MTLSizeMake(128, 1, 1), "pf rms");
 }
 
+/* Batched RMSNorm, or LayerNorm when a beta bias is present (phi-2 prefill). */
+static bool dense_norm_batch(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *x,
+                             const ds4_dense_wdesc *norm, const ds4_dense_wdesc *norm_bias,
+                             uint32_t M, uint32_t n, float eps) {
+    if (norm_bias && norm_bias->data) {
+        ds4_gpu_tensor *wb = dense_cached_weight(g, norm->data, norm->bytes);
+        ds4_gpu_tensor *bb = dense_cached_weight(g, norm_bias->data, norm_bias->bytes);
+        if (!wb || !bb) return false;
+        struct __attribute__((packed)) { uint32_t n; float eps; } a = { n, eps };
+        ds4_gpu_tensor *bufs[4] = { x, wb, bb, out };
+        return ds4_gpu_run_grid("kernel_dense_layer_norm_f32_batch", &a, sizeof(a), bufs, 4,
+                                MTLSizeMake(M, 1, 1), MTLSizeMake(128, 1, 1), "pf ln");
+    }
+    return dense_rms_batch(g, out, x, norm, M, n, eps);
+}
+
 static bool dense_matmul_w(ds4_dense_gpu *g, const ds4_dense_wdesc *W, ds4_gpu_tensor *x,
                            ds4_gpu_tensor *out, uint32_t M) {
     ds4_gpu_tensor *Wb = dense_cached_weight(g, W->data, W->bytes);
@@ -5854,6 +5870,25 @@ static bool dense_bias_batch(ds4_dense_gpu *g, ds4_gpu_tensor *buf, const ds4_de
     uint32_t a[2] = { n, M * n };
     ds4_gpu_tensor *bufs[2] = { buf, bb };
     return ds4_gpu_run_simple("kernel_dense_add_bias_batch", a, sizeof(a), bufs, 2, M * n, "pf bias");
+}
+
+/* Batched FFN for prefill (MoE excluded — stays per-token): non-gated GELU MLP (phi-2) vs gated
+ * SwiGLU/GeGLU. Writes the result to `out`; gateb/upb/actb are the M*nff scratch buffers. */
+static bool dense_ffn_batch(ds4_dense_gpu *g, const ds4_dense_model_desc *d, const ds4_dense_layer_desc *L,
+                            ds4_gpu_tensor *in, ds4_gpu_tensor *out,
+                            ds4_gpu_tensor *gateb, ds4_gpu_tensor *upb, ds4_gpu_tensor *actb,
+                            uint32_t M, uint32_t ne, uint32_t nff) {
+    if (!L->ffn_gate.data) {                                  /* non-gated GELU MLP (phi-2) */
+        return dense_matmul_w(g, &L->ffn_up, in, upb, M)
+            && dense_bias_batch(g, upb, &L->ffn_up_bias, nff, M)
+            && dense_gelu(upb, M*nff)
+            && dense_matmul_w(g, &L->ffn_down, upb, out, M)
+            && dense_bias_batch(g, out, &L->ffn_down_bias, ne, M);
+    }
+    return dense_matmul_w(g, &L->ffn_gate, in, gateb, M)
+        && dense_matmul_w(g, &L->ffn_up, in, upb, M)
+        && (d->ffn_geglu ? gemma_geglu(actb, gateb, upb, M*nff) : dense_swiglu(actb, gateb, upb, M*nff))
+        && dense_matmul_w(g, &L->ffn_down, actb, out, M);
 }
 
 static bool dense_rope_batch(ds4_gpu_tensor *x, uint32_t nh, uint32_t hd, uint32_t nrot,
@@ -5962,13 +5997,10 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
      * time through the decode forward, which builds the KV cache in the right format. Slower
      * prefill, but correct. */
     const bool has_qk_norm = d->n_layer > 0 && d->layers[0].attn_q_norm.data != NULL;
-    /* The batched prefill only handles plain llama (RMSNorm + sequential + gated SwiGLU). Anything else
-     * — LayerNorm, parallel-residual, non-gated/GeGLU FFN, qk-norm, MoE, int8 KV — uses the per-token
-     * decode forward, which builds the KV in the right format and applies all the caps. */
-    const bool nonstd = d->parallel_residual || d->ffn_geglu ||
-                        (d->n_layer > 0 && (d->layers[0].attn_norm_bias.data != NULL ||   /* LayerNorm */
-                                            d->layers[0].ffn_gate.data == NULL));          /* non-gated FFN */
-    if (d->gemma || g->kv_int8 || has_qk_norm || d->n_expert > 0 || nonstd) {
+    /* The batched prefill handles plain llama AND the caps (LayerNorm, parallel-residual, non-gated/
+     * GeGLU FFN, biases — see dense_norm_batch / dense_ffn_batch). It still can't do qk-norm, MoE,
+     * gemma's quirks, or int8 KV → those fall back to the per-token decode forward. */
+    if (d->gemma || g->kv_int8 || has_qk_norm || d->n_expert > 0) {
         float *throwaway = all_logits ? NULL : malloc((size_t)d->n_vocab * sizeof(float));
         int rc = 0;
         for (uint32_t i = 0; i < M && rc == 0; i++) {
@@ -5997,10 +6029,12 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
         /* f32 K/V scratch (per chunk) narrowed into the f16 KV cache after bias+rope */
         ds4_gpu_tensor *Kb = ds4_gpu_tensor_alloc((uint64_t)M*kvd*4);
         ds4_gpu_tensor *Vb = ds4_gpu_tensor_alloc((uint64_t)M*kvd*4);
+        ds4_gpu_tensor *Fb = d->parallel_residual ? ds4_gpu_tensor_alloc((uint64_t)M*ne*4) : NULL;  /* parallel-residual FFN output */
         ds4_gpu_tensor *Hrow = all_logits ? NULL : ds4_gpu_tensor_alloc((uint64_t)ne*4);
         ds4_gpu_tensor *logitsT = all_logits ? NULL : ds4_gpu_tensor_alloc((uint64_t)d->n_vocab*4);
         float *emb = malloc((size_t)ne*sizeof(float));
         bool ok = Xb&&Hb&&Ob&&Qb&&attb&&gateb&&upb&&actb&&Kb&&Vb&&emb
+                  && (!d->parallel_residual || Fb)
                   && (all_logits || (Hrow && logitsT));
 
         for (uint32_t m=0; ok && m<M; m++) {
@@ -6022,7 +6056,7 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
             ds4_gpu_tensor *kview=ds4_gpu_tensor_view(kv->k, (uint64_t)start_pos*kvd*2, (uint64_t)M*kvd*2);
             ds4_gpu_tensor *vview=ds4_gpu_tensor_view(kv->v, (uint64_t)start_pos*kvd*2, (uint64_t)M*kvd*2);
             ok = kview && vview
-              && dense_rms_batch(g, Hb, Xb, &L->attn_norm, M, ne, eps)
+              && dense_norm_batch(g, Hb, Xb, &L->attn_norm, &L->attn_norm_bias, M, ne, eps)
               && dense_matmul_w(g, &L->attn_q, Hb, Qb, M)
               && dense_matmul_w(g, &L->attn_k, Hb, Kb, M)
               && dense_matmul_w(g, &L->attn_v, Hb, Vb, M)
@@ -6035,13 +6069,18 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
               && dense_cvt_f16(g, vview, Vb, M*kvd)
               && dense_attn_prefill(attb, Qb, kv->k, kv->v, nh, nkv, hd, scale, M, start_pos)
               && dense_matmul_w(g, &L->attn_out, attb, Ob, M)
-              && dense_add(Xb, Ob, M*ne)
-              && dense_rms_batch(g, Hb, Xb, &L->ffn_norm, M, ne, eps)
-              && dense_matmul_w(g, &L->ffn_gate, Hb, gateb, M)
-              && dense_matmul_w(g, &L->ffn_up, Hb, upb, M)
-              && dense_swiglu(actb, gateb, upb, M*nff)
-              && dense_matmul_w(g, &L->ffn_down, actb, Ob, M)
-              && dense_add(Xb, Ob, M*ne);
+              && dense_bias_batch(g, Ob, &L->attn_out_bias, ne, M);   /* attn_out bias (phi-2) */
+            if (ok) {
+                if (d->parallel_residual) {                          /* phi-2: attn + ffn both from the input norm Hb */
+                    ok = dense_ffn_batch(g, d, L, Hb, Fb, gateb, upb, actb, M, ne, nff)
+                      && dense_add(Xb, Ob, M*ne) && dense_add(Xb, Fb, M*ne);
+                } else {                                             /* sequential: x += attn, then ffn from norm(x) */
+                    ok = dense_add(Xb, Ob, M*ne)
+                      && dense_norm_batch(g, Hb, Xb, &L->ffn_norm, &L->ffn_norm_bias, M, ne, eps)
+                      && dense_ffn_batch(g, d, L, Hb, Ob, gateb, upb, actb, M, ne, nff)
+                      && dense_add(Xb, Ob, M*ne);
+                }
+            }
             ds4_gpu_tensor_free(kview); ds4_gpu_tensor_free(vview);
         }
 
@@ -6049,12 +6088,12 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
         if (ok && all_logits) {       /* logits for ALL M tokens (speculative verify) */
             allT = use_pre ? g->vAllT : ds4_gpu_tensor_alloc((uint64_t)M*d->n_vocab*4);
             ok = allT
-              && dense_rms_batch(g, Hb, Xb, &d->output_norm, M, ne, eps)
+              && dense_norm_batch(g, Hb, Xb, &d->output_norm, &d->output_norm_bias, M, ne, eps)
               && dense_matmul_w(g, &d->output, Hb, allT, M);
         } else if (ok) {              /* last token only: final norm + output projection */
             ds4_gpu_tensor *xlast = ds4_gpu_tensor_view(Xb, (uint64_t)(M-1)*ne*4, (uint64_t)ne*4);
             ok = xlast
-              && dense_rms(g, Hrow, xlast, &d->output_norm, ne, eps)
+              && dense_norm(g, Hrow, xlast, &d->output_norm, &d->output_norm_bias, ne, eps)
               && dense_matvec(g, &d->output, Hrow, logitsT);
             ds4_gpu_tensor_free(xlast);
         }
@@ -6070,7 +6109,7 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
             ds4_gpu_tensor_read(logitsT, 0, last_logits, (uint64_t)d->n_vocab*4);
         }
         ds4_gpu_tensor_free(Hrow); ds4_gpu_tensor_free(logitsT); free(emb);  /* NULL-safe */
-        ds4_gpu_tensor_free(Kb); ds4_gpu_tensor_free(Vb);  /* f32 KV scratch (always fresh) */
+        ds4_gpu_tensor_free(Kb); ds4_gpu_tensor_free(Vb); ds4_gpu_tensor_free(Fb);  /* f32 KV scratch (always fresh) */
         if (!use_pre) {
             ds4_gpu_tensor_free(allT);
             ds4_gpu_tensor_free(Xb); ds4_gpu_tensor_free(Hb); ds4_gpu_tensor_free(Ob);

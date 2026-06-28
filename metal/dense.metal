@@ -2162,6 +2162,41 @@ kernel void kernel_dense_rms_norm_f32_batch(
     for (uint i = tid; i < a.n; i += nt) outr[i] = xr[i]*scale*w[i];
 }
 
+// Batched LayerNorm (phi-2 prefill): one threadgroup (128 threads) per row; mean then variance.
+kernel void kernel_dense_layer_norm_f32_batch(
+        constant ds4_dense_rmsnorm_args & a [[buffer(0)]],
+        device const float * x   [[buffer(1)]],
+        device const float * w   [[buffer(2)]],   // gamma
+        device const float * b   [[buffer(3)]],   // beta
+        device       float * out [[buffer(4)]],
+        uint   tgig  [[threadgroup_position_in_grid]],
+        uint   tid   [[thread_position_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint nt = 128u;
+    threadgroup float sdata[4];
+    device const float * xr   = x   + (ulong)tgig * a.n;
+    device       float * outr = out + (ulong)tgig * a.n;
+    float s = 0.0f;
+    for (uint i = tid; i < a.n; i += nt) s += xr[i];
+    s = simd_sum(s);
+    if (tiisg == 0) sdata[sgitg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { float t = 0.0f; for (uint k = 0; k < nt/32u; k++) t += sdata[k]; sdata[0] = t / (float)a.n; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mean = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float v = 0.0f;
+    for (uint i = tid; i < a.n; i += nt) { const float d = xr[i]-mean; v += d*d; }
+    v = simd_sum(v);
+    if (tiisg == 0) sdata[sgitg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { float t = 0.0f; for (uint k = 0; k < nt/32u; k++) t += sdata[k]; sdata[0] = t; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = 1.0f / sqrt(sdata[0] / (float)a.n + a.eps);
+    for (uint i = tid; i < a.n; i += nt) outr[i] = (xr[i]-mean)*inv*w[i] + b[i];
+}
+
 // Batched NEOX RoPE for M tokens. Token tok sits at position a.pos+tok; q is
 // [M, n_head*head_dim]. Dispatch n_tok*n_head*(n_rot/2) threads.
 kernel void kernel_dense_rope_neox_f32_batch(
