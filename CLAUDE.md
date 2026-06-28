@@ -233,8 +233,32 @@ token) gira su 32 GB via `./ds4 --metal-q3n-generate <gguf> "..." N`. Driver `ds
   riciclabile). Questo riquadra anche il denso: i pesi densi sono copie GPU private → lì
   footprint≈rss≈dimensione modello (irriducibile); gli esperti MoE inattivi sono cache riciclabile
   → il footprint reale del MoE è una frazione del modello.
+- **Quant come SECONDO lever (Q4 → Q2_K → IQ2_XXS)**: esperti più piccoli = meno byte da streammare
+  per token → attacca direttamente il collo di banda SSD (il limite reale; il prefetch parallelo non
+  può, siamo già al picco ~5 GB/s) + footprint più basso a parità di cap + hit-rate migliore. Il
+  matvec q3n copre **Q2_K–Q6_K + IQ2_XXS** (tipo 16). Confronto su `Qwen3-Next-80B-A3B` (M1 Max,
+  footprint reale / decode t/s):
+
+  | quant | disk | cap2 | cap1 |
+  |-------|-----:|------|------|
+  | Q4_K_M  | 48.5 GB | 3.57 / 4.11 | 2.57 / 3.74 |
+  | Q2_K    | 29.3 GB | 3.25 / 5.31 | 2.25 / 4.93 |
+  | IQ2_XXS | 21.2 GB | 3.17 / 5.88 | **2.14 / 5.59** |
+
+  **IQ2_XXS vince su ogni asse** (l'80B a 2.14 GiB di footprint + 5.6 t/s); IQ2@cap1 batte Q4@cap2 su
+  footprint *e* velocità. Tutti **byte-identici a llama-simple**.
+- **IQ2_XXS — kernel + workflow** (`metal/moe.metal`): `kernel_dense_mul_mv_iq2_xxs_f32` (ref, 1
+  thread/riga) + `_sg` (simdgroup NSG=2/nr0=2/simd_sum, grid letto da `constant`); il `_sg` è il path
+  veloce (naive 2.45 → sg 6.18 t/s), riusa le tabelle grid/segni IQ2 già in moe.metal. Cablati in
+  `dense_kquant_kernel`/`dense_kquant_sg_kernel` (case 16). `ds4_q3n_gpu_forward` usa
+  `ds4_dense_embed_row` (qualsiasi K-quant) per `token_embd`, non più hardcoded a Q4_K.
+  **L'IQ2_XXS RICHIEDE un imatrix** (llama-quantize fallisce senza): `llama-imatrix -m <Q4> -f
+  calib.txt -o imat -ngl 0` (CPU, calibrazione >1024 token) → `llama-quantize --imatrix imat
+  --allow-requantize <Q4> <out> IQ2_XXS`. NB: IQ2_S/XS/M hanno layout diverso (nessun kernel). La
+  qualità IQ2 qui è limitata (imatrix minimale + doppia quant da Q4, niente sorgente BF16 offline) ma
+  resta coerente.
 - **Benchmark**: `tests/bench_q3n_cache.sh [N] [MODEL]` fa lo sweep del cap e riporta footprint vs
-  maxRSS (+ t/s). Dettagli/stato in [[qwen3next-impl]].
+  maxRSS (+ t/s); passa il modello come `$2` per confrontare i quant. Dettagli/stato in [[qwen3next-impl]].
 
 ## Chat CLI (stile Claude Code) — `--metal-dense-chat`
 
