@@ -1630,6 +1630,44 @@ kernel void kernel_dense_rope_neox_f32(
     head[i + rot_half] = x0 * s + x1 * c;
 }
 
+struct ds4_gptoss_rope_args {
+    uint  n_head;
+    uint  head_dim;
+    uint  n_rot;
+    uint  pos;
+    float freq_base;
+    float freq_scale;   // 1/scaling_factor (1/32)
+    float mscale;       // cos/sin magnitude correction (1.3466)
+    float corr0, corr1; // YaRN ramp correction dims
+};
+
+// gpt-oss YaRN NEOX rope. theta_extrap = pos * base^(-2i/n_rot); theta = interp/extrap blend over
+// the ramp [corr0,corr1] (ext_factor=1): interp = freq_scale*theta_extrap; mix = 1-clamp((i-corr0)/
+// (corr1-corr0),0,1); theta = interp*(1-mix) + extrap*mix. cos/sin *= mscale. Matches ggml rope_yarn.
+kernel void kernel_gptoss_rope_yarn_f32(
+        constant ds4_gptoss_rope_args & a [[buffer(0)]],
+        device float * x [[buffer(1)]],
+        uint gid [[thread_position_in_grid]]) {
+    const uint rot_half = a.n_rot / 2u;
+    const uint total = a.n_head * rot_half;
+    if (gid >= total) return;
+    const uint h = gid / rot_half;
+    const uint i = gid % rot_half;
+    device float * head = x + h * a.head_dim;
+    const float freq         = pow(a.freq_base, -2.0f * (float)i / (float)a.n_rot);
+    const float theta_extrap = (float)a.pos * freq;
+    const float theta_interp = a.freq_scale * theta_extrap;
+    const float y        = ((float)i - a.corr0) / max(0.001f, a.corr1 - a.corr0);
+    const float ramp_mix = 1.0f - min(1.0f, max(0.0f, y));            // ext_factor = 1
+    const float theta    = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+    const float c = cos(theta) * a.mscale;
+    const float s = sin(theta) * a.mscale;
+    const float x0 = head[i];
+    const float x1 = head[i + rot_half];
+    head[i]            = x0 * c - x1 * s;
+    head[i + rot_half] = x0 * s + x1 * c;
+}
+
 // ---- Dense FFN building blocks (Fase 3.5) ----------------------------------
 // SwiGLU activation: out[i] = silu(gate[i]) * up[i]. One thread per element.
 kernel void kernel_dense_swiglu_f32(
