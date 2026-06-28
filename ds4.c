@@ -28049,6 +28049,67 @@ static int ds4_q3n_chat(const char *model_path, const char *system, int ctx_size
     return rc;
 }
 
+/* Minimal harmony chat for gpt-oss: <|start|>{role}<|message|>{text}<|end|> turns, the
+ * assistant generates <|channel|>{analysis|final}<|message|>...; we render the final channel
+ * bright and the analysis/reasoning dim, skipping the control tokens. Stops at <|return|>. */
+static int ds4_gptoss_chat(ds4_model *model, ds4_vocab *vocab, const char *model_path, int ctx_size) {
+    ds4_weights weights;
+    weights_bind(&weights, model, false, 0, 0, true, false);
+    const uint32_t n_ctx = ctx_size > 0 ? (uint32_t)ctx_size : 4096u;
+    ds4_gptoss_model_desc desc; build_gptoss_desc(&desc, model, &weights, n_ctx);
+    ds4_gptoss_gpu *g = ds4_gptoss_gpu_create(&desc);
+    if (!g) { free(desc.layers); return 1; }
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    dense_print_banner(model_path, n_ctx, "Apple Silicon (Metal)", "gpt-oss harmony chat · /exit or Ctrl-D to quit");
+    const int T_RET=200002, T_CHAN=200005, T_START=200006, T_END=200007, T_MSG=200008;
+    const char *DIM="\033[2m", *RST="\033[0m";
+    uint32_t pos = 0; int rc = 0; bool first = true;
+    for (;;) {
+        char *line = linenoise("\n\033[1m› \033[0m");
+        if (!line) break;                                    /* Ctrl-D */
+        if (line[0]=='\0') { free(line); continue; }
+        if (!strcmp(line, "/exit")) { free(line); break; }
+        linenoiseHistoryAdd(line);
+        token_vec t = {0};
+        if (first) {                                         /* one-time minimal system turn */
+            token_vec_push(&t, T_START); bpe_tokenize_text(vocab, "system", &t);
+            token_vec_push(&t, T_MSG);   bpe_tokenize_text(vocab, "You are a helpful assistant.", &t);
+            token_vec_push(&t, T_END);   first = false;
+        }
+        token_vec_push(&t, T_START); bpe_tokenize_text(vocab, "user", &t);
+        token_vec_push(&t, T_MSG);   bpe_tokenize_text(vocab, line, &t);
+        token_vec_push(&t, T_END);
+        token_vec_push(&t, T_START); bpe_tokenize_text(vocab, "assistant", &t);
+        free(line);
+        for (uint32_t i = 0; i < (uint32_t)t.len && rc == 0; i++)
+            if (ds4_gptoss_gpu_forward(g, &desc, t.v[i], pos++, logits) != 0) rc = 1;
+        token_vec_free(&t);
+        if (rc) break;
+        printf("\n");
+        bool in_name = false, capturing = false, dim = false; char nm[16]; int nl = 0;
+        int n_gen = 0, cap = (n_ctx > pos + 1u) ? (int)(n_ctx - pos - 1u) : 0;
+        while (rc == 0 && n_gen < cap) {
+            int tk = sample_argmax(logits, DS4_N_VOCAB);
+            if (tk == T_RET || tk == vocab->eos_id) break;
+            if      (tk == T_START) { in_name = true; capturing = false; }       /* skip the role name */
+            else if (tk == T_CHAN)  { in_name = true; capturing = true; nl = 0; } /* capture the channel name */
+            else if (tk == T_MSG)   { in_name = false; if (capturing) { nm[nl] = 0; dim = (strstr(nm, "final") == NULL); if (dim) fputs(DIM, stdout); capturing = false; } }
+            else if (tk == T_END)   { if (dim) { fputs(RST, stdout); dim = false; } }
+            else if (tk >= 199998)  { /* other harmony control token: skip */ }
+            else if (in_name)       { if (capturing) { ds4_str s = vocab->token[tk]; for (uint64_t j = 0; j < s.len && nl < 15; j++) nm[nl++] = s.ptr[j]; } }
+            else                    { dense_print_token(vocab, tk); }
+            fflush(stdout);
+            if (ds4_gptoss_gpu_forward(g, &desc, tk, pos++, logits) != 0) rc = 1;
+            n_gen++;
+        }
+        if (dim) fputs(RST, stdout);
+        printf("\n");
+        if (pos + 8u >= n_ctx) { printf("\033[2m(context window full — restart to continue)\033[0m\n"); break; }
+    }
+    free(logits); ds4_gptoss_gpu_free(g); free(desc.layers);
+    return rc;
+}
+
 int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                    char *err, size_t errlen) {
     ds4_model model;
@@ -28072,6 +28133,11 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
     const int is_q3n = ds4_arch_is_qwen3next();   /* same chat loop drives dense + qwen3_next */
     const int is_gemma = ds4_arch_is_gemma3();    /* gemma3 uses its own turn template */
     vocab_load(&vocab, &model);
+    if (ds4_arch_is_gptoss()) {                   /* gpt-oss: its own harmony REPL */
+        const int rc = ds4_gptoss_chat(&model, &vocab, model_path, ctx_size);
+        vocab_free(&vocab); model_close(&model);
+        return rc;
+    }
     weights_bind(&weights, &model, false, 0, 0, true, false);
 
     /* model basename (no dir, no .gguf) for the input-box shortcut footer */
