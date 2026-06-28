@@ -86,23 +86,36 @@ Metal engine, selected automatically from the GGUF `general.architecture`:
 
 ### Benchmarks (M1 Max, 32 GB, greedy decode, N=64)
 
-`tests/bench_vs_llama.sh` (offline gguf only). Decode is the steady-state metric; **RSS is the
-real RAM load** — far below the on-disk size thanks to zero-copy mmap wrapping (dense) and SSD
-streaming (MoE/>RAM).
+`tests/bench_vs_llama.sh` (offline gguf only). Decode is the steady-state metric. **RAM** is the
+real load — what the engine actually needs resident, measured identically for both (peak `ps`
+RSS for resident execution; for ds4's SSD-streamed MoE rows it is the peak *private footprint*
+from `/usr/bin/time -l`, because RSS counts reclaimable file-backed cache and over-reports
+streaming — e.g. ds4's gpt-oss is 26 GB RSS but only **10.7 GB** private).
 
-| Model | arch / driver | disk | ds4 decode | llama.cpp | ds4/llama | RSS (RAM) |
+| Model | arch / driver | disk | ds4 decode | llama decode | ds4 RAM | llama RAM |
 |---|---|---:|---:|---:|---:|---:|
-| phi-2 | dense (generic) | 1.7 GB | 28 t/s | 87 | 32% | **0.3 GB** |
-| phi-3-mini | dense (generic) | 2.2 GB | 60 t/s | 74 | 82% | 0.7 GB |
-| qwen2-7B Q4_K_M | dense | 4.4 GB | 39 t/s | 44 | 88% | 3.8 GB |
-| gemma-3-27B Q4_K_M | dense (gemma) | 15.4 GB | 10.6 t/s | 12.0 | 89% | 13.9 GB |
-| gpt-oss-20B Q8_0 | MoE (gpt-oss) | 20.7 GB | 2.6 t/s | — | — | pread |
-| Qwen3-Next-80B Q4_K_M | MoE (qwen3next) | 45.2 GB | 2.8 t/s | *> RAM* | — | **23.5 GB** |
+| phi-2 | dense (generic) | 1.7 GB | 28 t/s | 87 t/s | **0.3 GB** | 1.8 GB |
+| phi-3-mini | dense (generic) | 2.2 GB | 60 t/s | 74 t/s | 0.7 GB | 2.4 GB |
+| qwen2-7B Q4_K_M | dense | 4.4 GB | 39 t/s | 44 t/s | 3.8 GB | 4.5 GB |
+| gemma-3-27B Q4_K_M | dense (gemma) | 15.4 GB | 10.6 t/s | 12.0 t/s | 13.9 GB | 15.6 GB |
+| gpt-oss-20B Q8_0 | MoE (gpt-oss) | 20.7 GB | 2.6 t/s | 58 t/s | 10.7 GB † | 20.5 GB |
+| Qwen3-Next-80B Q4_K_M | MoE (qwen3next) | 45.2 GB | 2.8 t/s | *can't* ‡ | 6.4 GB † | — ‡ |
 
-Highlights: dense decode is **82–101 %** of llama.cpp; a **45 GB** model runs on a **32 GB**
-machine via SSD streaming (RSS ≈ 23 GB); small models hold a tiny RSS (phi-2: 0.3 GB resident
-for a 1.7 GB model). The batched prefill (matmul) handles the capability flags too, so phi-2's
-prefill is ~**170 t/s** (vs ~28 token-by-token).
+† SSD-streamed: ds4 `pread`s weights/experts on demand, so the *private* footprint is far below
+the model size (gpt-oss 10.7 GB, the 80B Qwen3-Next just **6.4 GB**); decode is the price (2–3 t/s).
+‡ 45 GB > 32 GB RAM, so llama.cpp can't full-offload Qwen3-Next on this box (the bench declines
+rather than OOM it). ds4 runs it anyway via expert streaming.
+
+Highlights:
+- **Dense: as fast as llama, on less RAM.** Decode is **82–101 %** of llama.cpp while the RAM
+  load stays *below* llama's — ds4 zero-copy-wraps the mmap'd weights instead of copying them:
+  phi-2 0.3 vs 1.8 GB, qwen2 3.8 vs 4.5, gemma 13.9 vs 15.6.
+- **MoE: runs what llama can't.** An **80B** model (Qwen3-Next) runs on a **32 GB** machine in a
+  **6.4 GB** private footprint — llama.cpp can't load it at all — and gpt-oss-20B fits in 10.7 GB
+  vs llama's 20.5. The trade is speed: the streamed path is 2–3 t/s (a resident fast path for
+  models that *do* fit, like gpt-oss, is future work — llama gets 58 t/s there).
+- **Batched prefill for the odd archs.** The matmul prefill now handles the capability flags, so
+  phi-2's prefill is ~**170 t/s** (vs ~28 token-by-token).
 
 ## More Documentation
 
