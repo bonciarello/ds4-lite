@@ -1683,6 +1683,7 @@ enum {
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
+    DS4_TENSOR_MXFP4    = 39,   /* gpt-oss native experts; ds4 has no MXFP4 kernel — reject cleanly */
 };
 
 typedef struct {
@@ -2001,6 +2002,11 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
         if (!cursor_u64(c, &t->rel_offset)) ds4_die(c->error);
 
         if (!tensor_nbytes(t->type, t->elements, &t->bytes)) {
+            if (t->type == DS4_TENSOR_MXFP4) {
+                ds4_die("this model uses MXFP4 (GGUF type 39), which ds4 does not support. "
+                        "Requantize to a supported type, e.g.:\n"
+                        "       llama-quantize --allow-requantize <model>.gguf <model>-Q8_0.gguf Q8_0");
+            }
             ds4_log(stderr,
                 DS4_LOG_WARNING,
                 "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",
