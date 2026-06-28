@@ -4248,6 +4248,21 @@ static void config_build_gptoss_shape(const ds4_model *m) {
                 (double)s.rms_eps, (unsigned long long)s.rope_orig_ctx);
 }
 
+/* Generic dense fallback: an UNKNOWN architecture (not one with its own shape builder / driver —
+ * deepseek4, qwen3next, gemma3, gpt-oss) that exposes the standard dense metadata (`<arch>.block_count`)
+ * is run on the plain dense driver. Covers the long tail of small llama-style transformers without a
+ * per-arch builder. Returns true + fills `ns` (the arch as a C string) when applicable. */
+static bool ds4_is_generic_dense(const ds4_model *m, ds4_str arch, char *ns, size_t ns_cap) {
+    if (arch.len == 0 || ds4_str_eq_cstr(arch, "qwen3next") || ds4_str_eq_cstr(arch, "gpt-oss") ||
+        ds4_str_eq_cstr(arch, "gemma3"))
+        return false;
+    size_t n = arch.len < ns_cap - 1 ? arch.len : ns_cap - 1;
+    memcpy(ns, arch.ptr, n); ns[n] = '\0';
+    if (strncmp(ns, "deepseek", 8) == 0) return false;       /* DeepSeek uses its own MLA+MoE engine */
+    uint32_t probe;
+    return model_get_u32_ns(m, ns, "block_count", &probe);   /* has the standard dense shape metadata */
+}
+
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
 static void config_validate_model(const ds4_model *m) {
@@ -4275,6 +4290,19 @@ static void config_validate_model(const ds4_model *m) {
     if (ds4_str_eq_cstr(arch, "gpt-oss")) {          /* MoE + sinks + sliding-window + YaRN (Phase 0: shape only) */
         config_build_gptoss_shape(m);
         return;
+    }
+
+    /* Generic dense fallback before the DeepSeek path: any unknown arch with standard dense
+     * metadata runs on the dense driver (experimental — assumes a llama-style transformer). */
+    {
+        static char s_generic_ns[64];   /* persistent: config_build_dense_shape keeps meta_ns/name by pointer */
+        if (ds4_is_generic_dense(m, arch, s_generic_ns, sizeof s_generic_ns)) {
+            ds4_log(stderr, DS4_LOG_WARNING,
+                    "ds4: architecture '%s' is not explicitly supported — attempting the generic dense "
+                    "path (standard transformer assumed; verify the output vs llama.cpp).\n", s_generic_ns);
+            config_build_dense_shape(m, s_generic_ns);
+            return;
+        }
     }
 
     const uint32_t n_layer = required_u32(m, "deepseek4.block_count");
@@ -4528,10 +4556,12 @@ static void weights_bind_layer_dense(ds4_layer_weights *l, const ds4_model *m, u
     l->ffn_gate    = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
     l->ffn_up      = required_tensorf(m, "blk.%u.ffn_up.weight", il);
     l->ffn_down    = required_tensorf(m, "blk.%u.ffn_down.weight", il);
-    /* gemma3 extra norms: per-head QK-norm + post-attention/post-ffn norms. */
+    /* Per-head QK-norm on q/k (qwen3, gemma3, …): optional — NULL data when the tensor is absent
+     * (qwen2/llama/mistral). The dense forward applies it (before RoPE) only when present. */
+    l->attn_q_norm = tensor_by_namef(m, "blk.%u.attn_q_norm.weight", il);
+    l->attn_k_norm = tensor_by_namef(m, "blk.%u.attn_k_norm.weight", il);
+    /* gemma3 extra norms: post-attention + post-ffn (gemma-only). */
     if (ds4_arch_is_gemma3()) {
-        l->attn_q_norm    = tensor_by_namef(m, "blk.%u.attn_q_norm.weight", il);
-        l->attn_k_norm    = tensor_by_namef(m, "blk.%u.attn_k_norm.weight", il);
         l->attn_post_norm = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);
         l->ffn_post_norm  = required_tensorf(m, "blk.%u.post_ffw_norm.weight", il);
     }
@@ -26244,9 +26274,10 @@ int ds4_model_is_dense(const char *path) {
     model_open(&m, path, false, false);
     ds4_str arch = {0};
     model_get_string(&m, "general.architecture", &arch);
-    const char *ns = NULL;
+    const char *ns = NULL; char gns[64];
     const int dense = (ds4_dense_arch_supported(arch, &ns) ||
-                       ds4_str_eq_cstr(arch, "gemma3")) ? 1 : 0;
+                       ds4_str_eq_cstr(arch, "gemma3") ||
+                       ds4_is_generic_dense(&m, arch, gns, sizeof gns)) ? 1 : 0;
     model_close(&m);
     return dense;
 }
@@ -28049,9 +28080,115 @@ static int ds4_q3n_chat(const char *model_path, const char *system, int ctx_size
     return rc;
 }
 
-/* Minimal harmony chat for gpt-oss: <|start|>{role}<|message|>{text}<|end|> turns, the
- * assistant generates <|channel|>{analysis|final}<|message|>...; we render the final channel
- * bright and the analysis/reasoning dim, skipping the control tokens. Stops at <|return|>. */
+/* gpt-oss tool declaration, rendered as a harmony DEVELOPER message (the format gpt-oss is trained
+ * on — a prose list makes it only *play* at calling, never emitting a real <|call|>). With this the
+ * model emits `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`
+ * and stops. Tools map to dense_tool_exec. */
+static const char *GPTOSS_DEV_TOOLS =
+    "# Instructions\n\n"
+    "You can call functions that act on the user's machine. When the user asks you to create, read, "
+    "or edit a file, list a directory, search code, run a shell command, or look something up online, "
+    "you MUST call the matching function — do not merely describe the steps or print code for the user "
+    "to copy. Call one function and then use its result to give the final answer.\n\n"
+    "# Tools\n\n## functions\n\nnamespace functions {\n\n"
+    "// Returns the contents of a file.\n"
+    "type read_file = (_: { path: string }) => any;\n\n"
+    "// Creates or overwrites a file with the given content.\n"
+    "type write_file = (_: { path: string, content: string }) => any;\n\n"
+    "// Replaces the first occurrence of old_string with new_string in a file.\n"
+    "type edit_file = (_: { path: string, old_string: string, new_string: string }) => any;\n\n"
+    "// Lists a directory (ls -la).\n"
+    "type list_dir = (_: { path: string }) => any;\n\n"
+    "// Lists files matching a glob pattern (e.g. src/**/*.c).\n"
+    "type glob = (_: { pattern: string }) => any;\n\n"
+    "// Searches file contents recursively for a pattern.\n"
+    "type grep = (_: { pattern: string, path: string }) => any;\n\n"
+    "// Runs a shell command and returns its output.\n"
+    "type bash = (_: { command: string }) => any;\n\n"
+    "// Fetches a web page's text.\n"
+    "type web_fetch = (_: { url: string }) => any;\n\n"
+    "// Returns web search results.\n"
+    "type web_search = (_: { query: string }) => any;\n\n"
+    "} // namespace functions";
+
+/* Generate one gpt-oss assistant turn: parse the harmony channels, stream the analysis/commentary
+ * channels dim (💭) and the final channel as markdown, accumulating the final text into *final_out.
+ * gpt-oss calls tools NATIVELY via a "commentary to=functions.NAME" channel ended by <|call|>: when
+ * that is seen the function name is returned in tool_name[] and its JSON-object arguments (the
+ * channel body) in *tool_args_out (malloc'd), and generation stops. tool_name[0]=='\0' = no native
+ * call (the caller then also checks *final_out for a Hermes <tool_call> fallback). pos advances. */
+static int gptoss_gen_turn(ds4_gptoss_gpu *g, const ds4_gptoss_model_desc *desc,
+                           const ds4_vocab *vocab, uint32_t *pos_io, uint32_t n_ctx, float *logits,
+                           char **final_out, char *tool_name, size_t tn_cap, char **tool_args_out) {
+    const int T_RET=200002, T_CALL=200012, T_CHAN=200005, T_START=200006, T_END=200007, T_MSG=200008;
+    const char *DIM="\033[2m", *RST="\033[0m";
+    const bool dbg = getenv("DS4_GPTOSS_TOOLDEBUG") != NULL;
+    uint32_t pos = *pos_io; int rc = 0;
+    md_state md; md_init(&md);
+    bool in_name=false, capturing=false, dim=false, tool_chan=false, call_now=false;
+    char hdr[192]; int hl=0;                            /* channel header, e.g. "commentary to=functions.write_file json" */
+    char *ans=NULL; size_t al=0, ac=0, md_fed=0;        /* FINAL channel text (display + Hermes fallback) */
+    char *targs=NULL; size_t tl=0, tc=0;                /* native tool-call args = a tool channel's body */
+    tool_name[0]='\0'; *tool_args_out=NULL;
+    int n_gen=0, cap=(n_ctx > pos+1u) ? (int)(n_ctx-pos-1u) : 0;
+    while (rc==0 && n_gen<cap) {
+        int tk = sample_argmax(logits, DS4_N_VOCAB);
+        if (tk==T_RET || tk==vocab->eos_id) break;
+        if      (tk==T_START) { in_name=true; capturing=false; }
+        else if (tk==T_CHAN)  { in_name=true; capturing=true; hl=0; }
+        else if (tk==T_MSG)   {
+            in_name=false;
+            if (capturing) {
+                hdr[hl]=0; capturing=false;
+                if (dbg) fprintf(stderr, "\n[gptoss hdr: '%s']\n", hdr);
+                /* native call: header is "commentary to=NAME json" (or "to=functions.NAME"); the raw
+                 * token bytes encode spaces as Ġ (0xC4 0xA0), which conveniently stops the name scan. */
+                const char *tf = strstr(hdr, "to=");
+                if (tf) {
+                    tf += 3;
+                    if (strncmp(tf, "functions.", 10) == 0) tf += 10;    /* optional harmony namespace prefix */
+                    size_t k=0;
+                    while (tf[k] && ((tf[k]>='a'&&tf[k]<='z')||(tf[k]>='A'&&tf[k]<='Z')||(tf[k]>='0'&&tf[k]<='9')||tf[k]=='_') && k<tn_cap-1)
+                        { tool_name[k]=tf[k]; k++; }
+                    tool_name[k]=0;
+                }
+                tool_chan = (tool_name[0]!='\0');
+                if (tool_chan) { dim=false; printf("\033[2m\xf0\x9f\x94\xa7 %s…\033[0m", tool_name); fflush(stdout); }
+                else { dim=(strstr(hdr,"final")==NULL);                  /* analysis/commentary dim, final bright */
+                       if (dim) { fputs(DIM,stdout); fputs("\xf0\x9f\x92\xad  ",stdout); } }
+            }
+        }
+        else if (tk==T_CALL)  { if (tool_chan && tool_name[0]) { if (!targs) dense_sbuf_append(&targs,&tl,&tc,"",0);
+                                    *tool_args_out=targs; targs=NULL; call_now=true;
+                                    if (dbg) fprintf(stderr,"[gptoss <|call|> -> %s]\n", tool_name); } }
+        else if (tk==T_END)   { if (tool_chan) { if (dbg) fprintf(stderr,"[gptoss tool '%s' ended by <|end|> (no <|call|>)]\n", tool_name); tool_chan=false; }
+                                else if (!dim) { if (al>md_fed) { md_feed(&md, ans+md_fed,(int)(al-md_fed)); md_fed=al; } md_flush(&md); }
+                                else { fputs(RST,stdout); fputc('\n',stdout); dim=false; } }
+        else if (tk>=199998)  { /* other harmony control token (constrain, …): skip */ }
+        else if (in_name)     { if (capturing) { ds4_str s=vocab->token[tk]; for (uint64_t j=0;j<s.len&&hl<191;j++) hdr[hl++]=s.ptr[j]; } }
+        else if (tool_chan)   { char tb[96]; int tn=dense_token_bytes(vocab,tk,tb,sizeof tb); dense_sbuf_append(&targs,&tl,&tc,tb,(size_t)tn); }
+        else if (dim)         { dense_print_token(vocab, tk); }                   /* analysis/commentary: dim raw */
+        else { char tb[96]; int tn=dense_token_bytes(vocab,tk,tb,sizeof tb); dense_sbuf_append(&ans,&al,&ac,tb,(size_t)tn);
+               if (al>md_fed) { md_feed(&md, ans+md_fed, (int)(al-md_fed)); md_fed=al; } }    /* final: markdown */
+        fflush(stdout);
+        if (ds4_gptoss_gpu_forward(g, desc, tk, pos++, logits) != 0) rc=1;
+        n_gen++;
+        if (call_now) break;
+    }
+    if (dim) fputs(RST, stdout);
+    if (al>md_fed) md_feed(&md, ans+md_fed, (int)(al-md_fed));
+    md_flush(&md);
+    free(targs);                                         /* discarded if a tool channel never hit <|call|> */
+    *pos_io = pos; *final_out = ans;
+    return rc;
+}
+
+/* Harmony chat for gpt-oss with the full claude-code UI (box input, spinner, markdown) AND
+ * function-calling: <|start|>{role}<|message|>{text}<|end|> turns; the assistant emits
+ * <|channel|>{analysis|final}<|message|>… Tools are declared in a harmony developer message
+ * (GPTOSS_DEV_TOOLS); the model's native "commentary to=functions.NAME … <|call|>" call is
+ * executed (dense_tool_exec) and fed back as a harmony "functions.NAME to=assistant" message,
+ * then the assistant regenerates. ON by default; DS4_DENSE_NO_TOOLS disables. Stops at <|return|>. */
 static int ds4_gptoss_chat(ds4_model *model, ds4_vocab *vocab, const char *model_path, int ctx_size) {
     ds4_weights weights;
     weights_bind(&weights, model, false, 0, 0, true, false);
@@ -28060,52 +28197,107 @@ static int ds4_gptoss_chat(ds4_model *model, ds4_vocab *vocab, const char *model
     ds4_gptoss_gpu *g = ds4_gptoss_gpu_create(&desc);
     if (!g) { free(desc.layers); return 1; }
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-    dense_print_banner(model_path, n_ctx, "Apple Silicon (Metal)", "gpt-oss harmony chat · /exit or Ctrl-D to quit");
-    const int T_RET=200002, T_CHAN=200005, T_START=200006, T_END=200007, T_MSG=200008;
-    const char *DIM="\033[2m", *RST="\033[0m";
+    /* Full claude-code-style UI — banner box + boxed input (status footer, slash menu, live
+     * context bar), prefill spinner, and markdown rendering — the same as the dense + q3n chats,
+     * driving the harmony format: <|start|>{role}<|message|>{text}<|end|>; the assistant emits
+     * <|channel|>{analysis|final}<|message|>… The final channel is markdown-rendered, the
+     * analysis/reasoning channel is shown dim (💭), and the harmony control tokens are skipped. */
+    const char *device = "Apple Silicon (Metal)";
+    const char *init_log = "gpt-oss harmony · reasoning shown dim · /exit or Ctrl-D to quit";
+    dense_print_banner(model_path, n_ctx, device, init_log);
+    char histpath[PATH_MAX];
+    { const char *home = getenv("HOME"); if (!home || !home[0]) home = ".";
+      snprintf(histpath, sizeof histpath, "%s/.ds4_gptoss_chat_history", home); }
+    linenoiseHistorySetMaxLen(512); linenoiseHistoryLoad(histpath);
+    if (isatty(STDIN_FILENO) && pipe(g_winch_pipe) == 0) {
+        fcntl(g_winch_pipe[0], F_SETFL, O_NONBLOCK); fcntl(g_winch_pipe[1], F_SETFL, O_NONBLOCK);
+        struct sigaction sa; memset(&sa, 0, sizeof sa);
+        sa.sa_handler = dense_winch_handler; sigemptyset(&sa.sa_mask); sigaction(SIGWINCH, &sa, NULL);
+    }
+    const int T_CHAN=200005, T_START=200006, T_END=200007, T_MSG=200008;
+    const bool tools_on = getenv("DS4_DENSE_NO_TOOLS") == NULL;   /* function-calling, on by default */
     uint32_t pos = 0; int rc = 0; bool first = true;
-    for (;;) {
-        char *line = linenoise("\n\033[1m› \033[0m");
-        if (!line) break;                                    /* Ctrl-D */
-        if (line[0]=='\0') { free(line); continue; }
-        if (!strcmp(line, "/exit")) { free(line); break; }
-        linenoiseHistoryAdd(line);
+    char *line = NULL;
+    while (rc == 0) {
+        linenoiseFree(line);
+        line = dense_readline("> ", model_path, n_ctx, device, init_log, pos);
+        if (!line) { printf("\n"); break; }                  /* Ctrl-D */
+        if (line[0]=='\0') continue;
+        if (!strcmp(line, "/exit") || !strcmp(line, "/quit")) break;
+        linenoiseHistoryAdd(line); linenoiseHistorySave(histpath);
         token_vec t = {0};
-        if (first) {                                         /* one-time minimal system turn */
+        if (first) {                                         /* one-time system turn + developer(tools) */
             token_vec_push(&t, T_START); bpe_tokenize_text(vocab, "system", &t);
             token_vec_push(&t, T_MSG);   bpe_tokenize_text(vocab, "You are a helpful assistant.", &t);
-            token_vec_push(&t, T_END);   first = false;
+            token_vec_push(&t, T_END);
+            if (tools_on) {                                  /* harmony developer message declaring the tools */
+                token_vec_push(&t, T_START); bpe_tokenize_text(vocab, "developer", &t);
+                token_vec_push(&t, T_MSG);   bpe_tokenize_text(vocab, GPTOSS_DEV_TOOLS, &t);
+                token_vec_push(&t, T_END);
+            }
+            first = false;
         }
         token_vec_push(&t, T_START); bpe_tokenize_text(vocab, "user", &t);
         token_vec_push(&t, T_MSG);   bpe_tokenize_text(vocab, line, &t);
         token_vec_push(&t, T_END);
         token_vec_push(&t, T_START); bpe_tokenize_text(vocab, "assistant", &t);
-        free(line);
+        /* prefill behind a "thinking…" spinner until the first token streams */
+        pthread_t spin; int spin_on = 0;
+        if (isatty(STDOUT_FILENO)) {
+            printf("\r\033[36m⠋\033[0m \033[2mthinking…\033[0m\033[K"); fflush(stdout);
+            g_spin_run = 1;
+            if (pthread_create(&spin, NULL, dense_spinner_thread, NULL) == 0) spin_on = 1; else g_spin_run = 0;
+        }
         for (uint32_t i = 0; i < (uint32_t)t.len && rc == 0; i++)
             if (ds4_gptoss_gpu_forward(g, &desc, t.v[i], pos++, logits) != 0) rc = 1;
         token_vec_free(&t);
+        if (spin_on) { g_spin_run = 0; pthread_join(spin, NULL); }
+        printf("\r\033[K");                                  /* clear the spinner line */
         if (rc) break;
-        printf("\n");
-        bool in_name = false, capturing = false, dim = false; char nm[16]; int nl = 0;
-        int n_gen = 0, cap = (n_ctx > pos + 1u) ? (int)(n_ctx - pos - 1u) : 0;
-        while (rc == 0 && n_gen < cap) {
-            int tk = sample_argmax(logits, DS4_N_VOCAB);
-            if (tk == T_RET || tk == vocab->eos_id) break;
-            if      (tk == T_START) { in_name = true; capturing = false; }       /* skip the role name */
-            else if (tk == T_CHAN)  { in_name = true; capturing = true; nl = 0; } /* capture the channel name */
-            else if (tk == T_MSG)   { in_name = false; if (capturing) { nm[nl] = 0; dim = (strstr(nm, "final") == NULL); if (dim) fputs(DIM, stdout); capturing = false; } }
-            else if (tk == T_END)   { if (dim) { fputs(RST, stdout); dim = false; } }
-            else if (tk >= 199998)  { /* other harmony control token: skip */ }
-            else if (in_name)       { if (capturing) { ds4_str s = vocab->token[tk]; for (uint64_t j = 0; j < s.len && nl < 15; j++) nm[nl++] = s.ptr[j]; } }
-            else                    { dense_print_token(vocab, tk); }
-            fflush(stdout);
-            if (ds4_gptoss_gpu_forward(g, &desc, tk, pos++, logits) != 0) rc = 1;
-            n_gen++;
+        char *ans = NULL; char tname[64]; char *targs = NULL;
+        rc = gptoss_gen_turn(g, &desc, vocab, &pos, n_ctx, logits, &ans, tname, sizeof tname, &targs);
+        /* Tool loop: gpt-oss calls a function NATIVELY (commentary to=functions.NAME … <|call|>) — or,
+         * as a fallback, as a Hermes <tool_call> in the final channel. Run it, feed the result back as
+         * a harmony tool message, reopen the assistant, and regenerate. Bounded (8 rounds). */
+        if (tools_on && rc == 0) {
+            char *hargs = xmalloc(65536);                    /* Hermes-fallback args buffer */
+            for (int round = 0; round < 8 && pos < n_ctx - 1u; round++) {
+                char hname[64]; const char *name = NULL, *args = NULL;
+                if (tname[0]) { name = tname; args = targs ? targs : "{}"; }                 /* native call */
+                else {                                                                       /* Hermes fallback */
+                    const char *at = ans ? ans : ""; while (*at==' '||*at=='\n'||*at=='\r'||*at=='\t') at++;
+                    if (dense_tool_find_call(at, hname, sizeof hname, hargs, 65536)) { name = hname; args = hargs; }
+                }
+                if (!name) break;
+                if (!tname[0] && ds4_gptoss_gpu_forward(g, &desc, T_END, pos++, logits) != 0) { rc = 1; break; }  /* Hermes: close the turn (<|call|> already did for native) */
+                char *res = NULL; size_t rl = 0, rc2 = 0;
+                dense_tool_exec(name, args, &res, &rl, &rc2);
+                dense_tool_render(name, args, res, rl);
+                /* harmony tool result: <|start|>functions.NAME to=assistant<|channel|>commentary<|message|>{res}<|end|> + reopen assistant */
+                token_vec tr = {0}; char role[96];
+                snprintf(role, sizeof role, "functions.%s to=assistant", name);
+                token_vec_push(&tr, T_START); bpe_tokenize_text(vocab, role, &tr);
+                token_vec_push(&tr, T_CHAN);  bpe_tokenize_text(vocab, "commentary", &tr);
+                token_vec_push(&tr, T_MSG);   bpe_tokenize_text(vocab, res ? res : "", &tr);
+                token_vec_push(&tr, T_END);
+                token_vec_push(&tr, T_START); bpe_tokenize_text(vocab, "assistant", &tr);
+                free(res);
+                for (uint32_t i = 0; i < (uint32_t)tr.len && pos < n_ctx - 1u && rc == 0; i++)
+                    if (ds4_gptoss_gpu_forward(g, &desc, tr.v[i], pos++, logits) != 0) rc = 1;
+                token_vec_free(&tr);
+                if (rc) break;
+                free(ans); ans = NULL; free(targs); targs = NULL; tname[0] = '\0';
+                rc = gptoss_gen_turn(g, &desc, vocab, &pos, n_ctx, logits, &ans, tname, sizeof tname, &targs);
+                if (rc) break;
+            }
+            free(hargs);
         }
-        if (dim) fputs(RST, stdout);
+        free(ans); free(targs);
         printf("\n");
         if (pos + 8u >= n_ctx) { printf("\033[2m(context window full — restart to continue)\033[0m\n"); break; }
     }
+    linenoiseFree(line);
+    if (g_winch_pipe[0] >= 0) { close(g_winch_pipe[0]); close(g_winch_pipe[1]); g_winch_pipe[0] = g_winch_pipe[1] = -1; }
     free(logits); ds4_gptoss_gpu_free(g); free(desc.layers);
     return rc;
 }
