@@ -67,6 +67,43 @@ sessions, and open issues including the full trace.
 
 The `ds4-agent` is alpha quality, the project was later added.
 
+## Multi-architecture support (ds4-lite fork)
+
+This fork ([`github.com/bonciarello/ds4-lite`](https://github.com/bonciarello/ds4-lite))
+extends ds4 beyond DeepSeek V4 to run **small/dense and non-DeepSeek models** on the same
+Metal engine, selected automatically from the GGUF `general.architecture`:
+
+- **DeepSeek V4** (PRO/FLASH) — the original MLA+MoE engine.
+- **Dense families**: `qwen2`, `qwen3` (with QK-norm), `llama`, `mistral`, plus a **generic
+  fallback** that runs *any* unlisted llama-style transformer with no per-arch code.
+- **gemma-3** (`gemma3`): 4 norms/layer, QK-norm, GeGLU, sliding-window.
+- **qwen3_next** (`qwen3next`): hybrid Gated-DeltaNet + MoE, SSD-streamed.
+- **gpt-oss** (`gpt-oss`): MoE + attention sinks + sliding-window + YaRN + harmony chat/tools.
+- **MoE** on the dense driver: `qwen3moe` (softmax→top-k→renorm routing).
+- **Capability flags** for non-llama deviations: LayerNorm, parallel-residual, GeGLU, non-gated
+  GELU MLP, fused QKV / gate-up tensors, partial rotary, attention/FFN biases — which together
+  run e.g. **phi-3** and **phi-2** end-to-end (byte-exact vs llama.cpp on deterministic prompts).
+
+### Benchmarks (M1 Max, 32 GB, greedy decode, N=64)
+
+`tests/bench_vs_llama.sh` (offline gguf only). Decode is the steady-state metric; **RSS is the
+real RAM load** — far below the on-disk size thanks to zero-copy mmap wrapping (dense) and SSD
+streaming (MoE/>RAM).
+
+| Model | arch / driver | disk | ds4 decode | llama.cpp | ds4/llama | RSS (RAM) |
+|---|---|---:|---:|---:|---:|---:|
+| phi-2 | dense (generic) | 1.7 GB | 28 t/s | 87 | 32% | **0.3 GB** |
+| phi-3-mini | dense (generic) | 2.2 GB | 60 t/s | 74 | 82% | 0.7 GB |
+| qwen2-7B Q4_K_M | dense | 4.4 GB | 39 t/s | 44 | 88% | 3.8 GB |
+| gemma-3-27B Q4_K_M | dense (gemma) | 15.4 GB | 10.6 t/s | 12.0 | 89% | 13.9 GB |
+| gpt-oss-20B Q8_0 | MoE (gpt-oss) | 20.7 GB | 2.6 t/s | — | — | pread |
+| Qwen3-Next-80B Q4_K_M | MoE (qwen3next) | 45.2 GB | 2.8 t/s | *> RAM* | — | **23.5 GB** |
+
+Highlights: dense decode is **82–101 %** of llama.cpp; a **45 GB** model runs on a **32 GB**
+machine via SSD streaming (RSS ≈ 23 GB); small models hold a tiny RSS (phi-2: 0.3 GB resident
+for a 1.7 GB model). The batched prefill (matmul) handles the capability flags too, so phi-2's
+prefill is ~**170 t/s** (vs ~28 token-by-token).
+
 ## More Documentation
 
 If you are looking for very specific things, we have other
