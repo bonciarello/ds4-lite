@@ -76,13 +76,17 @@ Metal engine, selected automatically from the GGUF `general.architecture`:
 - **DeepSeek V4** (PRO/FLASH) — the original MLA+MoE engine.
 - **Dense families**: `qwen2`, `qwen3` (with QK-norm), `llama`, `mistral`, plus a **generic
   fallback** that runs *any* unlisted llama-style transformer with no per-arch code.
-- **gemma-3** (`gemma3`): 4 norms/layer, QK-norm, GeGLU, sliding-window.
+- **gemma-2 / gemma-3** (`gemma2`, `gemma3`): sandwich norms (4/layer), GeGLU, embedding scale,
+  sliding-window; gemma-3 adds QK-norm, gemma-2 adds attention + final logit soft-capping.
 - **qwen3_next** (`qwen3next`): hybrid Gated-DeltaNet + MoE, SSD-streamed.
 - **gpt-oss** (`gpt-oss`): MoE + attention sinks + sliding-window + YaRN + harmony chat/tools.
 - **MoE** on the dense driver: `qwen3moe` (softmax→top-k→renorm routing).
-- **Capability flags** for non-llama deviations: LayerNorm, parallel-residual, GeGLU, non-gated
-  GELU MLP, fused QKV / gate-up tensors, partial rotary, attention/FFN biases — which together
-  run e.g. **phi-3** and **phi-2** end-to-end (byte-exact vs llama.cpp on deterministic prompts).
+- **Capability flags** for non-llama deviations: LayerNorm, parallel-residual (gated on `ffn_norm`
+  presence), GeGLU, non-gated GELU MLP, fused QKV / gate-up tensors, partial rotary, attention/FFN
+  biases — which together run e.g. **phi-3**, **phi-2** and **stablelm-2** end-to-end (byte-exact vs
+  llama.cpp on deterministic prompts).
+- **Weight dtypes**: F32, F16, BF16, Q2_K–Q6_K, Q8_0, IQ2_XXS — matvec kernels numerically validated
+  against an f32 CPU reference (F16/BF16 rel_err ≈ 4e-7).
 
 ### Benchmarks (M1 Max, 32 GB, greedy decode, N=64)
 
@@ -94,6 +98,8 @@ streaming — e.g. ds4's gpt-oss is 26 GB RSS but only **10.7 GB** private).
 
 | Model | arch / driver | disk | ds4 decode | llama decode | ds4 RAM | llama RAM |
 |---|---|---:|---:|---:|---:|---:|
+| stablelm-2-1.6B Q4_K_M | dense (generic) | 1.0 GB | 29 t/s | 167 t/s | 0.4 GB | 1.1 GB |
+| gemma-2-2B Q4_K_M | dense (gemma) | 1.6 GB | 42 t/s | 94 t/s | **0.3 GB** | 1.7 GB |
 | phi-2 | dense (generic) | 1.7 GB | 28 t/s | 87 t/s | **0.3 GB** | 1.8 GB |
 | phi-3-mini | dense (generic) | 2.2 GB | 60 t/s | 74 t/s | 0.7 GB | 2.4 GB |
 | qwen2-7B Q4_K_M | dense | 4.4 GB | 39 t/s | 44 t/s | 3.8 GB | 4.5 GB |
@@ -107,9 +113,11 @@ the model size (gpt-oss 10.7 GB, the 80B Qwen3-Next just **6.4 GB**); decode is 
 rather than OOM it). ds4 runs it anyway via expert streaming.
 
 Highlights:
-- **Dense: as fast as llama, on less RAM.** Decode is **82–101 %** of llama.cpp while the RAM
-  load stays *below* llama's — ds4 zero-copy-wraps the mmap'd weights instead of copying them:
-  phi-2 0.3 vs 1.8 GB, qwen2 3.8 vs 4.5, gemma 13.9 vs 15.6.
+- **Dense: matches llama at 7B+, on less RAM.** For 7B–27B models decode is **82–89 %** of
+  llama.cpp; below that, fixed per-token GPU-dispatch overhead dominates the tiny matmuls, so
+  1–3B models run slower (17–45 %; gemma-2 also uses an unoptimised reference soft-cap attention).
+  RAM stays *below* llama throughout — ds4 zero-copy-wraps the mmap'd weights instead of copying:
+  stablelm 0.4 vs 1.1 GB, gemma-2 0.3 vs 1.7, qwen2 3.8 vs 4.5, gemma-3 13.9 vs 15.6.
 - **MoE: runs what llama can't.** An **80B** model (Qwen3-Next) runs on a **32 GB** machine in a
   **6.4 GB** private footprint — llama.cpp can't load it at all — and gpt-oss-20B fits in 10.7 GB
   vs llama's 20.5. The trade is speed: the streamed path is 2–3 t/s (a resident fast path for
