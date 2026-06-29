@@ -389,6 +389,7 @@ typedef struct {
 
 typedef struct {
     unsigned n_layer, n_embd, n_head, head_dim, n_ff;
+    unsigned pooling;   /* 1 = mean, 2 = CLS (gguf bert.pooling_type) */
     float    eps;
     ds4_dense_wdesc       token_embd, pos_embd, token_types, tok_norm, tok_norm_b;
     ds4_bert_layer_desc  *layers;   /* [n_layer] */

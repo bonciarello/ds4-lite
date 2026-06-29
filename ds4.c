@@ -27036,6 +27036,8 @@ static void build_bert_desc(ds4_bert_model_desc *desc, const ds4_model *model) {
     memset(desc, 0, sizeof(*desc));
     desc->n_layer=DS4_N_LAYER; desc->n_embd=DS4_N_EMBD; desc->n_head=DS4_N_HEAD;
     desc->head_dim=DS4_N_HEAD_DIM; desc->n_ff=DS4_N_FF; desc->eps=DS4_RMS_EPS;
+    desc->pooling=2;   /* default CLS */
+    model_get_u32_ns(model, "bert", "pooling_type", &desc->pooling);
     desc->token_embd  = dense_wdesc_of(model, required_tensor(model,"token_embd.weight"));
     desc->pos_embd    = dense_wdesc_of(model, required_tensor(model,"position_embd.weight"));
     desc->token_types = dense_wdesc_of(model, required_tensor(model,"token_types.weight"));

@@ -5866,7 +5866,7 @@ void ds4_rwkv7_gpu_free(ds4_rwkv7_gpu *g) {
  * L2-normalize. No KV cache (full attention). Projections (F16) on the GPU; attention /
  * LayerNorm / pooling on the CPU. */
 struct ds4_bert_gpu {
-    uint32_t n_layer, n_embd, n_head, head_dim, n_ff;
+    uint32_t n_layer, n_embd, n_head, head_dim, n_ff, pooling;
     float eps;
     const void **wkey; ds4_gpu_tensor **wbuf; int nw, wcap;
     ds4_gpu_tensor *gA, *gB;
@@ -5898,7 +5898,7 @@ static void bert_layernorm(float *x, const float *w, const float *b, uint32_t n,
 ds4_bert_gpu *ds4_bert_gpu_create(const ds4_bert_model_desc *d){
     if(!g_initialized && !ds4_gpu_init()) return NULL;
     ds4_bert_gpu *g=calloc(1,sizeof(*g)); if(!g) return NULL;
-    g->n_layer=d->n_layer; g->n_embd=d->n_embd; g->n_head=d->n_head; g->head_dim=d->head_dim; g->n_ff=d->n_ff; g->eps=d->eps;
+    g->n_layer=d->n_layer; g->n_embd=d->n_embd; g->n_head=d->n_head; g->head_dim=d->head_dim; g->n_ff=d->n_ff; g->eps=d->eps; g->pooling=d->pooling;
     g->gA=ds4_gpu_tensor_alloc((uint64_t)(d->n_embd>d->n_ff?d->n_embd:d->n_ff)*4);
     g->gB=ds4_gpu_tensor_alloc((uint64_t)(d->n_embd>d->n_ff?d->n_embd:d->n_ff)*4);
     if(!g->gA||!g->gB){ ds4_bert_gpu_free(g); return NULL; }
@@ -5952,8 +5952,8 @@ int ds4_bert_gpu_embed(ds4_bert_gpu *g, const ds4_bert_model_desc *d,
                 bert_layernorm(x,(const float*)L->layer_out_norm.data,(const float*)L->layer_out_norm_b.data,ne,g->eps);
             }
         }
-        /* pool + L2 normalize. bge-small uses CLS pooling (pooling_type=2 = first token); DS4_BERT_MEAN forces mean. */
-        if (getenv("DS4_BERT_MEAN")) { for(uint32_t i=0;i<ne;i++){ double s=0; for(uint32_t m=0;m<M;m++) s+=X[(size_t)m*ne+i]; out_embd[i]=(float)(s/M); } }
+        /* pool (gguf pooling_type: 1=mean, 2=CLS) + L2 normalize */
+        if (g->pooling==1) { for(uint32_t i=0;i<ne;i++){ double s=0; for(uint32_t m=0;m<M;m++) s+=X[(size_t)m*ne+i]; out_embd[i]=(float)(s/M); } }
         else { for(uint32_t i=0;i<ne;i++) out_embd[i]=X[i]; }   /* CLS = first token */
         { double nrm=0; for(uint32_t i=0;i<ne;i++) nrm+=(double)out_embd[i]*out_embd[i]; float inv=1.0f/sqrtf((float)nrm+1e-12f); for(uint32_t i=0;i<ne;i++) out_embd[i]*=inv; }
     done:
