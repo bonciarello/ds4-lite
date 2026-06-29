@@ -4010,7 +4010,10 @@ int ds4_gpu_dense_matvec_verify(int type, const void *wbytes, uint64_t wnbytes,
     if (!g_initialized && !ds4_gpu_init()) return 1;
     const char *kernel = NULL; uint32_t blkbytes = 0;
     float (*cpu_dot)(const uint8_t *, const float *) = NULL;
+    int dense_dtype = 0;   /* 0 = K-quant (256-blocked); 1 = f16 contiguous; 2 = bf16 contiguous */
     switch (type) {
+        case 1:  kernel="kernel_dense_mul_mv_f16_f32";  dense_dtype=1; break;
+        case 30: kernel="kernel_dense_mul_mv_bf16_f32"; dense_dtype=2; break;
         case 10: kernel="kernel_dense_mul_mv_q2_K_f32"; blkbytes=84;  cpu_dot=ds4_q2k_block_dot; break;
         case 11: kernel="kernel_dense_mul_mv_q3_K_f32"; blkbytes=110; cpu_dot=ds4_q3k_block_dot; break;
         case 12: kernel="kernel_dense_mul_mv_q4_K_f32"; blkbytes=144; cpu_dot=ds4_q4k_block_dot; break;
@@ -4018,8 +4021,9 @@ int ds4_gpu_dense_matvec_verify(int type, const void *wbytes, uint64_t wnbytes,
         case 14: kernel="kernel_dense_mul_mv_q6_K_f32"; blkbytes=210; cpu_dot=ds4_q6k_block_dot; break;
         default: return 2;
     }
-    if (in_dim % 256u != 0) return 3;
-    const uint32_t nblk = in_dim / 256u;
+    /* K-quants require 256-aligned in_dim; f16/bf16 are contiguous so any width is fine. */
+    if (!dense_dtype && in_dim % 256u != 0) return 3;
+    const uint32_t nblk = dense_dtype ? 0u : in_dim / 256u;
     ds4_gpu_tensor *Wb = ds4_gpu_tensor_alloc(wnbytes);
     ds4_gpu_tensor *xb = ds4_gpu_tensor_alloc((uint64_t)in_dim * 4);
     ds4_gpu_tensor *ob = ds4_gpu_tensor_alloc((uint64_t)out_dim * 4);
@@ -4041,8 +4045,19 @@ int ds4_gpu_dense_matvec_verify(int type, const void *wbytes, uint64_t wnbytes,
             float maxerr = 0.0f, maxmag = 1.0f;
             for (uint32_t r = 0; r < out_dim; r++) {
                 double acc = 0.0;
-                for (uint32_t b = 0; b < nblk; b++)
-                    acc += cpu_dot(wb + ((size_t)r*nblk + b)*blkbytes, x + (size_t)b*256);
+                if (dense_dtype == 1) {                /* f16: one contiguous row of in_dim halfs */
+                    const __fp16 *wr = (const __fp16 *)wb + (size_t)r * in_dim;
+                    for (uint32_t k = 0; k < in_dim; k++) acc += (double)(float)wr[k] * x[k];
+                } else if (dense_dtype == 2) {         /* bf16: top 16 bits of f32 */
+                    const uint16_t *wr = (const uint16_t *)wb + (size_t)r * in_dim;
+                    for (uint32_t k = 0; k < in_dim; k++) {
+                        uint32_t b = (uint32_t)wr[k] << 16; float f; memcpy(&f, &b, 4);
+                        acc += (double)f * x[k];
+                    }
+                } else {
+                    for (uint32_t b = 0; b < nblk; b++)
+                        acc += cpu_dot(wb + ((size_t)r*nblk + b)*blkbytes, x + (size_t)b*256);
+                }
                 ref[r] = (float)acc;
                 const float e = fabsf(got[r] - ref[r]); if (e > maxerr) maxerr = e;
                 const float m = fabsf(ref[r]); if (m > maxmag) maxmag = m;

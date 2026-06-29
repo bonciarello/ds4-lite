@@ -4094,7 +4094,11 @@ static void config_build_dense_shape(const ds4_model *m, const char *ns) {
         ds4_die("model has more layers than DS4_MAX_LAYER (raise the limit)");
     s.n_embd    = required_u32_ns(m, ns, "embedding_length");
     s.n_head    = required_u32_ns(m, ns, "attention.head_count");
-    s.n_head_kv = required_u32_ns(m, ns, "attention.head_count_kv");
+    /* head_count_kv is optional: absent means MHA (n_head_kv == n_head, no GQA).
+     * llama.cpp applies the same default; some archs (stablelm, several llama
+     * variants) omit the key precisely because they don't use grouped-query. */
+    if (!model_get_u32_ns(m, ns, "attention.head_count_kv", &s.n_head_kv) || s.n_head_kv == 0)
+        s.n_head_kv = s.n_head;
     s.n_ff      = required_u32_ns(m, ns, "feed_forward_length");
 
     /* head_dim is optional in GGUF; default to n_embd/n_head when absent. */
