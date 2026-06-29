@@ -159,6 +159,7 @@ typedef enum {
     DS4_ARCH_GPTOSS    = 4,  /* gpt-oss: MoE (top-4/32) + GQA + attention sinks + sliding-window + YaRN + MXFP4 */
     DS4_ARCH_GEMMA2    = 5,  /* like gemma3 but NO QK-norm + logit soft-capping (attn 50, final 30), SWA every other layer */
     DS4_ARCH_MAMBA     = 6,  /* state-space model: selective scan + causal conv, no attention/KV cache */
+    DS4_ARCH_RWKV7     = 7,  /* RWKV-7 (Goose): linear-attention delta-rule recurrence + channel mix, no attention */
 } ds4_arch_family;
 
 typedef struct {
@@ -383,6 +384,7 @@ DS4_MAYBE_UNUSED static inline bool ds4_arch_is_qwen3next(void) { return DS4_ARC
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma3(void) { return DS4_ARCH == DS4_ARCH_GEMMA3; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma2(void) { return DS4_ARCH == DS4_ARCH_GEMMA2; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_mamba(void) { return DS4_ARCH == DS4_ARCH_MAMBA; }
+DS4_MAYBE_UNUSED static inline bool ds4_arch_is_rwkv7(void) { return DS4_ARCH == DS4_ARCH_RWKV7; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gptoss(void) { return DS4_ARCH == DS4_ARCH_GPTOSS; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_moe(void)     { return DS4_N_EXPERT != 0; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_mla(void)     { return DS4_N_LORA_Q != 0; }
@@ -4303,13 +4305,33 @@ static void config_build_mamba_shape(const ds4_model *m) {
     g_ds4_shape = s;
 }
 
+/* rwkv7 (general.architecture == "rwkv7"): RWKV-7 "Goose" — linear-attention with a delta-rule
+ * recurrence + channel mixing, no attention/KV. Shape carries n_layer/n_embd/n_vocab; the WKV
+ * head size, FFN size and the LoRA ranks (decay/iclr/gate/value-residual) are read at desc build. */
+static void config_build_rwkv7_shape(const ds4_model *m) {
+    const char *ns = "rwkv7";
+    ds4_shape s; memset(&s, 0, sizeof(s));
+    s.arch = DS4_ARCH_RWKV7; s.meta_ns = ns; s.name = "rwkv7";
+    model_get_u32_ns(m, ns, "block_count",      &s.n_layer);
+    model_get_u32_ns(m, ns, "embedding_length", &s.n_embd);
+    if (!model_get_u32_ns(m, ns, "vocab_size", &s.n_vocab) || s.n_vocab == 0) {
+        ds4_array_ref tokens;
+        if (model_get_array(m, "tokenizer.ggml.tokens", &tokens)) s.n_vocab = (uint32_t)tokens.len;
+    }
+    model_get_u32_ns(m, ns, "feed_forward_length", &s.n_ff);
+    model_get_u32_ns(m, ns, "wkv.head_size",        &s.ssm_state_size);   /* reuse: WKV head size */
+    model_get_f32_ns(m, ns, "attention.layer_norm_epsilon", &s.rms_eps);
+    if (s.rms_eps == 0.0f) s.rms_eps = 1e-5f;
+    g_ds4_shape = s;
+}
+
 /* Generic dense fallback: an UNKNOWN architecture (not one with its own shape builder / driver —
  * deepseek4, qwen3next, gemma3, gpt-oss) that exposes the standard dense metadata (`<arch>.block_count`)
  * is run on the plain dense driver. Covers the long tail of small llama-style transformers without a
  * per-arch builder. Returns true + fills `ns` (the arch as a C string) when applicable. */
 static bool ds4_is_generic_dense(const ds4_model *m, ds4_str arch, char *ns, size_t ns_cap) {
     if (arch.len == 0 || ds4_str_eq_cstr(arch, "qwen3next") || ds4_str_eq_cstr(arch, "gpt-oss") ||
-        ds4_str_eq_cstr(arch, "gemma3") || ds4_str_eq_cstr(arch, "mamba"))
+        ds4_str_eq_cstr(arch, "gemma3") || ds4_str_eq_cstr(arch, "mamba") || ds4_str_eq_cstr(arch, "rwkv7"))
         return false;
     size_t n = arch.len < ns_cap - 1 ? arch.len : ns_cap - 1;
     memcpy(ns, arch.ptr, n); ns[n] = '\0';
@@ -4348,6 +4370,10 @@ static void config_validate_model(const ds4_model *m) {
     }
     if (ds4_str_eq_cstr(arch, "mamba")) {            /* state-space model — selective scan, no attention */
         config_build_mamba_shape(m);
+        return;
+    }
+    if (ds4_str_eq_cstr(arch, "rwkv7")) {            /* RWKV-7 — delta-rule linear attention, no KV */
+        config_build_rwkv7_shape(m);
         return;
     }
     if (ds4_str_eq_cstr(arch, "gpt-oss")) {          /* MoE + sinks + sliding-window + YaRN (Phase 0: shape only) */
