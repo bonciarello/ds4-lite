@@ -378,6 +378,29 @@ int ds4_rwkv7_gpu_forward(ds4_rwkv7_gpu *g, const ds4_rwkv7_model_desc *desc,
                           int token, unsigned pos, float *logits);
 int ds4_rwkv7_generate(const char *model_path, const char *prompt, int n_predict,
                        char *err, size_t errlen);
+
+/* ---- BERT (encoder-only, bidirectional) — embedding model, no LM head ------- */
+typedef struct {
+    ds4_dense_wdesc attn_q, attn_q_b, attn_k, attn_k_b, attn_v, attn_v_b;
+    ds4_dense_wdesc attn_out, attn_out_b, attn_out_norm, attn_out_norm_b;   /* post-attn LayerNorm */
+    ds4_dense_wdesc ffn_up, ffn_up_b, ffn_down, ffn_down_b;
+    ds4_dense_wdesc layer_out_norm, layer_out_norm_b;                       /* post-FFN LayerNorm */
+} ds4_bert_layer_desc;
+
+typedef struct {
+    unsigned n_layer, n_embd, n_head, head_dim, n_ff;
+    float    eps;
+    ds4_dense_wdesc       token_embd, pos_embd, token_types, tok_norm, tok_norm_b;
+    ds4_bert_layer_desc  *layers;   /* [n_layer] */
+} ds4_bert_model_desc;
+
+typedef struct ds4_bert_gpu ds4_bert_gpu;
+ds4_bert_gpu *ds4_bert_gpu_create(const ds4_bert_model_desc *desc);
+void ds4_bert_gpu_free(ds4_bert_gpu *g);
+/* Encode M tokens -> mean-pooled, L2-normalized embedding [n_embd]. 0 on success. */
+int ds4_bert_gpu_embed(ds4_bert_gpu *g, const ds4_bert_model_desc *desc,
+                       const int *tokens, uint32_t n_tokens, float *out_embd);
+int ds4_bert_embed(const char *model_path, const char *prompt, char *err, size_t errlen);
 /* Load a qwen3_next model and greedily generate n_predict tokens (EXPERIMENTAL). */
 int ds4_q3n_generate(const char *model_path, const char *prompt, int n_predict,
                      char *err, size_t errlen);

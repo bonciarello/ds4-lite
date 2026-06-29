@@ -1475,6 +1475,16 @@ static cli_config parse_options(int argc, char **argv) {
             if (rc != 0) fprintf(stderr, "ds4: qwen3_next generate failed: %s\n", st_err);
             exit(rc == 0 ? 0 : 1);
         }
+        if (!strcmp(arg, "--metal-bert-embed")) {
+            /* BERT sentence embedding. Args: MODEL "ids:N,N,.." (WordPiece tokenizer TODO). */
+            const char *mp = (i + 1 < argc) ? argv[++i] : NULL;
+            const char *pr = (i + 1 < argc) ? argv[++i] : NULL;
+            if (!mp || !pr) { fprintf(stderr, "ds4: --metal-bert-embed needs MODEL \"ids:..\"\n"); exit(1); }
+            char st_err[256] = {0};
+            const int rc = ds4_bert_embed(mp, pr, st_err, sizeof(st_err));
+            if (rc != 0) fprintf(stderr, "ds4: bert embed failed: %s\n", st_err);
+            exit(rc == 0 ? 0 : 1);
+        }
         if (!strcmp(arg, "--metal-rwkv7-generate")) {
             /* RWKV-7 greedy generation. Args: MODEL "ids:N,N,..." [NPRED] (trie tokenizer TODO). */
             const char *mp = (i + 1 < argc) ? argv[++i] : NULL;

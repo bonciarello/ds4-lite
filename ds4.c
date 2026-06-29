@@ -160,6 +160,7 @@ typedef enum {
     DS4_ARCH_GEMMA2    = 5,  /* like gemma3 but NO QK-norm + logit soft-capping (attn 50, final 30), SWA every other layer */
     DS4_ARCH_MAMBA     = 6,  /* state-space model: selective scan + causal conv, no attention/KV cache */
     DS4_ARCH_RWKV7     = 7,  /* RWKV-7 (Goose): linear-attention delta-rule recurrence + channel mix, no attention */
+    DS4_ARCH_BERT      = 8,  /* BERT encoder-only: bidirectional attention, learned pos/type embeddings, embedding output */
 } ds4_arch_family;
 
 typedef struct {
@@ -385,6 +386,7 @@ DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma3(void) { return DS4_ARCH =
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma2(void) { return DS4_ARCH == DS4_ARCH_GEMMA2; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_mamba(void) { return DS4_ARCH == DS4_ARCH_MAMBA; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_rwkv7(void) { return DS4_ARCH == DS4_ARCH_RWKV7; }
+DS4_MAYBE_UNUSED static inline bool ds4_arch_is_bert(void) { return DS4_ARCH == DS4_ARCH_BERT; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gptoss(void) { return DS4_ARCH == DS4_ARCH_GPTOSS; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_moe(void)     { return DS4_N_EXPERT != 0; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_mla(void)     { return DS4_N_LORA_Q != 0; }
@@ -4325,13 +4327,33 @@ static void config_build_rwkv7_shape(const ds4_model *m) {
     g_ds4_shape = s;
 }
 
+/* bert (general.architecture == "bert"): encoder-only bidirectional transformer (embedding model). */
+static void config_build_bert_shape(const ds4_model *m) {
+    const char *ns = "bert";
+    ds4_shape s; memset(&s, 0, sizeof(s));
+    s.arch = DS4_ARCH_BERT; s.meta_ns = ns; s.name = "bert";
+    model_get_u32_ns(m, ns, "block_count",          &s.n_layer);
+    model_get_u32_ns(m, ns, "embedding_length",     &s.n_embd);
+    model_get_u32_ns(m, ns, "attention.head_count", &s.n_head);
+    model_get_u32_ns(m, ns, "feed_forward_length",  &s.n_ff);
+    if (!model_get_u32_ns(m, ns, "vocab_size", &s.n_vocab) || s.n_vocab == 0) {
+        ds4_array_ref tokens;
+        if (model_get_array(m, "tokenizer.ggml.tokens", &tokens)) s.n_vocab = (uint32_t)tokens.len;
+    }
+    s.n_head_dim = s.n_head ? s.n_embd / s.n_head : 0;
+    model_get_f32_ns(m, ns, "attention.layer_norm_epsilon", &s.rms_eps);
+    if (s.rms_eps == 0.0f) s.rms_eps = 1e-12f;
+    g_ds4_shape = s;
+}
+
 /* Generic dense fallback: an UNKNOWN architecture (not one with its own shape builder / driver —
  * deepseek4, qwen3next, gemma3, gpt-oss) that exposes the standard dense metadata (`<arch>.block_count`)
  * is run on the plain dense driver. Covers the long tail of small llama-style transformers without a
  * per-arch builder. Returns true + fills `ns` (the arch as a C string) when applicable. */
 static bool ds4_is_generic_dense(const ds4_model *m, ds4_str arch, char *ns, size_t ns_cap) {
     if (arch.len == 0 || ds4_str_eq_cstr(arch, "qwen3next") || ds4_str_eq_cstr(arch, "gpt-oss") ||
-        ds4_str_eq_cstr(arch, "gemma3") || ds4_str_eq_cstr(arch, "mamba") || ds4_str_eq_cstr(arch, "rwkv7"))
+        ds4_str_eq_cstr(arch, "gemma3") || ds4_str_eq_cstr(arch, "mamba") || ds4_str_eq_cstr(arch, "rwkv7") ||
+        ds4_str_eq_cstr(arch, "bert"))
         return false;
     size_t n = arch.len < ns_cap - 1 ? arch.len : ns_cap - 1;
     memcpy(ns, arch.ptr, n); ns[n] = '\0';
@@ -4374,6 +4396,10 @@ static void config_validate_model(const ds4_model *m) {
     }
     if (ds4_str_eq_cstr(arch, "rwkv7")) {            /* RWKV-7 — delta-rule linear attention, no KV */
         config_build_rwkv7_shape(m);
+        return;
+    }
+    if (ds4_str_eq_cstr(arch, "bert")) {             /* BERT encoder-only — bidirectional, embedding output */
+        config_build_bert_shape(m);
         return;
     }
     if (ds4_str_eq_cstr(arch, "gpt-oss")) {          /* MoE + sinks + sliding-window + YaRN (Phase 0: shape only) */
@@ -27003,6 +27029,54 @@ int ds4_rwkv7_generate(const char *model_path, const char *prompt, int n_predict
     free(logits); ds4_rwkv7_gpu_free(g); free(desc.layers);
     token_vec_free(&toks); vocab_free(&vocab); model_close(&model);
     if (rc && errlen && !err[0]) snprintf(err,errlen,"rwkv7 forward failed");
+    return rc;
+}
+
+static void build_bert_desc(ds4_bert_model_desc *desc, const ds4_model *model) {
+    memset(desc, 0, sizeof(*desc));
+    desc->n_layer=DS4_N_LAYER; desc->n_embd=DS4_N_EMBD; desc->n_head=DS4_N_HEAD;
+    desc->head_dim=DS4_N_HEAD_DIM; desc->n_ff=DS4_N_FF; desc->eps=DS4_RMS_EPS;
+    desc->token_embd  = dense_wdesc_of(model, required_tensor(model,"token_embd.weight"));
+    desc->pos_embd    = dense_wdesc_of(model, required_tensor(model,"position_embd.weight"));
+    desc->token_types = dense_wdesc_of(model, required_tensor(model,"token_types.weight"));
+    desc->tok_norm    = dense_wdesc_of(model, required_tensor(model,"token_embd_norm.weight"));
+    desc->tok_norm_b  = dense_wdesc_of(model, required_tensor(model,"token_embd_norm.bias"));
+    desc->layers = xcalloc(desc->n_layer, sizeof(desc->layers[0]));
+    for (uint32_t il=0; il<desc->n_layer; il++) {
+        ds4_bert_layer_desc *L=&desc->layers[il];
+        #define BT(field,name) L->field = dense_wdesc_of(model, required_tensorf(model, "blk.%u." name, il))
+        BT(attn_q,"attn_q.weight"); BT(attn_q_b,"attn_q.bias");
+        BT(attn_k,"attn_k.weight"); BT(attn_k_b,"attn_k.bias");
+        BT(attn_v,"attn_v.weight"); BT(attn_v_b,"attn_v.bias");
+        BT(attn_out,"attn_output.weight"); BT(attn_out_b,"attn_output.bias");
+        BT(attn_out_norm,"attn_output_norm.weight"); BT(attn_out_norm_b,"attn_output_norm.bias");
+        BT(ffn_up,"ffn_up.weight"); BT(ffn_up_b,"ffn_up.bias");
+        BT(ffn_down,"ffn_down.weight"); BT(ffn_down_b,"ffn_down.bias");
+        BT(layer_out_norm,"layer_output_norm.weight"); BT(layer_out_norm_b,"layer_output_norm.bias");
+        #undef BT
+    }
+}
+
+/* BERT sentence embedding. Prompt is "ids:N,N,..." (WordPiece tokenizer TODO); prints the mean-pooled,
+ * L2-normalized embedding so it can be compared (cosine) to llama-embedding. */
+int ds4_bert_embed(const char *model_path, const char *prompt, char *err, size_t errlen) {
+    ds4_model model;
+    model_open(&model, model_path, false, true);
+    config_validate_model(&model);
+    if (!ds4_arch_is_bert()) { if(errlen)snprintf(err,errlen,"not a bert model"); model_close(&model); return 1; }
+    token_vec toks={0};
+    const char *p=prompt?prompt:"";
+    if (strncmp(p,"ids:",4)==0){ p+=4; while(*p){ token_vec_push(&toks,(int)strtol(p,(char**)&p,10)); if(*p==',')p++; else break; } }
+    if (toks.len==0){ if(errlen)snprintf(err,errlen,"bert needs prompt 'ids:N,N,...' (WordPiece tokenizer TODO)"); model_close(&model); return 1; }
+    ds4_bert_model_desc desc; build_bert_desc(&desc,&model);
+    ds4_bert_gpu *g=ds4_bert_gpu_create(&desc);
+    if(!g){ if(errlen)snprintf(err,errlen,"bert GPU create failed"); free(desc.layers); token_vec_free(&toks); model_close(&model); return 1; }
+    float *emb=xmalloc((size_t)DS4_N_EMBD*sizeof(float));
+    int rc=ds4_bert_gpu_embed(g,&desc,toks.v,(uint32_t)toks.len,emb);
+    if (rc==0){ printf("=== ds4 bert embedding (dim %u) ===\n",(unsigned)DS4_N_EMBD);
+        for (uint32_t i=0;i<DS4_N_EMBD;i++) printf("%.6f ", emb[i]); printf("\n"); }
+    free(emb); ds4_bert_gpu_free(g); free(desc.layers); token_vec_free(&toks); model_close(&model);
+    if (rc && errlen && !err[0]) snprintf(err,errlen,"bert embed failed");
     return rc;
 }
 

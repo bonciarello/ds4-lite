@@ -5860,6 +5860,114 @@ void ds4_rwkv7_gpu_free(ds4_rwkv7_gpu *g) {
     free(g->prev_time); free(g->prev_chan); free(g->wkv); free(g->cpu); free(g);
 }
 
+/* ===== BERT (encoder-only, bidirectional) embedding driver ================= *
+ * Processes the whole sequence at once: token+position+type embeddings -> LayerNorm ->
+ * N layers of [bidirectional self-attention, post-LN; GELU FFN, post-LN] -> mean-pool ->
+ * L2-normalize. No KV cache (full attention). Projections (F16) on the GPU; attention /
+ * LayerNorm / pooling on the CPU. */
+struct ds4_bert_gpu {
+    uint32_t n_layer, n_embd, n_head, head_dim, n_ff;
+    float eps;
+    const void **wkey; ds4_gpu_tensor **wbuf; int nw, wcap;
+    ds4_gpu_tensor *gA, *gB;
+};
+static ds4_gpu_tensor *bert_w(ds4_bert_gpu *g, const ds4_dense_wdesc *W) {
+    for (int i=0;i<g->nw;i++) if (g->wkey[i]==W->data) return g->wbuf[i];
+    if (g->nw==g->wcap){ g->wcap=g->wcap?g->wcap*2:64; g->wkey=realloc(g->wkey,(size_t)g->wcap*sizeof(void*)); g->wbuf=realloc(g->wbuf,(size_t)g->wcap*sizeof(void*)); }
+    ds4_gpu_tensor *t=ds4_gpu_tensor_alloc(W->bytes); if(t) ds4_gpu_tensor_write(t,0,W->data,W->bytes);
+    g->wkey[g->nw]=W->data; g->wbuf[g->nw]=t; g->nw++; return t;
+}
+/* out += W @ in + bias (the projection has a bias). F32 weight -> CPU, else GPU. */
+static bool bert_mm(ds4_bert_gpu *g, const ds4_dense_wdesc *W, const ds4_dense_wdesc *bias,
+                    const float *in, uint32_t in_dim, float *out, uint32_t out_dim) {
+    if (W->type==0) { const float *w=(const float*)W->data;
+        for (uint32_t o=0;o<out_dim;o++){ const float *wr=w+(size_t)o*in_dim; double acc=0; for(uint32_t i=0;i<in_dim;i++) acc+=(double)wr[i]*in[i]; out[o]=(float)acc; } }
+    else { ds4_gpu_tensor *Wb=bert_w(g,W); if(!Wb) return false;
+        ds4_gpu_tensor_write(g->gA,0,in,(uint64_t)in_dim*4);
+        if(!mamba_matvec(Wb,W->type,g->gA,g->gB,in_dim,out_dim)) return false;
+        ds4_gpu_tensor_read(g->gB,0,out,(uint64_t)out_dim*4); }
+    if (bias && bias->data){ const float *b=(const float*)bias->data; for(uint32_t o=0;o<out_dim;o++) out[o]+=b[o]; }
+    return true;
+}
+static inline float bert_gelu(float x){ return 0.5f*x*(1.0f+erff(x*0.7071067811865476f)); }   /* exact (erf) GELU, as BERT */
+static void bert_layernorm(float *x, const float *w, const float *b, uint32_t n, float eps){
+    double m=0; for(uint32_t i=0;i<n;i++) m+=x[i]; m/=n; double v=0; for(uint32_t i=0;i<n;i++){double d=x[i]-m; v+=d*d;} v/=n;
+    float inv=1.0f/sqrtf((float)v+eps); for(uint32_t i=0;i<n;i++) x[i]=((float)(x[i]-m))*inv*w[i]+b[i];
+}
+
+ds4_bert_gpu *ds4_bert_gpu_create(const ds4_bert_model_desc *d){
+    if(!g_initialized && !ds4_gpu_init()) return NULL;
+    ds4_bert_gpu *g=calloc(1,sizeof(*g)); if(!g) return NULL;
+    g->n_layer=d->n_layer; g->n_embd=d->n_embd; g->n_head=d->n_head; g->head_dim=d->head_dim; g->n_ff=d->n_ff; g->eps=d->eps;
+    g->gA=ds4_gpu_tensor_alloc((uint64_t)(d->n_embd>d->n_ff?d->n_embd:d->n_ff)*4);
+    g->gB=ds4_gpu_tensor_alloc((uint64_t)(d->n_embd>d->n_ff?d->n_embd:d->n_ff)*4);
+    if(!g->gA||!g->gB){ ds4_bert_gpu_free(g); return NULL; }
+    return g;
+}
+
+int ds4_bert_gpu_embed(ds4_bert_gpu *g, const ds4_bert_model_desc *d,
+                       const int *tokens, uint32_t M, float *out_embd){
+    @autoreleasepool {
+        const uint32_t ne=g->n_embd, nh=g->n_head, hd=g->head_dim, nff=g->n_ff;
+        const float scale=1.0f/sqrtf((float)hd);
+        float *X=malloc((size_t)M*ne*4), *Q=malloc((size_t)M*ne*4), *K=malloc((size_t)M*ne*4),
+              *V=malloc((size_t)M*ne*4), *ctx=malloc((size_t)M*ne*4), *tmp=malloc((size_t)(ne>nff?ne:nff)*4),
+              *ff=malloc((size_t)nff*4), *sc=malloc((size_t)M*4);
+        int rc=0;
+        if(!X||!Q||!K||!V||!ctx||!tmp||!ff||!sc){ rc=2; goto done; }
+        /* embeddings: tok + pos + type[0], then LayerNorm */
+        { const float *typ=(const float*)d->token_types.data;   /* [ne,2]; row 0 = segment 0 */
+          for (uint32_t m=0;m<M;m++){ float *x=X+(size_t)m*ne;
+              if(!ds4_dense_embed_row(d->token_embd.type,d->token_embd.data,(uint32_t)tokens[m],ne,x)){ rc=2; goto done; }
+              float prow[1024]; (void)prow;
+              if(!ds4_dense_embed_row(d->pos_embd.type,d->pos_embd.data,m,ne,tmp)){ rc=2; goto done; }
+              for(uint32_t i=0;i<ne;i++) x[i]+=tmp[i]+typ[i];   /* token + position + type(segment 0) */
+              bert_layernorm(x,(const float*)d->tok_norm.data,(const float*)d->tok_norm_b.data,ne,g->eps);
+          } }
+        for (uint32_t il=0; il<g->n_layer; il++){
+            const ds4_bert_layer_desc *L=&d->layers[il];
+            for (uint32_t m=0;m<M;m++){ float *x=X+(size_t)m*ne;
+                if(!bert_mm(g,&L->attn_q,&L->attn_q_b,x,ne,Q+(size_t)m*ne,ne)||
+                   !bert_mm(g,&L->attn_k,&L->attn_k_b,x,ne,K+(size_t)m*ne,ne)||
+                   !bert_mm(g,&L->attn_v,&L->attn_v_b,x,ne,V+(size_t)m*ne,ne)){ rc=1; goto done; }
+            }
+            /* bidirectional attention (per head, per query over all keys) */
+            for (uint32_t m=0;m<M;m++){ float *cx=ctx+(size_t)m*ne;
+                for (uint32_t h=0;h<nh;h++){ const float *qh=Q+(size_t)m*ne+h*hd;
+                    float mx=-1e30f;
+                    for(uint32_t j=0;j<M;j++){ const float *kh=K+(size_t)j*ne+h*hd; float dot=0; for(uint32_t dd=0;dd<hd;dd++) dot+=qh[dd]*kh[dd]; sc[j]=dot*scale; if(sc[j]>mx)mx=sc[j]; }
+                    double sum=0; for(uint32_t j=0;j<M;j++){ sc[j]=expf(sc[j]-mx); sum+=sc[j]; }
+                    float inv=(float)(1.0/sum);
+                    for(uint32_t dd=0;dd<hd;dd++){ float acc=0; for(uint32_t j=0;j<M;j++) acc+=sc[j]*V[(size_t)j*ne+h*hd+dd]; cx[h*hd+dd]=acc*inv; }
+                }
+            }
+            for (uint32_t m=0;m<M;m++){ float *x=X+(size_t)m*ne;
+                if(!bert_mm(g,&L->attn_out,&L->attn_out_b,ctx+(size_t)m*ne,ne,tmp,ne)){ rc=1; goto done; }
+                for(uint32_t i=0;i<ne;i++) x[i]+=tmp[i];
+                bert_layernorm(x,(const float*)L->attn_out_norm.data,(const float*)L->attn_out_norm_b.data,ne,g->eps);
+                if(!bert_mm(g,&L->ffn_up,&L->ffn_up_b,x,ne,ff,nff)){ rc=1; goto done; }
+                for(uint32_t i=0;i<nff;i++) ff[i]=bert_gelu(ff[i]);
+                if(!bert_mm(g,&L->ffn_down,&L->ffn_down_b,ff,nff,tmp,ne)){ rc=1; goto done; }
+                for(uint32_t i=0;i<ne;i++) x[i]+=tmp[i];
+                bert_layernorm(x,(const float*)L->layer_out_norm.data,(const float*)L->layer_out_norm_b.data,ne,g->eps);
+            }
+        }
+        /* pool + L2 normalize. bge-small uses CLS pooling (pooling_type=2 = first token); DS4_BERT_MEAN forces mean. */
+        if (getenv("DS4_BERT_MEAN")) { for(uint32_t i=0;i<ne;i++){ double s=0; for(uint32_t m=0;m<M;m++) s+=X[(size_t)m*ne+i]; out_embd[i]=(float)(s/M); } }
+        else { for(uint32_t i=0;i<ne;i++) out_embd[i]=X[i]; }   /* CLS = first token */
+        { double nrm=0; for(uint32_t i=0;i<ne;i++) nrm+=(double)out_embd[i]*out_embd[i]; float inv=1.0f/sqrtf((float)nrm+1e-12f); for(uint32_t i=0;i<ne;i++) out_embd[i]*=inv; }
+    done:
+        free(X);free(Q);free(K);free(V);free(ctx);free(tmp);free(ff);free(sc);
+        return rc;
+    }
+}
+
+void ds4_bert_gpu_free(ds4_bert_gpu *g){
+    if(!g) return;
+    for(int i=0;i<g->nw;i++) ds4_gpu_tensor_free(g->wbuf[i]);
+    free(g->wkey); free(g->wbuf); ds4_gpu_tensor_free(g->gA); ds4_gpu_tensor_free(g->gB); free(g);
+}
+
 /* ===== gpt-oss forward driver ============================================== */
 struct ds4_gptoss_gpu {
     uint32_t n_layer, n_embd, n_vocab, n_ctx, n_head, n_kv, head_dim, n_rot, qd, kvd, nff, n_expert, n_expert_used, n_swa;
