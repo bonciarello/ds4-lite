@@ -26459,13 +26459,14 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
     {
         const char *arch = g_ds4_shape.name ? g_ds4_shape.name : "";
         desc->ffn_geglu = (strcmp(arch, "gemma2") == 0);
-        const bool arch_parallel = (strcmp(arch, "gptneox") == 0 || strcmp(arch, "phi2") == 0 ||
-                                    strcmp(arch, "stablelm") == 0 || strcmp(arch, "persimmon") == 0);
-        /* Parallel residual is only taken when the arch has NO separate ffn_norm: with one
-         * present (e.g. stablelm-2), llama.cpp ignores use_parallel_residual and runs the
-         * standard sequential graph — attn residual, then ffn_norm, then FFN. Gating on the
-         * bound ffn_norm tensor matches that exactly (phi-2/gptneox have none -> parallel). */
-        desc->parallel_residual = arch_parallel && (weights->layer[0].ffn_norm == NULL);
+        /* Genuinely-parallel archs (x = inpL + attn + ffn): gptneox, phi2, persimmon. NB stablelm
+         * sets use_parallel_residual too, but with a separate ffn_norm llama.cpp ignores the flag and
+         * runs the SEQUENTIAL graph — so stablelm is NOT here. Among the parallel archs, gptneox/
+         * persimmon feed the FFN from a SECOND norm on the layer input (ffn_norm), while phi-2 has no
+         * ffn_norm and feeds the FFN from the attention input norm; the forward picks per layer on
+         * ffn_norm presence. */
+        desc->parallel_residual = (strcmp(arch, "gptneox") == 0 || strcmp(arch, "phi2") == 0 ||
+                                   strcmp(arch, "persimmon") == 0);
         /* ALiBi positional bias instead of RoPE (bloom, mpt, jais). NB falcon uses RoPE, so it is
          * NOT here. When set, the dense forward skips RoPE and the attention adds the per-head
          * linear bias. bloom also has a post-embedding LayerNorm (token_embd_norm). */

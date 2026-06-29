@@ -5451,10 +5451,17 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
             if (ok) {
                 ds4_gpu_tensor *ffn_out = NULL;
                 if (d->parallel_residual) {
-                    /* phi-2 / GPT-NeoX: attn and FFN both read the SAME input norm (g->h); x += attn + ffn. */
-                    ok = dense_ffn(g, d, L, g->h, &ffn_out, nff)
-                      && dense_add(g->x, g->o, ne)
-                      && dense_add(g->x, ffn_out, ne);
+                    /* Parallel residual: x += attn + ffn, both from the layer input (g->x still holds it).
+                     * gptneox/persimmon feed the FFN from a separate ffn_norm(inpL); phi-2 has none and
+                     * reuses the attention input norm (g->h). */
+                    ds4_gpu_tensor *ffn_in = g->h;
+                    if (L->ffn_norm.data) {
+                        ok = dense_norm(g, g->h2, g->x, &L->ffn_norm, &L->ffn_norm_bias, ne, eps);
+                        ffn_in = g->h2;
+                    }
+                    ok = ok && dense_ffn(g, d, L, ffn_in, &ffn_out, nff)
+                            && dense_add(g->x, g->o, ne)
+                            && dense_add(g->x, ffn_out, ne);
                 } else {
                     /* sequential (llama / qwen / qwen3moe): x += attn, then FFN from norm(x). */
                     ok = dense_add(g->x, g->o, ne)
@@ -6112,9 +6119,14 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
               && dense_matmul_w(g, &L->attn_out, attb, Ob, M)
               && dense_bias_batch(g, Ob, &L->attn_out_bias, ne, M);   /* attn_out bias (phi-2) */
             if (ok) {
-                if (d->parallel_residual) {                          /* phi-2: attn + ffn both from the input norm Hb */
-                    ok = dense_ffn_batch(g, d, L, Hb, Fb, gateb, upb, actb, M, ne, nff)
-                      && dense_add(Xb, Ob, M*ne) && dense_add(Xb, Fb, M*ne);
+                if (d->parallel_residual) {                          /* attn + ffn both from the layer input Xb */
+                    /* gptneox/persimmon: FFN from a separate ffn_norm(Xb) (Hb is free post-attention,
+                     * reuse it); phi-2: no ffn_norm, FFN from the attention input norm still in Hb. */
+                    ds4_gpu_tensor *ffn_in = Hb;
+                    if (L->ffn_norm.data)
+                        ok = dense_norm_batch(g, Hb, Xb, &L->ffn_norm, &L->ffn_norm_bias, M, ne, eps);
+                    ok = ok && dense_ffn_batch(g, d, L, ffn_in, Fb, gateb, upb, actb, M, ne, nff)
+                            && dense_add(Xb, Ob, M*ne) && dense_add(Xb, Fb, M*ne);
                 } else {                                             /* sequential: x += attn, then ffn from norm(x) */
                     ok = dense_add(Xb, Ob, M*ne)
                       && dense_norm_batch(g, Hb, Xb, &L->ffn_norm, &L->ffn_norm_bias, M, ne, eps)
