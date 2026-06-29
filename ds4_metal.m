@@ -4372,31 +4372,35 @@ static bool dense_swiglu(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tens
 static bool dense_attn(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *q,
                        ds4_gpu_tensor *kc, ds4_gpu_tensor *vc,
                        uint32_t nh, uint32_t nkv, uint32_t hd, uint32_t nctx, float scale, float softcap) {
-    struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; } a = { nh, nkv, hd, nctx, scale };
     ds4_gpu_tensor *bufs[4] = { q, kc, vc, out };
-    if (softcap > 0.0f) {   /* gemma-2: logit soft-capping -> simdgroup softcap kernel (one simdgroup/head, f16 KV) */
-        struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale, softcap; } sc =
-            { nh, nkv, hd, nctx, scale, softcap };
-        return ds4_gpu_run_grid("kernel_dense_attn_decode_softcap_f32", &sc, sizeof(sc), bufs, 4,
-                                MTLSizeMake(nh, 1, 1), MTLSizeMake(32, 1, 1), "fwd attn softcap");
-    }
-    if (getenv("DS4_ATTN_SCALAR"))  /* A/B: the old 28-thread kernel */
-        return ds4_gpu_run_simple("kernel_dense_attn_decode_f32", &a, sizeof(a), bufs, 4, nh, "fwd attn");
 
     /* Split the KV into chunks for parallelism; combine the partials. Small
      * contexts stay single-simdgroup-per-head (no combine overhead). The chunk
-     * (keys per split) is tunable via DS4_ATTN_CHUNK; smaller = more parallelism. */
+     * (keys per split) is tunable via DS4_ATTN_CHUNK; smaller = more parallelism.
+     * gemma-2 logit soft-capping (softcap>0) rides every path: the single-simdgroup
+     * kernel has a softcap variant, and the split kernel caps each score in-loop. */
     uint32_t chunk_target = 32u;   /* tuned sweet spot (max parallelism vs combine cost) */
     { const char *e = getenv("DS4_ATTN_CHUNK"); if (e && atoi(e) > 0) chunk_target = (uint32_t)atoi(e); }
     uint32_t S = (nctx + chunk_target - 1u) / chunk_target;
     if (S > DS4_ATTN_SPLIT_MAX) S = DS4_ATTN_SPLIT_MAX;
-    if (S <= 1u || getenv("DS4_ATTN_NOSPLIT") || !g->pm)
+
+    if (S <= 1u || getenv("DS4_ATTN_NOSPLIT") || !g->pm) {   /* single simdgroup per head */
+        if (softcap > 0.0f) {
+            struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale, softcap; } sc =
+                { nh, nkv, hd, nctx, scale, softcap };
+            return ds4_gpu_run_grid("kernel_dense_attn_decode_softcap_f32", &sc, sizeof(sc), bufs, 4,
+                                    MTLSizeMake(nh, 1, 1), MTLSizeMake(32, 1, 1), "fwd attn softcap sg");
+        }
+        struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; } a = { nh, nkv, hd, nctx, scale };
+        if (getenv("DS4_ATTN_SCALAR"))  /* A/B: the old 28-thread kernel (no softcap; debug only) */
+            return ds4_gpu_run_simple("kernel_dense_attn_decode_f32", &a, sizeof(a), bufs, 4, nh, "fwd attn");
         return ds4_gpu_run_grid("kernel_dense_attn_decode_f32_sg", &a, sizeof(a), bufs, 4,
                                 MTLSizeMake(nh, 1, 1), MTLSizeMake(32, 1, 1), "fwd attn sg");
+    }
 
     const uint32_t chunk = (nctx + S - 1u) / S;
-    struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx, n_split, chunk; float scale; } sa =
-        { nh, nkv, hd, nctx, S, chunk, scale };
+    struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx, n_split, chunk; float scale, softcap; } sa =
+        { nh, nkv, hd, nctx, S, chunk, scale, softcap };
     ds4_gpu_tensor *split_bufs[6]   = { q, kc, vc, g->pm, g->pl, g->pacc };
     ds4_gpu_tensor *combine_bufs[4] = { g->pm, g->pl, g->pacc, out };
     /* GQA-grouped split (one simdgroup per KV-head -> reads the KV once for the whole group)

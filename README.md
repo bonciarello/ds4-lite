@@ -99,7 +99,7 @@ streaming — e.g. ds4's gpt-oss is 26 GB RSS but only **10.7 GB** private).
 | Model | arch / driver | disk | ds4 decode | llama decode | ds4 RAM | llama RAM |
 |---|---|---:|---:|---:|---:|---:|
 | stablelm-2-1.6B Q4_K_M | dense (generic) | 1.0 GB | 29 t/s | 167 t/s | 0.4 GB | 1.1 GB |
-| gemma-2-2B Q4_K_M | dense (gemma) | 1.6 GB | 42 t/s | 94 t/s | **0.3 GB** | 1.7 GB |
+| gemma-2-2B Q4_K_M | dense (gemma) | 1.6 GB | 59 t/s | 94 t/s | **0.3 GB** | 1.7 GB |
 | phi-2 | dense (generic) | 1.7 GB | 28 t/s | 87 t/s | **0.3 GB** | 1.8 GB |
 | phi-3-mini | dense (generic) | 2.2 GB | 60 t/s | 74 t/s | 0.7 GB | 2.4 GB |
 | qwen2-7B Q4_K_M | dense | 4.4 GB | 39 t/s | 44 t/s | 3.8 GB | 4.5 GB |
@@ -114,10 +114,12 @@ rather than OOM it). ds4 runs it anyway via expert streaming.
 
 Highlights:
 - **Dense: matches llama at 7B+, on less RAM.** For 7B–27B models decode is **82–89 %** of
-  llama.cpp; below that, fixed per-token GPU-dispatch overhead dominates the tiny matmuls, so
-  1–3B models run slower (17–45 %; gemma-2 also uses an unoptimised reference soft-cap attention).
-  RAM stays *below* llama throughout — ds4 zero-copy-wraps the mmap'd weights instead of copying:
-  stablelm 0.4 vs 1.1 GB, gemma-2 0.3 vs 1.7, qwen2 3.8 vs 4.5, gemma-3 13.9 vs 15.6.
+  llama.cpp; below that, fixed per-token GPU-dispatch overhead dominates the tiny matmuls, so the
+  smallest models run a larger fraction behind (stablelm-1.6B 17 %, phi-2 32 %, gemma-2-2B 63 %,
+  phi-3 82 %). RAM stays *below* llama throughout — ds4 zero-copy-wraps the mmap'd weights instead
+  of copying: stablelm 0.4 vs 1.1 GB, gemma-2 0.3 vs 1.7, qwen2 3.8 vs 4.5, gemma-3 13.9 vs 15.6.
+  gemma-2's logit soft-cap attention rides the same split-KV (flash-decoding) path as every other
+  arch, so its decode stays flat as the context grows (≈2.6× the single-simdgroup kernel at 384 tok).
 - **MoE: runs what llama can't.** An **80B** model (Qwen3-Next) runs on a **32 GB** machine in a
   **6.4 GB** private footprint — llama.cpp can't load it at all — and gpt-oss-20B fits in 10.7 GB
   vs llama's 20.5. The trade is speed: the streamed path is 2–3 t/s (a resident fast path for

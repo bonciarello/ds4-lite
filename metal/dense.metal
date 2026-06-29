@@ -2500,6 +2500,7 @@ kernel void kernel_dense_add_bias_batch(
 struct ds4_dense_attn_split_args {
     uint  n_head, n_kv, head_dim, n_ctx, n_split, chunk;
     float scale;
+    float softcap;   /* gemma-2 attn logit soft-cap (0 = off); applied per score before the softmax */
 };
 
 kernel void kernel_dense_attn_decode_split_f32(
@@ -2531,7 +2532,8 @@ kernel void kernel_dense_attn_decode_split_f32(
         device const half * kt = (device const half *)kcache + (ulong)t*kvdim + hkv*hd;
         float p = 0.0f;
         for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) p += qreg[j]*kt[d]; }
-        const float s = simd_sum(p) * a.scale;
+        float s = simd_sum(p) * a.scale;
+        if (a.softcap > 0.0f) s = a.softcap * tanh(clamp(s / a.softcap, -15.0f, 15.0f));
         const float m_new = max(m, s);
         const float corr = exp(m - m_new), pe = exp(s - m_new);
         l = l*corr + pe;
@@ -2613,7 +2615,8 @@ kernel void kernel_dense_attn_decode_split_gqa_f32(
         for (uint g = 0; g < group; g++) {
             float p = 0.0f;
             for (uint j = 0; j < ndl; j++) p += qreg[g][j] * kreg[j];
-            const float s = simd_sum(p) * a.scale;
+            float s = simd_sum(p) * a.scale;
+            if (a.softcap > 0.0f) s = a.softcap * tanh(clamp(s / a.softcap, -15.0f, 15.0f));
             const float mn = max(m[g], s);
             const float corr = exp(m[g] - mn), pe = exp(s - mn);
             l[g] = l[g]*corr + pe;
