@@ -161,6 +161,7 @@ typedef enum {
     DS4_ARCH_MAMBA     = 6,  /* state-space model: selective scan + causal conv, no attention/KV cache */
     DS4_ARCH_RWKV7     = 7,  /* RWKV-7 (Goose): linear-attention delta-rule recurrence + channel mix, no attention */
     DS4_ARCH_BERT      = 8,  /* BERT encoder-only: bidirectional attention, learned pos/type embeddings, embedding output */
+    DS4_ARCH_T5        = 9,  /* T5 encoder-decoder: bidirectional encoder + causal decoder w/ cross-attention, relative pos bias */
 } ds4_arch_family;
 
 typedef struct {
@@ -387,6 +388,7 @@ DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma2(void) { return DS4_ARCH =
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_mamba(void) { return DS4_ARCH == DS4_ARCH_MAMBA; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_rwkv7(void) { return DS4_ARCH == DS4_ARCH_RWKV7; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_bert(void) { return DS4_ARCH == DS4_ARCH_BERT; }
+DS4_MAYBE_UNUSED static inline bool ds4_arch_is_t5(void) { return DS4_ARCH == DS4_ARCH_T5; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gptoss(void) { return DS4_ARCH == DS4_ARCH_GPTOSS; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_moe(void)     { return DS4_N_EXPERT != 0; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_mla(void)     { return DS4_N_LORA_Q != 0; }
@@ -4346,6 +4348,28 @@ static void config_build_bert_shape(const ds4_model *m) {
     g_ds4_shape = s;
 }
 
+/* t5 (general.architecture == "t5"): encoder-decoder. Bidirectional encoder + causal decoder with
+ * cross-attention, RMSNorm, NO biases, attention scale 1.0, and a learned relative-position bias
+ * (shared from layer 0). The driver/desc read the rest (rel buckets, dec layers, dec start token). */
+static void config_build_t5_shape(const ds4_model *m) {
+    const char *ns = "t5";
+    ds4_shape s; memset(&s, 0, sizeof(s));
+    s.arch = DS4_ARCH_T5; s.meta_ns = ns; s.name = "t5";
+    model_get_u32_ns(m, ns, "block_count",          &s.n_layer);
+    model_get_u32_ns(m, ns, "embedding_length",     &s.n_embd);
+    model_get_u32_ns(m, ns, "attention.head_count", &s.n_head);
+    model_get_u32_ns(m, ns, "feed_forward_length",  &s.n_ff);
+    if (!model_get_u32_ns(m, ns, "attention.key_length", &s.n_head_dim) || s.n_head_dim == 0)
+        s.n_head_dim = s.n_head ? s.n_embd / s.n_head : 0;
+    if (!model_get_u32_ns(m, ns, "vocab_size", &s.n_vocab) || s.n_vocab == 0) {
+        ds4_array_ref tokens;
+        if (model_get_array(m, "tokenizer.ggml.tokens", &tokens)) s.n_vocab = (uint32_t)tokens.len;
+    }
+    if (!model_get_f32_ns(m, ns, "attention.layer_norm_rms_epsilon", &s.rms_eps) || s.rms_eps == 0.0f)
+        s.rms_eps = 1e-6f;
+    g_ds4_shape = s;
+}
+
 /* Generic dense fallback: an UNKNOWN architecture (not one with its own shape builder / driver —
  * deepseek4, qwen3next, gemma3, gpt-oss) that exposes the standard dense metadata (`<arch>.block_count`)
  * is run on the plain dense driver. Covers the long tail of small llama-style transformers without a
@@ -4353,7 +4377,7 @@ static void config_build_bert_shape(const ds4_model *m) {
 static bool ds4_is_generic_dense(const ds4_model *m, ds4_str arch, char *ns, size_t ns_cap) {
     if (arch.len == 0 || ds4_str_eq_cstr(arch, "qwen3next") || ds4_str_eq_cstr(arch, "gpt-oss") ||
         ds4_str_eq_cstr(arch, "gemma3") || ds4_str_eq_cstr(arch, "mamba") || ds4_str_eq_cstr(arch, "rwkv7") ||
-        ds4_str_eq_cstr(arch, "bert"))
+        ds4_str_eq_cstr(arch, "bert") || ds4_str_eq_cstr(arch, "t5"))
         return false;
     size_t n = arch.len < ns_cap - 1 ? arch.len : ns_cap - 1;
     memcpy(ns, arch.ptr, n); ns[n] = '\0';
@@ -4400,6 +4424,10 @@ static void config_validate_model(const ds4_model *m) {
     }
     if (ds4_str_eq_cstr(arch, "bert")) {             /* BERT encoder-only — bidirectional, embedding output */
         config_build_bert_shape(m);
+        return;
+    }
+    if (ds4_str_eq_cstr(arch, "t5")) {               /* T5 encoder-decoder — cross-attention, relative pos bias */
+        config_build_t5_shape(m);
         return;
     }
     if (ds4_str_eq_cstr(arch, "gpt-oss")) {          /* MoE + sinks + sliding-window + YaRN (Phase 0: shape only) */
