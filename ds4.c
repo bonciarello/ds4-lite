@@ -158,6 +158,7 @@ typedef enum {
     DS4_ARCH_GEMMA3    = 3,  /* dense transformer + gemma quirks: 4 norms/layer, QK-norm, GeGLU, sliding-window */
     DS4_ARCH_GPTOSS    = 4,  /* gpt-oss: MoE (top-4/32) + GQA + attention sinks + sliding-window + YaRN + MXFP4 */
     DS4_ARCH_GEMMA2    = 5,  /* like gemma3 but NO QK-norm + logit soft-capping (attn 50, final 30), SWA every other layer */
+    DS4_ARCH_MAMBA     = 6,  /* state-space model: selective scan + causal conv, no attention/KV cache */
 } ds4_arch_family;
 
 typedef struct {
@@ -381,6 +382,7 @@ DS4_MAYBE_UNUSED static inline bool ds4_arch_is_deepseek(void) { return DS4_ARCH
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_qwen3next(void) { return DS4_ARCH == DS4_ARCH_QWEN3NEXT; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma3(void) { return DS4_ARCH == DS4_ARCH_GEMMA3; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma2(void) { return DS4_ARCH == DS4_ARCH_GEMMA2; }
+DS4_MAYBE_UNUSED static inline bool ds4_arch_is_mamba(void) { return DS4_ARCH == DS4_ARCH_MAMBA; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gptoss(void) { return DS4_ARCH == DS4_ARCH_GPTOSS; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_moe(void)     { return DS4_N_EXPERT != 0; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_mla(void)     { return DS4_N_LORA_Q != 0; }
@@ -4280,13 +4282,34 @@ static void config_build_gptoss_shape(const ds4_model *m) {
                 (double)s.rms_eps, (unsigned long long)s.rope_orig_ctx);
 }
 
+/* mamba (general.architecture == "mamba"): a state-space model — no attention. Reads the SSM dims
+ * (conv kernel, inner size, state size, dt rank) and runs the dedicated ds4_mamba_gpu driver. */
+static void config_build_mamba_shape(const ds4_model *m) {
+    const char *ns = "mamba";
+    ds4_shape s; memset(&s, 0, sizeof(s));
+    s.arch = DS4_ARCH_MAMBA; s.meta_ns = ns; s.name = "mamba";
+    model_get_u32_ns(m, ns, "block_count",      &s.n_layer);
+    model_get_u32_ns(m, ns, "embedding_length", &s.n_embd);
+    if (!model_get_u32_ns(m, ns, "vocab_size", &s.n_vocab) || s.n_vocab == 0) {
+        ds4_array_ref tokens;
+        if (model_get_array(m, "tokenizer.ggml.tokens", &tokens)) s.n_vocab = (uint32_t)tokens.len;
+    }
+    model_get_u32_ns(m, ns, "ssm.conv_kernel",    &s.ssm_conv_kernel);
+    model_get_u32_ns(m, ns, "ssm.inner_size",     &s.ssm_inner_size);
+    model_get_u32_ns(m, ns, "ssm.state_size",     &s.ssm_state_size);
+    model_get_u32_ns(m, ns, "ssm.time_step_rank", &s.ssm_dt_rank);
+    model_get_f32_ns(m, ns, "attention.layer_norm_rms_epsilon", &s.rms_eps);
+    if (s.rms_eps == 0.0f) s.rms_eps = 1e-5f;
+    g_ds4_shape = s;
+}
+
 /* Generic dense fallback: an UNKNOWN architecture (not one with its own shape builder / driver —
  * deepseek4, qwen3next, gemma3, gpt-oss) that exposes the standard dense metadata (`<arch>.block_count`)
  * is run on the plain dense driver. Covers the long tail of small llama-style transformers without a
  * per-arch builder. Returns true + fills `ns` (the arch as a C string) when applicable. */
 static bool ds4_is_generic_dense(const ds4_model *m, ds4_str arch, char *ns, size_t ns_cap) {
     if (arch.len == 0 || ds4_str_eq_cstr(arch, "qwen3next") || ds4_str_eq_cstr(arch, "gpt-oss") ||
-        ds4_str_eq_cstr(arch, "gemma3"))
+        ds4_str_eq_cstr(arch, "gemma3") || ds4_str_eq_cstr(arch, "mamba"))
         return false;
     size_t n = arch.len < ns_cap - 1 ? arch.len : ns_cap - 1;
     memcpy(ns, arch.ptr, n); ns[n] = '\0';
@@ -4321,6 +4344,10 @@ static void config_validate_model(const ds4_model *m) {
     }
     if (ds4_str_eq_cstr(arch, "gemma2")) {           /* gemma quirks + soft-capping (runs the gemma forward) */
         config_build_gemma2_shape(m);
+        return;
+    }
+    if (ds4_str_eq_cstr(arch, "mamba")) {            /* state-space model — selective scan, no attention */
+        config_build_mamba_shape(m);
         return;
     }
     if (ds4_str_eq_cstr(arch, "gpt-oss")) {          /* MoE + sinks + sliding-window + YaRN (Phase 0: shape only) */
@@ -26744,6 +26771,78 @@ int ds4_q3n_generate(const char *model_path, const char *prompt, int n_predict,
     free(logits); ds4_q3n_gpu_free(g); free(desc.layers);
     token_vec_free(&toks); vocab_free(&vocab); model_close(&model);
     if (rc && errlen && !err[0]) snprintf(err, errlen, "qwen3_next forward failed");
+    return rc;
+}
+
+/* Build the Mamba descriptor by reading the ssm_* tensors directly (the generic dense binding does
+ * not know them). Q8_0 projections become matvec wdescs; the small F32 params (A_log/D/conv/biases/
+ * norms) are wdescs too — the driver reads wdesc.data on the CPU for the conv + scan. */
+static void build_mamba_desc(ds4_mamba_model_desc *desc, const ds4_model *model) {
+    memset(desc, 0, sizeof(*desc));
+    desc->n_layer = DS4_N_LAYER; desc->n_embd = DS4_N_EMBD; desc->n_vocab = DS4_N_VOCAB;
+    desc->d_inner = g_ds4_shape.ssm_inner_size; desc->d_conv = g_ds4_shape.ssm_conv_kernel;
+    desc->d_state = g_ds4_shape.ssm_state_size; desc->dt_rank = g_ds4_shape.ssm_dt_rank;
+    desc->rms_eps = DS4_RMS_EPS;
+    desc->token_embd  = dense_wdesc_of(model, required_tensor(model, "token_embd.weight"));
+    desc->output_norm = dense_wdesc_of(model, required_tensor(model, "output_norm.weight"));
+    ds4_tensor *out = model_find_tensor(model, "output.weight");          /* tied to token_embd if absent */
+    desc->output = dense_wdesc_of(model, out ? out : required_tensor(model, "token_embd.weight"));
+    desc->layers = xcalloc(desc->n_layer, sizeof(desc->layers[0]));
+    for (uint32_t il = 0; il < desc->n_layer; il++) {
+        ds4_mamba_layer_desc *L = &desc->layers[il];
+        L->attn_norm       = dense_wdesc_of(model, required_tensorf(model, "blk.%u.attn_norm.weight", il));
+        L->ssm_in          = dense_wdesc_of(model, required_tensorf(model, "blk.%u.ssm_in.weight", il));
+        L->ssm_x           = dense_wdesc_of(model, required_tensorf(model, "blk.%u.ssm_x.weight", il));
+        L->ssm_dt          = dense_wdesc_of(model, required_tensorf(model, "blk.%u.ssm_dt.weight", il));
+        L->ssm_dt_bias     = dense_wdesc_of(model, required_tensorf(model, "blk.%u.ssm_dt.bias", il));
+        L->ssm_out         = dense_wdesc_of(model, required_tensorf(model, "blk.%u.ssm_out.weight", il));
+        L->ssm_conv1d      = dense_wdesc_of(model, required_tensorf(model, "blk.%u.ssm_conv1d.weight", il));
+        L->ssm_conv1d_bias = dense_wdesc_of(model, required_tensorf(model, "blk.%u.ssm_conv1d.bias", il));
+        L->ssm_a           = dense_wdesc_of(model, required_tensorf(model, "blk.%u.ssm_a", il));
+        L->ssm_d           = dense_wdesc_of(model, required_tensorf(model, "blk.%u.ssm_d", il));
+    }
+}
+
+/* Greedy generation on the Mamba SSM driver (correctness-first: GPU matvec projections + CPU
+ * conv/scan). Validate the greedy continuation vs llama.cpp. */
+int ds4_mamba_generate(const char *model_path, const char *prompt, int n_predict,
+                       char *err, size_t errlen) {
+    ds4_model model; ds4_vocab vocab;
+    model_open(&model, model_path, false, true);
+    config_validate_model(&model);
+    if (!ds4_arch_is_mamba()) { if (errlen) snprintf(err, errlen, "not a mamba model"); model_close(&model); return 1; }
+    vocab_load(&vocab, &model);
+    token_vec toks = {0};
+    bpe_tokenize_text(&vocab, prompt ? prompt : "", &toks);
+    if (toks.len == 0) { if (errlen) snprintf(err, errlen, "empty prompt"); vocab_free(&vocab); model_close(&model); return 1; }
+    ds4_mamba_model_desc desc; build_mamba_desc(&desc, &model);
+    ds4_mamba_gpu *g = ds4_mamba_gpu_create(&desc);
+    if (!g) { if (errlen) snprintf(err, errlen, "mamba GPU create failed"); free(desc.layers); token_vec_free(&toks); vocab_free(&vocab); model_close(&model); return 1; }
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    int rc = 0; uint32_t pos = 0;
+    const double t0 = now_sec();
+    for (uint32_t i = 0; i < (uint32_t)toks.len && rc == 0; i++)
+        if (ds4_mamba_gpu_forward(g, &desc, toks.v[i], pos++, logits) != 0) rc = 1;
+    const double t_pf = now_sec();
+    printf("=== ds4 mamba greedy (%d tokens) ===\n", n_predict);
+    for (uint32_t i = 0; i < (uint32_t)toks.len; i++) dense_print_token(&vocab, toks.v[i]);
+    int n_gen = 0;
+    while (rc == 0 && n_gen < n_predict) {
+        int next = sample_argmax(logits, DS4_N_VOCAB);
+        if (next == vocab.eos_id) break;
+        dense_print_token(&vocab, next); fflush(stdout); n_gen++;
+        if (ds4_mamba_gpu_forward(g, &desc, next, pos++, logits) != 0) { rc = 1; break; }
+    }
+    const double t1 = now_sec();
+    printf("\n");
+    if (rc == 0) {
+        const double pf_s = t_pf - t0, gen_s = t1 - t_pf;
+        fprintf(stderr, "ds4 mamba metrics: prompt=%u tok, prefill %.2f t/s (TTFT %.3f s), gen %.2f t/s (%d tok)\n",
+                (unsigned)toks.len, pf_s > 0 ? toks.len / pf_s : 0.0, pf_s, gen_s > 0 ? n_gen / gen_s : 0.0, n_gen);
+    }
+    free(logits); ds4_mamba_gpu_free(g); free(desc.layers);
+    token_vec_free(&toks); vocab_free(&vocab); model_close(&model);
+    if (rc && errlen && !err[0]) snprintf(err, errlen, "mamba forward failed");
     return rc;
 }
 

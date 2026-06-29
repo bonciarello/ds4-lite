@@ -320,6 +320,35 @@ void ds4_q3n_gpu_free(ds4_q3n_gpu *g);
 /* One-token forward at position pos; writes desc->n_vocab logits. 0 on success. */
 int ds4_q3n_gpu_forward(ds4_q3n_gpu *g, const ds4_q3n_model_desc *desc,
                         int token, unsigned pos, float *logits);
+
+/* ---- Mamba (state-space model; no attention) ----------------------------- *
+ * Each block: rmsnorm -> in_proj -> [x|z]; causal conv1d + SiLU on x; x_proj ->
+ * [dt|B|C]; dt_proj + softplus; selective scan h = exp(dt*A)*h + dt*B*x,
+ * y = C·h + D*x; gate y *= silu(z); out_proj. Recurrent state per layer (conv
+ * window + ssm state), no KV cache. Projections (Q8_0) run on GPU; the small
+ * F32 conv/scan/gate run on CPU. */
+typedef struct {
+    ds4_dense_wdesc attn_norm;                       /* pre-block RMSNorm (F32) */
+    ds4_dense_wdesc ssm_in, ssm_x, ssm_dt, ssm_out;  /* projections (Q8_0) */
+    ds4_dense_wdesc ssm_conv1d, ssm_conv1d_bias;     /* causal conv weight [d_conv,d_inner] + bias (F32) */
+    ds4_dense_wdesc ssm_a, ssm_d, ssm_dt_bias;       /* A_log [d_state,d_inner], D [d_inner], dt bias (F32) */
+} ds4_mamba_layer_desc;
+
+typedef struct {
+    unsigned n_layer, n_embd, n_vocab;
+    unsigned d_inner, d_conv, d_state, dt_rank;
+    float    rms_eps;
+    ds4_dense_wdesc       token_embd, output_norm, output;
+    ds4_mamba_layer_desc *layers;   /* [n_layer] */
+} ds4_mamba_model_desc;
+
+typedef struct ds4_mamba_gpu ds4_mamba_gpu;
+ds4_mamba_gpu *ds4_mamba_gpu_create(const ds4_mamba_model_desc *desc);
+void ds4_mamba_gpu_free(ds4_mamba_gpu *g);
+int ds4_mamba_gpu_forward(ds4_mamba_gpu *g, const ds4_mamba_model_desc *desc,
+                          int token, unsigned pos, float *logits);
+int ds4_mamba_generate(const char *model_path, const char *prompt, int n_predict,
+                       char *err, size_t errlen);
 /* Load a qwen3_next model and greedily generate n_predict tokens (EXPERIMENTAL). */
 int ds4_q3n_generate(const char *model_path, const char *prompt, int n_predict,
                      char *err, size_t errlen);

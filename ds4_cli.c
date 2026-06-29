@@ -1475,6 +1475,17 @@ static cli_config parse_options(int argc, char **argv) {
             if (rc != 0) fprintf(stderr, "ds4: qwen3_next generate failed: %s\n", st_err);
             exit(rc == 0 ? 0 : 1);
         }
+        if (!strcmp(arg, "--metal-mamba-generate")) {
+            /* Mamba (SSM) greedy generation. Args: MODEL PROMPT [NPRED]. */
+            const char *mp = (i + 1 < argc) ? argv[++i] : NULL;
+            const char *pr = (i + 1 < argc) ? argv[++i] : NULL;
+            const int np = (i + 1 < argc) ? atoi(argv[++i]) : 12;
+            if (!mp || !pr) { fprintf(stderr, "ds4: --metal-mamba-generate needs MODEL PROMPT [N]\n"); exit(1); }
+            char st_err[256] = {0};
+            const int rc = ds4_mamba_generate(mp, pr, np, st_err, sizeof(st_err));
+            if (rc != 0) fprintf(stderr, "ds4: mamba generate failed: %s\n", st_err);
+            exit(rc == 0 ? 0 : 1);
+        }
         if (!strcmp(arg, "--metal-gptoss-generate")) {
             /* gpt-oss (Phase 2a: load + bind + report; forward is Phase 2b). Args: MODEL PROMPT [N]. */
             const char *mp = (i + 1 < argc) ? argv[++i] : NULL;

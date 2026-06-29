@@ -4192,6 +4192,17 @@ static bool ds4_dense_embed_row(int type, const void *data, uint32_t token, uint
             for (uint32_t i = 0; i < ne; i++) { uint32_t b = (uint32_t)r[i] << 16; float f; memcpy(&f, &b, 4); out[i] = f; }
             return true;
         }
+        case 8: {  /* Q8_0: 32-element blocks (2-byte f16 scale + 32 int8) */
+            const uint32_t nblk = ne / 32u;
+            const uint8_t *row = (const uint8_t *)data + (size_t)token*nblk*34u;
+            for (uint32_t b = 0; b < nblk; b++) {
+                const uint8_t *blk = row + (size_t)b*34u;
+                __fp16 sh; memcpy(&sh, blk, 2); const float scale = (float)sh;
+                const int8_t *q = (const int8_t *)(blk + 2);
+                for (uint32_t i = 0; i < 32; i++) out[b*32u + i] = scale * (float)q[i];
+            }
+            return true;
+        }
         case 10: case 11: case 12: case 14: {  /* K-quants (256-element blocks) */
             uint32_t bb; void (*deq)(const uint8_t*, float*);
             if      (type==10) { bb=84;  deq=ds4_q2k_dequant_block; }
@@ -5493,6 +5504,186 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
             fprintf(stderr,"   logits: argmax=%d max=%.4f mean=%.4f\n", am, mx, s/d->n_vocab); }
         return 0;
     }
+}
+
+/* ===== Mamba (SSM) forward driver ========================================== *
+ * No attention/KV cache: a selective state-space model. Each layer keeps two recurrent
+ * states — the causal-conv window (conv_state) and the SSM hidden state (ssm_state). The
+ * four projections (Q8_0) run on the GPU matvec; the small F32 conv + scan + gate run on
+ * the CPU (cheap: d_inner*d_state per token). Correctness-first; optimize later. */
+struct ds4_mamba_gpu {
+    uint32_t n_layer, n_embd, n_vocab, d_inner, d_conv, d_state, dt_rank;
+    float rms_eps;
+    ds4_gpu_tensor **w_in, **w_x, **w_dt, **w_out;   /* [n_layer] cached Q8_0 projection weights on GPU */
+    ds4_gpu_tensor *w_output;                        /* output projection (tied embeddings) */
+    ds4_gpu_tensor *gA, *gB;                         /* matvec scratch: gA = input, gB = output */
+    float *conv_state;  /* [n_layer][d_conv][d_inner] sliding window of post-in_proj x */
+    float *ssm_state;   /* [n_layer][d_inner][d_state] */
+    float *cpu;         /* one scratch block: h,xz,x,z,xdbl,dt,y,resid */
+};
+
+static bool mamba_matvec(ds4_gpu_tensor *Wb, int type, ds4_gpu_tensor *x, ds4_gpu_tensor *out,
+                         uint32_t in_dim, uint32_t out_dim) {
+    struct __attribute__((packed)) { uint32_t in_dim, out_dim; } qa = { in_dim, out_dim };
+    ds4_gpu_tensor *bufs[3] = { Wb, x, out };
+    uint32_t nr0 = 2;
+    const char *sg = dense_kquant_sg_kernel(type, &nr0);
+    if (sg) return ds4_gpu_run_kquant_sg(sg, &qa, sizeof(qa), bufs, out_dim, nr0, 2u, "mamba mv");
+    const char *k = dense_kquant_kernel(type);
+    if (k) return ds4_gpu_run_simple(k, &qa, sizeof(qa), bufs, 3, out_dim, "mamba mv");
+    return false;   /* mamba projections are Q8_0; f32 not expected here */
+}
+
+/* One projection matvec. Quantized/F16 weights run on the GPU (upload in -> gA, matvec -> gB,
+ * read out); F32 weights (mamba keeps ssm_x / ssm_dt in F32 — their row dims don't block-quantize)
+ * run a small CPU matvec from W->data. ggml layout: out[o] = sum_i W[i + o*in_dim] * in[i]. */
+static bool mamba_proj(ds4_mamba_gpu *g, const ds4_dense_wdesc *W, ds4_gpu_tensor *Wb,
+                       const float *in, uint32_t in_dim, float *out, uint32_t out_dim) {
+    if (W->type == 0) {                                  /* F32 weight -> CPU matvec */
+        const float *w = (const float *)W->data;
+        for (uint32_t o = 0; o < out_dim; o++) {
+            const float *wr = w + (size_t)o*in_dim;
+            double acc = 0.0;
+            for (uint32_t i = 0; i < in_dim; i++) acc += (double)wr[i] * in[i];
+            out[o] = (float)acc;
+        }
+        return true;
+    }
+    ds4_gpu_tensor_write(g->gA, 0, in, (uint64_t)in_dim*4);
+    if (!mamba_matvec(Wb, W->type, g->gA, g->gB, in_dim, out_dim)) return false;
+    ds4_gpu_tensor_read(g->gB, 0, out, (uint64_t)out_dim*4);
+    return true;
+}
+
+static ds4_gpu_tensor *mamba_upload_weight(const ds4_dense_wdesc *w) {
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(w->bytes);
+    if (t) ds4_gpu_tensor_write(t, 0, w->data, w->bytes);
+    return t;
+}
+
+ds4_mamba_gpu *ds4_mamba_gpu_create(const ds4_mamba_model_desc *d) {
+    if (!g_initialized && !ds4_gpu_init()) return NULL;
+    ds4_mamba_gpu *g = calloc(1, sizeof(*g));
+    if (!g) return NULL;
+    g->n_layer=d->n_layer; g->n_embd=d->n_embd; g->n_vocab=d->n_vocab;
+    g->d_inner=d->d_inner; g->d_conv=d->d_conv; g->d_state=d->d_state; g->dt_rank=d->dt_rank;
+    g->rms_eps=d->rms_eps;
+    g->w_in =calloc(d->n_layer,sizeof(void*)); g->w_x  =calloc(d->n_layer,sizeof(void*));
+    g->w_dt =calloc(d->n_layer,sizeof(void*)); g->w_out=calloc(d->n_layer,sizeof(void*));
+    bool ok = g->w_in && g->w_x && g->w_dt && g->w_out;
+    for (uint32_t il=0; ok && il<d->n_layer; il++) {
+        const ds4_mamba_layer_desc *L=&d->layers[il];
+        g->w_in[il] =mamba_upload_weight(&L->ssm_in);
+        g->w_x[il]  =mamba_upload_weight(&L->ssm_x);
+        g->w_dt[il] =mamba_upload_weight(&L->ssm_dt);
+        g->w_out[il]=mamba_upload_weight(&L->ssm_out);
+        ok = g->w_in[il]&&g->w_x[il]&&g->w_dt[il]&&g->w_out[il];
+    }
+    g->w_output = mamba_upload_weight(&d->output);
+    const uint32_t max_in  = d->n_embd > d->d_inner ? d->n_embd : d->d_inner;
+    const uint32_t max_out = d->n_vocab;
+    g->gA = ds4_gpu_tensor_alloc((uint64_t)max_in*4);
+    g->gB = ds4_gpu_tensor_alloc((uint64_t)max_out*4);
+    g->conv_state = calloc((size_t)d->n_layer*d->d_conv*d->d_inner, sizeof(float));
+    g->ssm_state  = calloc((size_t)d->n_layer*d->d_inner*d->d_state, sizeof(float));
+    /* CPU scratch: h(n_embd) xz(2*d_inner) x(d_inner) z(d_inner) xdbl(dt_rank+2*d_state) dt(d_inner) y(d_inner) resid(n_embd) */
+    g->cpu = calloc((size_t)(d->n_embd + 2*d->d_inner + d->d_inner + d->d_inner +
+                             (d->dt_rank+2*d->d_state) + d->d_inner + d->d_inner + d->n_embd), sizeof(float));
+    if (!ok || !g->w_output || !g->gA || !g->gB || !g->conv_state || !g->ssm_state || !g->cpu) {
+        ds4_mamba_gpu_free(g); return NULL;
+    }
+    return g;
+}
+
+static inline float mamba_softplus(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
+static inline float mamba_silu(float x)     { return x / (1.0f + expf(-x)); }
+
+int ds4_mamba_gpu_forward(ds4_mamba_gpu *g, const ds4_mamba_model_desc *d,
+                          int token, unsigned pos, float *logits) {
+    (void)pos;
+    @autoreleasepool {
+        const uint32_t ne=g->n_embd, di=g->d_inner, dc=g->d_conv, ds=g->d_state, dr=g->dt_rank;
+        const uint32_t xdbl_n = dr + 2*ds;
+        /* CPU scratch slices */
+        float *h=g->cpu, *xz=h+ne, *xv=xz+2*di, *zv=xv+di, *xdbl=zv+di, *dtv=xdbl+xdbl_n, *yv=dtv+di, *resid=yv+di;
+        /* embedding (Q8_0) -> resid (the residual stream lives on the CPU) */
+        if (!ds4_dense_embed_row(d->token_embd.type, d->token_embd.data, (uint32_t)token, ne, resid)) return 2;
+
+        for (uint32_t il=0; il<g->n_layer; il++) {
+            const ds4_mamba_layer_desc *L=&d->layers[il];
+            const float *an = (const float*)L->attn_norm.data;          /* RMSNorm weight */
+            const float *Aw = (const float*)L->ssm_a.data;              /* A_log [d_state, d_inner] */
+            const float *Dw = (const float*)L->ssm_d.data;              /* D [d_inner] */
+            const float *cw = (const float*)L->ssm_conv1d.data;         /* conv [d_conv, d_inner] (channel-major) */
+            const float *cb = (const float*)L->ssm_conv1d_bias.data;    /* conv bias [d_inner] */
+            const float *dtb= (const float*)L->ssm_dt_bias.data;        /* dt bias [d_inner] */
+            float *cs = g->conv_state + (size_t)il*dc*di;
+            float *ss = g->ssm_state  + (size_t)il*di*ds;
+
+            /* 1) RMSNorm(resid) -> h */
+            double ss2=0; for (uint32_t i=0;i<ne;i++) ss2+=(double)resid[i]*resid[i];
+            const float rms = 1.0f/sqrtf((float)(ss2/ne)+g->rms_eps);
+            for (uint32_t i=0;i<ne;i++) h[i]=resid[i]*rms*an[i];
+
+            /* 2) in_proj -> [x|z] */
+            if (!mamba_proj(g, &L->ssm_in, g->w_in[il], h, ne, xz, 2*di)) return 1;
+            memcpy(xv, xz, (size_t)di*4); memcpy(zv, xz+di, (size_t)di*4);
+
+            /* 3) causal conv1d (shift in x, dot with kernel) + SiLU, per channel */
+            for (uint32_t dd=0; dd<di; dd++) {                /* cs[k][dd] = cs[k*di+dd] (oldest..newest) */
+                for (uint32_t k=0;k<dc-1;k++) cs[(size_t)k*di+dd]=cs[(size_t)(k+1)*di+dd];
+                cs[(size_t)(dc-1)*di+dd]=xv[dd];
+                float c=cb[dd];
+                for (uint32_t k=0;k<dc;k++) c += cw[(size_t)dd*dc+k]*cs[(size_t)k*di+dd];
+                xv[dd]=mamba_silu(c);
+            }
+
+            /* 4) x_proj -> [dt_part | B | C] */
+            if (!mamba_proj(g, &L->ssm_x, g->w_x[il], xv, di, xdbl, xdbl_n)) return 1;
+            const float *Bv = xdbl + dr, *Cv = xdbl + dr + ds;
+
+            /* 5) dt = softplus(dt_proj(dt_part) + dt_bias) */
+            if (!mamba_proj(g, &L->ssm_dt, g->w_dt[il], xdbl, dr, dtv, di)) return 1;
+            for (uint32_t dd=0; dd<di; dd++) dtv[dd]=mamba_softplus(dtv[dd]+dtb[dd]);
+
+            /* 6) selective scan: ss[d,n] = exp(dt*A)*ss + dt*B*x ; y = C·ss + D*x */
+            for (uint32_t dd=0; dd<di; dd++) {
+                const float dt=dtv[dd], x=xv[dd];
+                float y=0.0f; float *srow=ss+(size_t)dd*ds; const float *Arow=Aw+(size_t)dd*ds;
+                for (uint32_t n=0;n<ds;n++) {
+                    const float A=Arow[n];   /* gguf ssm_a is already A = -exp(A_log) (negative); use directly */
+                    srow[n]=expf(dt*A)*srow[n] + dt*Bv[n]*x;
+                    y += Cv[n]*srow[n];
+                }
+                yv[dd] = (y + Dw[dd]*x) * mamba_silu(zv[dd]);   /* 7) gate */
+            }
+
+            /* 8) out_proj, add to the residual stream */
+            if (!mamba_proj(g, &L->ssm_out, g->w_out[il], yv, di, h, ne)) return 1;
+            for (uint32_t i=0;i<ne;i++) resid[i]+=h[i];
+        }
+
+        /* final RMSNorm + output projection */
+        const float *on=(const float*)d->output_norm.data;
+        double ss2=0; for (uint32_t i=0;i<ne;i++) ss2+=(double)resid[i]*resid[i];
+        const float rms=1.0f/sqrtf((float)(ss2/ne)+g->rms_eps);
+        for (uint32_t i=0;i<ne;i++) h[i]=resid[i]*rms*on[i];
+        if (!mamba_proj(g, &d->output, g->w_output, h, ne, logits, g->n_vocab)) return 1;
+        return 0;
+    }
+}
+
+void ds4_mamba_gpu_free(ds4_mamba_gpu *g) {
+    if (!g) return;
+    for (uint32_t il=0; il<g->n_layer; il++) {
+        if (g->w_in)  ds4_gpu_tensor_free(g->w_in[il]);
+        if (g->w_x)   ds4_gpu_tensor_free(g->w_x[il]);
+        if (g->w_dt)  ds4_gpu_tensor_free(g->w_dt[il]);
+        if (g->w_out) ds4_gpu_tensor_free(g->w_out[il]);
+    }
+    free(g->w_in); free(g->w_x); free(g->w_dt); free(g->w_out);
+    ds4_gpu_tensor_free(g->w_output); ds4_gpu_tensor_free(g->gA); ds4_gpu_tensor_free(g->gB);
+    free(g->conv_state); free(g->ssm_state); free(g->cpu); free(g);
 }
 
 /* ===== gpt-oss forward driver ============================================== */
