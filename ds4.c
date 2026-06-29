@@ -22787,6 +22787,7 @@ typedef enum {
     DS4_PRETOK_SPM   = 2,   /* SentencePiece (llama/gemma): score-driven merge, no BPE merges */
     DS4_PRETOK_GPT4O = 3,   /* o200k / gpt-4o (gpt-oss): case-aware letters, \p{N}{1,3} */
     DS4_PRETOK_RWKV  = 4,   /* RWKV world: byte-level greedy longest-match over the (unescaped) vocab */
+    DS4_PRETOK_BERT  = 5,   /* BERT WordPiece: lowercase + punctuation split + greedy ## subwords */
 } ds4_pretok;
 
 struct ds4_vocab {
@@ -23429,7 +23430,51 @@ static void rwkv_tokenize_text(const ds4_vocab *vocab, const char *text, token_v
     }
 }
 
+/* BERT WordPiece: greedy longest-match per word, with "##" continuation subwords; the whole word
+ * becomes [UNK] if any remainder can't be matched. */
+static int bert_is_punct(unsigned c) {
+    return (c>=33&&c<=47)||(c>=58&&c<=64)||(c>=91&&c<=96)||(c>=123&&c<=126);
+}
+static void bert_wordpiece(const ds4_vocab *v, const char *w, size_t wl, token_vec *out) {
+    if (wl==0) return;
+    if (wl>500) { token_vec_push(out, v->unk_id); return; }   /* BERT also [UNK]s very long words */
+    /* This gguf's vocab is SentencePiece-style: word-/punct-initial tokens carry a leading
+     * U+2581 (▁, bytes E2 96 81); continuation subwords are raw. Prepend ▁ to the piece, then
+     * greedy longest-match over the bytes. */
+    char buf[524]; buf[0]=(char)0xE2; buf[1]=(char)0x96; buf[2]=(char)0x81;
+    memcpy(buf+3, w, wl); const size_t n = wl+3;
+    int subs[524], nsub=0, ok=1; size_t start=0;
+    while (start<n) {
+        int found=-1; size_t fend=0;
+        for (size_t end=n; end>start; end--) {
+            int id;
+            if (table_get(&v->token_to_id, buf+start, (uint64_t)(end-start), &id)) { found=id; fend=end; break; }
+        }
+        if (found<0) { ok=0; break; }
+        subs[nsub++]=found; start=fend;
+    }
+    if (ok) { for (int i=0;i<nsub;i++) token_vec_push(out, subs[i]); }
+    else token_vec_push(out, v->unk_id);
+}
+static void bert_tokenize_text(const ds4_vocab *v, const char *text, token_vec *out) {
+    token_vec_push(out, v->bos_id);   /* [CLS] */
+    char word[520]; size_t wl=0;
+    for (const unsigned char *p=(const unsigned char*)text; *p; p++) {
+        unsigned c=*p;
+        if (c==' '||c=='\t'||c=='\n'||c=='\r'||c==0x0c||c==0x0b) { if(wl){bert_wordpiece(v,word,wl,out); wl=0;} continue; }
+        if (bert_is_punct(c)) { if(wl){bert_wordpiece(v,word,wl,out); wl=0;} char pc=(char)c; bert_wordpiece(v,&pc,1,out); continue; }
+        if (c>='A'&&c<='Z') c=c-'A'+'a';   /* lowercase (uncased BERT) */
+        if (wl<sizeof(word)) word[wl++]=(char)c;
+    }
+    if (wl) bert_wordpiece(v,word,wl,out);
+    token_vec_push(out, v->eos_id);   /* [SEP] */
+}
+
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    if (vocab->pre_type == DS4_PRETOK_BERT) {
+        bert_tokenize_text(vocab, text, out);
+        return;
+    }
     if (vocab->pre_type == DS4_PRETOK_RWKV) {
         rwkv_tokenize_text(vocab, text, out);
         return;
@@ -23551,6 +23596,7 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     model_get_string(model, "tokenizer.ggml.model", &tmodel);
     const bool is_spm  = ds4_str_eq_cstr(tmodel, "llama");
     const bool is_rwkv = ds4_str_eq_cstr(tmodel, "rwkv");
+    const bool is_bert = ds4_str_eq_cstr(tmodel, "bert");
 
     vocab->n_vocab = (int)tokens.len;
     vocab->token = xcalloc((size_t)vocab->n_vocab, sizeof(vocab->token[0]));
@@ -23592,6 +23638,9 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     if (is_rwkv) {
         table_init(&vocab->merge_rank, 1);    /* no merges; byte-level greedy match */
         vocab->pre_type = DS4_PRETOK_RWKV;
+    } else if (is_bert) {
+        table_init(&vocab->merge_rank, 1);    /* no merges; WordPiece */
+        vocab->pre_type = DS4_PRETOK_BERT;
     } else if (is_spm) {
         /* SPM: load the per-token merge scores; no BPE merge table. */
         ds4_array_ref scores;
@@ -27062,22 +27111,24 @@ static void build_bert_desc(ds4_bert_model_desc *desc, const ds4_model *model) {
 /* BERT sentence embedding. Prompt is "ids:N,N,..." (WordPiece tokenizer TODO); prints the mean-pooled,
  * L2-normalized embedding so it can be compared (cosine) to llama-embedding. */
 int ds4_bert_embed(const char *model_path, const char *prompt, char *err, size_t errlen) {
-    ds4_model model;
+    ds4_model model; ds4_vocab vocab;
     model_open(&model, model_path, false, true);
     config_validate_model(&model);
     if (!ds4_arch_is_bert()) { if(errlen)snprintf(err,errlen,"not a bert model"); model_close(&model); return 1; }
+    vocab_load(&vocab, &model);
     token_vec toks={0};
     const char *p=prompt?prompt:"";
     if (strncmp(p,"ids:",4)==0){ p+=4; while(*p){ token_vec_push(&toks,(int)strtol(p,(char**)&p,10)); if(*p==',')p++; else break; } }
-    if (toks.len==0){ if(errlen)snprintf(err,errlen,"bert needs prompt 'ids:N,N,...' (WordPiece tokenizer TODO)"); model_close(&model); return 1; }
+    else bert_tokenize_text(&vocab, p, &toks);
+    if (toks.len==0){ if(errlen)snprintf(err,errlen,"empty prompt"); vocab_free(&vocab); model_close(&model); return 1; }
     ds4_bert_model_desc desc; build_bert_desc(&desc,&model);
     ds4_bert_gpu *g=ds4_bert_gpu_create(&desc);
-    if(!g){ if(errlen)snprintf(err,errlen,"bert GPU create failed"); free(desc.layers); token_vec_free(&toks); model_close(&model); return 1; }
+    if(!g){ if(errlen)snprintf(err,errlen,"bert GPU create failed"); free(desc.layers); token_vec_free(&toks); vocab_free(&vocab); model_close(&model); return 1; }
     float *emb=xmalloc((size_t)DS4_N_EMBD*sizeof(float));
     int rc=ds4_bert_gpu_embed(g,&desc,toks.v,(uint32_t)toks.len,emb);
     if (rc==0){ printf("=== ds4 bert embedding (dim %u) ===\n",(unsigned)DS4_N_EMBD);
         for (uint32_t i=0;i<DS4_N_EMBD;i++) printf("%.6f ", emb[i]); printf("\n"); }
-    free(emb); ds4_bert_gpu_free(g); free(desc.layers); token_vec_free(&toks); model_close(&model);
+    free(emb); ds4_bert_gpu_free(g); free(desc.layers); token_vec_free(&toks); vocab_free(&vocab); model_close(&model);
     if (rc && errlen && !err[0]) snprintf(err,errlen,"bert embed failed");
     return rc;
 }
