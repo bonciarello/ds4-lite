@@ -3200,6 +3200,8 @@ typedef struct {
     ds4_tensor *output_hc_scale;
     ds4_tensor *output_norm;
     ds4_tensor *output_norm_bias;   /* LayerNorm beta for the final norm; NULL on RMSNorm */
+    ds4_tensor *tok_norm;           /* post-embedding LayerNorm (bloom word_embeddings_layernorm); NULL if absent */
+    ds4_tensor *tok_norm_bias;
     ds4_tensor *output;
     ds4_layer_weights layer[DS4_MAX_LAYER];
 } ds4_weights;
@@ -4588,6 +4590,9 @@ static void weights_bind_output_dense(ds4_weights *w, const ds4_model *m,
                                        : model_find_tensor(m, "token_embd.weight");
     w->output_norm = required_tensor(m, "output_norm.weight");
     w->output_norm_bias = model_find_tensor(m, "output_norm.bias");   /* LayerNorm beta (optional) */
+    /* bloom: a LayerNorm on the embeddings before the first layer (word_embeddings_layernorm). */
+    w->tok_norm      = model_find_tensor(m, "token_embd_norm.weight");
+    w->tok_norm_bias = model_find_tensor(m, "token_embd_norm.bias");
     /* Some dense models tie embeddings: no separate output.weight, reuse embd. */
     w->output = model_find_tensor(m, "output.weight");
     if (!w->output && require_output) w->output = w->token_embd;
@@ -26461,7 +26466,13 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
          * standard sequential graph — attn residual, then ffn_norm, then FFN. Gating on the
          * bound ffn_norm tensor matches that exactly (phi-2/gptneox have none -> parallel). */
         desc->parallel_residual = arch_parallel && (weights->layer[0].ffn_norm == NULL);
+        /* ALiBi positional bias instead of RoPE (bloom, mpt, jais). NB falcon uses RoPE, so it is
+         * NOT here. When set, the dense forward skips RoPE and the attention adds the per-head
+         * linear bias. bloom also has a post-embedding LayerNorm (token_embd_norm). */
+        desc->alibi = (strcmp(arch, "bloom") == 0 || strcmp(arch, "mpt") == 0 || strcmp(arch, "jais") == 0);
     }
+    desc->tok_norm      = dense_wdesc_of(model, weights->tok_norm);
+    desc->tok_norm_bias = dense_wdesc_of(model, weights->tok_norm_bias);
     /* gemma3: dense transformer with gemma quirks. Embedding scaling, attention
      * scale on query_pre_attn_scalar (= n_embd/n_head for the 27B), GeGLU, per-head
      * QK-norm, 4 norms/layer, and sliding-window attention with a separate RoPE base

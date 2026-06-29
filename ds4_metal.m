@@ -4371,8 +4371,9 @@ static bool dense_swiglu(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tens
 
 static bool dense_attn(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *q,
                        ds4_gpu_tensor *kc, ds4_gpu_tensor *vc,
-                       uint32_t nh, uint32_t nkv, uint32_t hd, uint32_t nctx, float scale, float softcap) {
+                       uint32_t nh, uint32_t nkv, uint32_t hd, uint32_t nctx, float scale, float softcap, int alibi) {
     ds4_gpu_tensor *bufs[4] = { q, kc, vc, out };
+    const uint32_t ali = alibi ? 1u : 0u;   /* ALiBi linear-bias attention (bloom/mpt/falcon; no RoPE) */
 
     /* Split the KV into chunks for parallelism; combine the partials. Small
      * contexts stay single-simdgroup-per-head (no combine overhead). The chunk
@@ -4391,16 +4392,17 @@ static bool dense_attn(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *q,
             return ds4_gpu_run_grid("kernel_dense_attn_decode_softcap_f32", &sc, sizeof(sc), bufs, 4,
                                     MTLSizeMake(nh, 1, 1), MTLSizeMake(32, 1, 1), "fwd attn softcap sg");
         }
-        struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; } a = { nh, nkv, hd, nctx, scale };
-        if (getenv("DS4_ATTN_SCALAR"))  /* A/B: the old 28-thread kernel (no softcap; debug only) */
+        struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; uint32_t alibi; } a =
+            { nh, nkv, hd, nctx, scale, ali };
+        if (getenv("DS4_ATTN_SCALAR"))  /* A/B: the old 28-thread kernel (no softcap/alibi; debug only) */
             return ds4_gpu_run_simple("kernel_dense_attn_decode_f32", &a, sizeof(a), bufs, 4, nh, "fwd attn");
         return ds4_gpu_run_grid("kernel_dense_attn_decode_f32_sg", &a, sizeof(a), bufs, 4,
                                 MTLSizeMake(nh, 1, 1), MTLSizeMake(32, 1, 1), "fwd attn sg");
     }
 
     const uint32_t chunk = (nctx + S - 1u) / S;
-    struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx, n_split, chunk; float scale, softcap; } sa =
-        { nh, nkv, hd, nctx, S, chunk, scale, softcap };
+    struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx, n_split, chunk; float scale, softcap; uint32_t alibi; } sa =
+        { nh, nkv, hd, nctx, S, chunk, scale, softcap, ali };
     ds4_gpu_tensor *split_bufs[6]   = { q, kc, vc, g->pm, g->pl, g->pacc };
     ds4_gpu_tensor *combine_bufs[4] = { g->pm, g->pl, g->pacc, out };
     /* GQA-grouped split (one simdgroup per KV-head -> reads the KV once for the whole group)
@@ -4457,7 +4459,7 @@ static bool dense_kv_write(ds4_dense_gpu *g, ds4_dense_kv_layer *kv, uint32_t ws
 }
 /* Attention over the first n_attn cache slots [0, n_attn). */
 static bool dense_kv_read_attn(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_dense_kv_layer *kv,
-                               uint32_t nh, uint32_t nkv, uint32_t hd, uint32_t n_attn, float scale, float softcap) {
+                               uint32_t nh, uint32_t nkv, uint32_t hd, uint32_t n_attn, float scale, float softcap, int alibi) {
     const uint32_t kvd = nkv*hd;
     if (g->kv_int8) {
         /* int8 KV path has no softcap variant; gemma-2 (the only softcap user) runs f16 KV by default. */
@@ -4471,7 +4473,7 @@ static bool dense_kv_read_attn(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_te
     }
     ds4_gpu_tensor *kc = ds4_gpu_tensor_view(kv->k, 0, (uint64_t)n_attn*kvd*2);
     ds4_gpu_tensor *vc = ds4_gpu_tensor_view(kv->v, 0, (uint64_t)n_attn*kvd*2);
-    bool ok = kc && vc && dense_attn(g, out, q, kc, vc, nh, nkv, hd, n_attn, scale, softcap);
+    bool ok = kc && vc && dense_attn(g, out, q, kc, vc, nh, nkv, hd, n_attn, scale, softcap, alibi);
     ds4_gpu_tensor_free(kc); ds4_gpu_tensor_free(vc);
     return ok;
 }
@@ -4921,7 +4923,7 @@ static bool q3n_layer_full_attn(ds4_q3n_gpu *g, const ds4_q3n_model_desc *d,
     if (batch) g_batch_serialize = true;
     struct __attribute__((packed)) { uint32_t nh, hd; } sp = { nh, hd };
     struct __attribute__((packed)) { uint32_t nh, hd; float eps; } qa = { nh, hd, eps }, ka = { nkv, hd, eps };
-    struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; } at = { nh, nkv, hd, pos+1u, scale };
+    struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; uint32_t alibi; } at = { nh, nkv, hd, pos+1u, scale, 0u };  /* q3n: no ALiBi */
     ds4_gpu_tensor *sb[3]={g->q_full,g->q,g->gate}, *qb[3]={g->q,qn,g->q}, *kb[3]={g->k,kn,g->k};
     ds4_gpu_tensor *ab[4]={g->q,g->kc[il],g->vc[il],g->att}, *gb[3]={g->att,g->gate,g->att};
     bool ok = q3n_rms(g, g->h, g->x, &L->attn_norm, ne, eps)
@@ -5298,7 +5300,7 @@ static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d
               && gemma_rope(g->q, nh,  hd, nrot, pos, rbase, rscale)
               && gemma_rope(g->k, nkv, hd, nrot, pos, rbase, rscale)
               && dense_kv_write(g, kv, wslot, kvd)                                  /* f16 or int8 + scale */
-              && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv, hd, n_attn, scale, d->attn_softcap)
+              && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv, hd, n_attn, scale, d->attn_softcap, 0)
               && dense_matvec(g, &L->attn_out, g->att, g->o)
               && gemma_rms(g, g->h, g->o, &L->attn_post_norm, ne, eps)
               && dense_add(g->x, g->h, ne)
@@ -5418,6 +5420,10 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
             if (!ds4_gpu_begin_commands()) { g_batch_serialize = false; return 1; }
         }
         bool ok = true;
+        /* bloom: LayerNorm on the embeddings before the first layer (in-place; LayerNorm is
+         * two-pass-read-then-write so out==x is safe). */
+        if (d->tok_norm.data)
+            ok = dense_norm(g, g->x, g->x, &d->tok_norm, &d->tok_norm_bias, ne, eps);
         for (uint32_t il = 0; ok && il < d->n_layer; il++) {
             const ds4_dense_layer_desc *L = &d->layers[il];
             ds4_dense_kv_layer *kv = &g->kv[il];
@@ -5434,10 +5440,11 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
               /* QK-norm (qwen3-style): per-head RMSNorm on q/k before RoPE, only if the model has it. */
               && (L->attn_q_norm.data ? gemma_qk_norm(g, g->q, &L->attn_q_norm, nh,  hd, eps) : true)
               && (L->attn_k_norm.data ? gemma_qk_norm(g, g->k, &L->attn_k_norm, nkv, hd, eps) : true)
-              && dense_rope(g->q, nh,  hd, nrot, pos, base)
-              && dense_rope(g->k, nkv, hd, nrot, pos, base)
+              /* ALiBi models (bloom/mpt) have NO RoPE — the positional signal is the attention bias. */
+              && (d->alibi ? true : dense_rope(g->q, nh,  hd, nrot, pos, base))
+              && (d->alibi ? true : dense_rope(g->k, nkv, hd, nrot, pos, base))
               && dense_kv_write(g, kv, pos, kvd)
-              && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv, hd, pos+1, scale, 0.0f)
+              && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv, hd, pos+1, scale, 0.0f, d->alibi)
               && dense_matvec(g, &L->attn_out, g->att, g->o)
               && dense_add_bias(g, g->o, &L->attn_out_bias, ne);   /* g->o = attention output (pre-residual) + bias (phi-2) */
             const double ta1 = g->profile ? ds4_gpu_now_ms() : 0.0;
@@ -6032,8 +6039,9 @@ int ds4_dense_gpu_prefill(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
     const bool has_qk_norm = d->n_layer > 0 && d->layers[0].attn_q_norm.data != NULL;
     /* The batched prefill handles plain llama AND the caps (LayerNorm, parallel-residual, non-gated/
      * GeGLU FFN, biases — see dense_norm_batch / dense_ffn_batch). It still can't do qk-norm, MoE,
-     * gemma's quirks, or int8 KV → those fall back to the per-token decode forward. */
-    if (d->gemma || g->kv_int8 || has_qk_norm || d->n_expert > 0) {
+     * gemma's quirks, int8 KV, or ALiBi (the prefill attention kernel has no bias) → those fall
+     * back to the per-token decode forward. */
+    if (d->gemma || g->kv_int8 || has_qk_norm || d->n_expert > 0 || d->alibi) {
         float *throwaway = all_logits ? NULL : malloc((size_t)d->n_vocab * sizeof(float));
         int rc = 0;
         for (uint32_t i = 0; i < M && rc == 0; i++) {

@@ -1779,7 +1779,16 @@ struct ds4_dense_attn_args {
     uint  head_dim;
     uint  n_ctx;
     float scale;
+    uint  alibi;     /* 1 -> add ALiBi linear bias to scores (bloom/mpt/falcon); 0 -> off */
 };
+
+/* ALiBi per-head slope (no buffer needed; matches llama.cpp's geometric-sequence formula).
+ * n = largest power of two <= n_head; m0 = 2^(-8/n), m1 = 2^(-4/n). */
+static inline float ds4_alibi_slope(uint h, uint n_head) {
+    uint n = 1u; while (n*2u <= n_head) n *= 2u;
+    return (h < n) ? exp2(-8.0f * (float)(h + 1u) / (float)n)
+                   : exp2(-4.0f * (float)(2u*(h - n) + 1u) / (float)n);
+}
 kernel void kernel_dense_attn_decode_f32(
         constant ds4_dense_attn_args & a [[buffer(0)]],
         device const float * q      [[buffer(1)]],
@@ -1928,7 +1937,8 @@ kernel void kernel_dense_attn_decode_f32_sg(
             const uint d = lane + 32u*j;
             if (d < hd) p += qreg[j] * kt[d];
         }
-        const float s = simd_sum(p) * a.scale;
+        float s = simd_sum(p) * a.scale;
+        if (a.alibi) s += ds4_alibi_slope(hq, a.n_head) * (float)((int)t - (int)(a.n_ctx - 1u));
         const float m_new = max(m, s);
         const float corr  = exp(m - m_new);     // first iter: exp(-inf)=0
         const float pe    = exp(s - m_new);
@@ -2501,6 +2511,7 @@ struct ds4_dense_attn_split_args {
     uint  n_head, n_kv, head_dim, n_ctx, n_split, chunk;
     float scale;
     float softcap;   /* gemma-2 attn logit soft-cap (0 = off); applied per score before the softmax */
+    uint  alibi;     /* 1 -> add ALiBi linear bias to scores (bloom/mpt/falcon); 0 -> off */
 };
 
 kernel void kernel_dense_attn_decode_split_f32(
@@ -2534,6 +2545,7 @@ kernel void kernel_dense_attn_decode_split_f32(
         for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; if (d < hd) p += qreg[j]*kt[d]; }
         float s = simd_sum(p) * a.scale;
         if (a.softcap > 0.0f) s = a.softcap * tanh(clamp(s / a.softcap, -15.0f, 15.0f));
+        if (a.alibi) s += ds4_alibi_slope(hq, a.n_head) * (float)((int)t - (int)(a.n_ctx - 1u));
         const float m_new = max(m, s);
         const float corr = exp(m - m_new), pe = exp(s - m_new);
         l = l*corr + pe;

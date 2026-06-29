@@ -222,7 +222,10 @@ typedef struct {
     int      ffn_geglu;         /* FFN activation: 1 = GeGLU (gelu), 0 = SwiGLU (silu) */
     int      norm_layernorm;    /* norm type: 1 = LayerNorm (mean+var+gamma+beta), 0 = RMSNorm */
     int      parallel_residual; /* 1 = attn + ffn both read the input norm, summed (phi-2, GPT-NeoX) */
+    int      alibi;             /* 1 = ALiBi positional bias (no RoPE): bloom/mpt/falcon */
     ds4_dense_wdesc output_norm_bias;  /* LayerNorm beta for the final norm (NULL on RMSNorm) */
+    ds4_dense_wdesc tok_norm;      /* post-embedding LayerNorm weight (bloom word_embeddings_layernorm); NULL if absent */
+    ds4_dense_wdesc tok_norm_bias; /* post-embedding LayerNorm beta */
 } ds4_dense_model_desc;
 
 typedef struct ds4_dense_gpu ds4_dense_gpu;
