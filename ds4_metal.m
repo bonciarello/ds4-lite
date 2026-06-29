@@ -4203,6 +4203,45 @@ static bool ds4_dense_embed_row(int type, const void *data, uint32_t token, uint
             }
             return true;
         }
+        case 6: {  /* Q5_0: 32-elem blocks (2B f16 d + 4B qh hi-bits + 16B qs lo-nibbles) = 22B */
+            const uint32_t nblk = ne / 32u;
+            const uint8_t *row = (const uint8_t *)data + (size_t)token*nblk*22u;
+            for (uint32_t b = 0; b < nblk; b++) {
+                const uint8_t *blk = row + (size_t)b*22u;
+                __fp16 dh; memcpy(&dh, blk, 2); const float d = (float)dh;
+                uint32_t qh; memcpy(&qh, blk+2, 4);
+                const uint8_t *qs = blk + 6;
+                for (uint32_t j = 0; j < 16; j++) {
+                    const uint8_t xh0 = (uint8_t)(((qh >> (j +  0)) << 4) & 0x10);
+                    const uint8_t xh1 = (uint8_t)( (qh >> (j + 12))       & 0x10);
+                    const int x0 = (int)((qs[j] & 0x0F) | xh0) - 16;
+                    const int x1 = (int)((qs[j] >>   4) | xh1) - 16;
+                    out[b*32u + j]      = d * (float)x0;
+                    out[b*32u + j + 16] = d * (float)x1;
+                }
+            }
+            return true;
+        }
+        case 7: {  /* Q5_1: 32-elem blocks (2B f16 d + 2B f16 m + 4B qh + 16B qs) = 24B, unsigned + min */
+            const uint32_t nblk = ne / 32u;
+            const uint8_t *row = (const uint8_t *)data + (size_t)token*nblk*24u;
+            for (uint32_t b = 0; b < nblk; b++) {
+                const uint8_t *blk = row + (size_t)b*24u;
+                __fp16 dh, mh; memcpy(&dh, blk, 2); memcpy(&mh, blk+2, 2);
+                const float d = (float)dh, m = (float)mh;
+                uint32_t qh; memcpy(&qh, blk+4, 4);
+                const uint8_t *qs = blk + 8;
+                for (uint32_t j = 0; j < 16; j++) {
+                    const uint8_t xh0 = (uint8_t)(((qh >> (j +  0)) << 4) & 0x10);
+                    const uint8_t xh1 = (uint8_t)( (qh >> (j + 12))       & 0x10);
+                    const int x0 = (int)((qs[j] & 0x0F) | xh0);
+                    const int x1 = (int)((qs[j] >>   4) | xh1);
+                    out[b*32u + j]      = d * (float)x0 + m;
+                    out[b*32u + j + 16] = d * (float)x1 + m;
+                }
+            }
+            return true;
+        }
         case 10: case 11: case 12: case 14: {  /* K-quants (256-element blocks) */
             uint32_t bb; void (*deq)(const uint8_t*, float*);
             if      (type==10) { bb=84;  deq=ds4_q2k_dequant_block; }
@@ -4225,6 +4264,7 @@ struct ds4_dense_gpu {
     bool kv_int8;                       /* DS4_KV_INT8: store KV as int8 + per-slot scale (½ the KV RAM) */
     uint32_t swa_window, swa_pattern;   /* gemma sliding window: local layers cap their KV
                                          * cache at swa_window slots (ring buffer); 0 = off */
+    int      norm_layernorm;            /* 1 = LayerNorm even with no beta (mpt/falcon bias-free) */
     ds4_gpu_tensor *x, *h, *h2, *q, *k, *v, *att, *o, *gate, *up, *act, *down, *logits;
     /* MoE FFN scratch (NULL on a dense model): router logits + per-expert gate/up/act/down + accumulator. */
     ds4_gpu_tensor *moe_router, *moe_gate, *moe_up, *moe_act, *moe_down, *moe_acc;
@@ -4288,6 +4328,8 @@ static const char *dense_kquant_kernel(int type) {
         case 1:  return "kernel_dense_mul_mv_f16_f32";     /* F16 (full-precision models) */
         case 30: return "kernel_dense_mul_mv_bf16_f32";    /* BF16 (common HF native format) */
         case 8:  return "kernel_dense_mul_mv_q8_0_f32";    /* Q8_0 (32-block; gpt-oss) */
+        case 6:  return "kernel_dense_mul_mv_q5_0_f32";    /* Q5_0 legacy (32-block; falcon) */
+        case 7:  return "kernel_dense_mul_mv_q5_1_f32";    /* Q5_1 legacy (32-block; falcon) */
         case 10: return "kernel_dense_mul_mv_q2_K_f32";
         case 11: return "kernel_dense_mul_mv_q3_K_f32";
         case 12: return "kernel_dense_mul_mv_q4_K_f32";
@@ -4339,6 +4381,13 @@ static bool dense_norm(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *x,
         struct __attribute__((packed)) { uint32_t n; float eps; } a = { n, eps };
         ds4_gpu_tensor *bufs[4] = { x, wb, bb, out };
         return ds4_gpu_run_simple("kernel_dense_layer_norm_f32", &a, sizeof(a), bufs, 4, 1u, "fwd ln");
+    }
+    if (g->norm_layernorm) {                              /* LayerNorm with NO beta (mpt/falcon bias-free) */
+        ds4_gpu_tensor *wb = dense_cached_weight(g, norm->data, norm->bytes);
+        if (!wb) return false;
+        struct __attribute__((packed)) { uint32_t n; float eps; } a = { n, eps };
+        ds4_gpu_tensor *bufs[3] = { x, wb, out };
+        return ds4_gpu_run_simple("kernel_dense_layer_norm_nobias_f32", &a, sizeof(a), bufs, 3, 1u, "fwd ln nb");
     }
     return dense_rms(g, out, x, norm, n, eps);            /* RMSNorm */
 }
@@ -4498,6 +4547,7 @@ ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
     g->n_vocab = d->n_vocab; g->n_ctx = d->n_ctx;
     g->swa_window = d->gemma ? d->swa_window : 0u;   /* sliding-window KV only for gemma */
     g->swa_pattern = d->swa_pattern;
+    g->norm_layernorm = d->norm_layernorm;
     g->kv_int8 = getenv("DS4_KV_INT8") != NULL;
     g->wcache = [NSMutableDictionary dictionary];
     g->profile = getenv("DS4_DENSE_PROFILE") != NULL;
@@ -6357,6 +6407,14 @@ static bool dense_norm_batch(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tens
         ds4_gpu_tensor *bufs[4] = { x, wb, bb, out };
         return ds4_gpu_run_grid("kernel_dense_layer_norm_f32_batch", &a, sizeof(a), bufs, 4,
                                 MTLSizeMake(M, 1, 1), MTLSizeMake(128, 1, 1), "pf ln");
+    }
+    if (g->norm_layernorm) {                              /* LayerNorm, no beta (mpt/falcon bias-free) */
+        ds4_gpu_tensor *wb = dense_cached_weight(g, norm->data, norm->bytes);
+        if (!wb) return false;
+        struct __attribute__((packed)) { uint32_t n; float eps; } a = { n, eps };
+        ds4_gpu_tensor *bufs[3] = { x, wb, out };
+        return ds4_gpu_run_grid("kernel_dense_layer_norm_nobias_f32_batch", &a, sizeof(a), bufs, 3,
+                                MTLSizeMake(M, 1, 1), MTLSizeMake(128, 1, 1), "pf ln nb");
     }
     return dense_rms_batch(g, out, x, norm, M, n, eps);
 }

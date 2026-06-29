@@ -26675,18 +26675,26 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
     {
         const char *arch = g_ds4_shape.name ? g_ds4_shape.name : "";
         desc->ffn_geglu = (strcmp(arch, "gemma2") == 0);
-        /* Genuinely-parallel archs (x = inpL + attn + ffn): gptneox, phi2, persimmon. NB stablelm
-         * sets use_parallel_residual too, but with a separate ffn_norm llama.cpp ignores the flag and
-         * runs the SEQUENTIAL graph — so stablelm is NOT here. Among the parallel archs, gptneox/
-         * persimmon feed the FFN from a SECOND norm on the layer input (ffn_norm), while phi-2 has no
-         * ffn_norm and feeds the FFN from the attention input norm; the forward picks per layer on
-         * ffn_norm presence. */
+        /* Genuinely-parallel archs (x = inpL + attn + ffn): gptneox, phi2, persimmon, falcon. NB
+         * stablelm sets use_parallel_residual too, but with a separate ffn_norm llama.cpp ignores the
+         * flag and runs the SEQUENTIAL graph — so stablelm is NOT here. Among the parallel archs,
+         * gptneox/persimmon (and falcon-40b, which has ffn_norm) feed the FFN from a SECOND norm on the
+         * layer input (ffn_norm), while phi-2 and falcon-7b have no ffn_norm and feed the FFN from the
+         * attention input norm; the forward picks per layer on ffn_norm presence. falcon also uses
+         * multi-query attention (n_head_kv=1 on the 7B) with a fused qkv — both handled by the generic
+         * GQA + fused-qkv split — and full NEOX RoPE (so it is NOT ALiBi). */
         desc->parallel_residual = (strcmp(arch, "gptneox") == 0 || strcmp(arch, "phi2") == 0 ||
-                                   strcmp(arch, "persimmon") == 0);
+                                   strcmp(arch, "persimmon") == 0 || strcmp(arch, "falcon") == 0);
         /* ALiBi positional bias instead of RoPE (bloom, mpt, jais). NB falcon uses RoPE, so it is
          * NOT here. When set, the dense forward skips RoPE and the attention adds the per-head
          * linear bias. bloom also has a post-embedding LayerNorm (token_embd_norm). */
         desc->alibi = (strcmp(arch, "bloom") == 0 || strcmp(arch, "mpt") == 0 || strcmp(arch, "jais") == 0);
+        /* LayerNorm (mean-subtracting) vs RMSNorm. dense_norm already infers LayerNorm whenever a
+         * norm bias (beta) is bound (bloom/gptneox/phi2/starcoder2/stablelm all ship one); this flag
+         * additionally forces it for bias-FREE LayerNorm archs that would otherwise fall through to
+         * RMSNorm and emit garbage: mpt sets no_bias on its LayerNorms, and falcon-7b ships gamma-only
+         * norms too. */
+        desc->norm_layernorm = (strcmp(arch, "mpt") == 0 || strcmp(arch, "falcon") == 0);
     }
     desc->tok_norm      = dense_wdesc_of(model, weights->tok_norm);
     desc->tok_norm_bias = dense_wdesc_of(model, weights->tok_norm_bias);

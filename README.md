@@ -81,12 +81,15 @@ Metal engine, selected automatically from the GGUF `general.architecture`:
 - **qwen3_next** (`qwen3next`): hybrid Gated-DeltaNet + MoE, SSD-streamed.
 - **gpt-oss** (`gpt-oss`): MoE + attention sinks + sliding-window + YaRN + harmony chat/tools.
 - **MoE** on the dense driver: `qwen3moe` (softmax→top-k→renorm routing).
-- **Capability flags** for non-llama deviations: LayerNorm, parallel-residual (gated on `ffn_norm`
-  presence), GeGLU, non-gated GELU MLP, fused QKV / gate-up tensors, partial rotary, attention/FFN
-  biases — which together run e.g. **phi-3**, **phi-2** and **stablelm-2** end-to-end (byte-exact vs
-  llama.cpp on deterministic prompts).
-- **Weight dtypes**: F32, F16, BF16, Q2_K–Q6_K, Q8_0, IQ2_XXS — matvec kernels numerically validated
-  against an f32 CPU reference (F16/BF16 rel_err ≈ 4e-7).
+- **Capability flags** for non-llama deviations: LayerNorm (incl. bias-free, mean-subtracting),
+  parallel-residual (gated on `ffn_norm` presence), GeGLU, non-gated GELU MLP, fused QKV / gate-up
+  tensors, partial rotary, attention/FFN biases — which together run e.g. **phi-3**, **phi-2** and
+  **stablelm-2** end-to-end (byte-exact vs llama.cpp on deterministic prompts).
+- **ALiBi & multi-query**: `bloom`/`mpt`/`jais` use ALiBi linear-bias attention (per-head slope, no
+  RoPE); `falcon` runs parallel-residual + extreme multi-query (1 KV head, fused QKV) + NEOX RoPE.
+  Both **mpt** and **falcon** are byte-exact vs llama.cpp.
+- **Weight dtypes**: F32, F16, BF16, Q2_K–Q6_K, Q8_0, **Q5_0/Q5_1** (legacy), IQ2_XXS — matvec kernels
+  numerically validated against an f32 CPU reference (F16/BF16 rel_err ≈ 4e-7).
 
 ### Benchmarks (M1 Max, 32 GB, greedy decode, N=64)
 
@@ -103,6 +106,8 @@ streaming — e.g. ds4's gpt-oss is 26 GB RSS but only **10.7 GB** private).
 | phi-2 | dense (generic) | 1.7 GB | 28 t/s | 87 t/s | **0.3 GB** | 1.8 GB |
 | phi-3-mini | dense (generic) | 2.2 GB | 60 t/s | 74 t/s | 0.7 GB | 2.4 GB |
 | qwen2-7B Q4_K_M | dense | 4.4 GB | 39 t/s | 44 t/s | 3.8 GB | 4.5 GB |
+| mpt-7B Q4_K_M | dense (generic, ALiBi) | 4.1 GB | 10.4 t/s | 42 t/s | **0.06 GB** | 4.3 GB |
+| falcon-7B Q4_K_M | dense (generic, multi-query) | 4.6 GB | 10.1 t/s | 39 t/s | **0.03 GB** | 4.7 GB |
 | gemma-3-27B Q4_K_M | dense (gemma) | 15.4 GB | 10.6 t/s | 12.0 t/s | 13.9 GB | 15.6 GB |
 | gpt-oss-20B Q8_0 | MoE (gpt-oss) | 20.7 GB | 2.6 t/s | 58 t/s | 10.7 GB † | 20.5 GB |
 | Qwen3-Next-80B Q4_K_M | MoE (qwen3next) | 45.2 GB | 2.8 t/s | *can't* ‡ | 6.4 GB † | — ‡ |
@@ -116,8 +121,13 @@ Highlights:
 - **Dense: matches llama at 7B+, on less RAM.** For 7B–27B models decode is **82–89 %** of
   llama.cpp; below that, fixed per-token GPU-dispatch overhead dominates the tiny matmuls, so the
   smallest models run a larger fraction behind (stablelm-1.6B 17 %, phi-2 32 %, gemma-2-2B 63 %,
-  phi-3 82 %). RAM stays *below* llama throughout — ds4 zero-copy-wraps the mmap'd weights instead
-  of copying: stablelm 0.4 vs 1.1 GB, gemma-2 0.3 vs 1.7, qwen2 3.8 vs 4.5, gemma-3 13.9 vs 15.6.
+  phi-3 82 %). The two 7B outliers — **mpt** and **falcon** at ~25 % — are quant-bound, not
+  arch-bound: their GGUFs carry legacy **Q5_0/Q5_1** weights whose matvec kernels are still the
+  correctness-first reference (one thread per row, no simdgroup variant yet), so they leave most of
+  the GPU idle. RAM stays *below* llama throughout — ds4 zero-copy-wraps the mmap'd weights instead
+  of copying: stablelm 0.4 vs 1.1 GB, gemma-2 0.3 vs 1.7, qwen2 3.8 vs 4.5, gemma-3 13.9 vs 15.6,
+  and the zero-copy footprint of mpt/falcon is just **0.06 / 0.03 GB** (4 GB working set, all
+  reclaimable file-backed mmap).
   gemma-2's logit soft-cap attention rides the same split-KV (flash-decoding) path as every other
   arch, so its decode stays flat as the context grows (≈2.6× the single-simdgroup kernel at 384 tok).
 - **MoE: runs what llama can't.** An **80B** model (Qwen3-Next) runs on a **32 GB** machine in a

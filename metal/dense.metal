@@ -1731,6 +1731,25 @@ kernel void kernel_dense_layer_norm_f32(
     for (uint i = 0; i < a.n; i++) out[i] = (x[i] - mean) * inv * w[i] + b[i];
 }
 
+// LayerNorm WITHOUT beta (bias-free archs: mpt has no_bias, falcon-7b drops norm bias).
+// Mean-subtracting like the full LayerNorm but only the gamma scale, no beta add. These archs
+// would otherwise fall through to RMSNorm (no mean subtraction) -> garbage. bufs: x, w(gamma), out.
+kernel void kernel_dense_layer_norm_nobias_f32(
+        constant ds4_dense_rmsnorm_args & a [[buffer(0)]],
+        device const float * x   [[buffer(1)]],
+        device const float * w   [[buffer(2)]],   // gamma
+        device       float * out [[buffer(3)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid != 0u) return;
+    float mean = 0.0f;
+    for (uint i = 0; i < a.n; i++) mean += x[i];
+    mean /= (float)a.n;
+    float var = 0.0f;
+    for (uint i = 0; i < a.n; i++) { const float d = x[i] - mean; var += d * d; }
+    const float inv = 1.0f / sqrt(var / (float)a.n + a.eps);
+    for (uint i = 0; i < a.n; i++) out[i] = (x[i] - mean) * inv * w[i];
+}
+
 // Parallel RMSNorm (Fase opt). One threadgroup of 128 threads; sum-of-squares
 // via per-simdgroup simd_sum + threadgroup reduction, then a parallel write.
 // Replaces the single-thread kernel above. Dispatch: grid=(1,1,1) tpg=(128,1,1).
@@ -2274,6 +2293,40 @@ kernel void kernel_dense_layer_norm_f32_batch(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float inv = 1.0f / sqrt(sdata[0] / (float)a.n + a.eps);
     for (uint i = tid; i < a.n; i += nt) outr[i] = (xr[i]-mean)*inv*w[i] + b[i];
+}
+
+// Batched LayerNorm WITHOUT beta (mpt/falcon bias-free prefill). Same as above minus the beta add.
+kernel void kernel_dense_layer_norm_nobias_f32_batch(
+        constant ds4_dense_rmsnorm_args & a [[buffer(0)]],
+        device const float * x   [[buffer(1)]],
+        device const float * w   [[buffer(2)]],   // gamma
+        device       float * out [[buffer(3)]],
+        uint   tgig  [[threadgroup_position_in_grid]],
+        uint   tid   [[thread_position_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint nt = 128u;
+    threadgroup float sdata[4];
+    device const float * xr   = x   + (ulong)tgig * a.n;
+    device       float * outr = out + (ulong)tgig * a.n;
+    float s = 0.0f;
+    for (uint i = tid; i < a.n; i += nt) s += xr[i];
+    s = simd_sum(s);
+    if (tiisg == 0) sdata[sgitg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { float t = 0.0f; for (uint k = 0; k < nt/32u; k++) t += sdata[k]; sdata[0] = t / (float)a.n; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mean = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float v = 0.0f;
+    for (uint i = tid; i < a.n; i += nt) { const float d = xr[i]-mean; v += d*d; }
+    v = simd_sum(v);
+    if (tiisg == 0) sdata[sgitg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { float t = 0.0f; for (uint k = 0; k < nt/32u; k++) t += sdata[k]; sdata[0] = t; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = 1.0f / sqrt(sdata[0] / (float)a.n + a.eps);
+    for (uint i = tid; i < a.n; i += nt) outr[i] = (xr[i]-mean)*inv*w[i];
 }
 
 // Batched NEOX RoPE for M tokens. Token tok sits at position a.pos+tok; q is
@@ -2874,6 +2927,73 @@ kernel void kernel_dense_mul_mv_q8_0_f32(
         float s = 0.0f;
         for (uint l = 0; l < 32u; l++) s += (float)qs[l] * xb[l];
         acc += d * s;
+    }
+    out[row] = acc;
+}
+
+/* Q5_0 legacy matvec: 22-byte blocks {half d; uchar qh[4]; uchar qs[16]}. Signed 5-bit (q-16),
+ * the 5th bit per weight lives in the 32-bit qh: lo-nibble j -> pos j, hi-nibble j -> pos j+16.
+ * qh read byte-wise (the 22-byte stride leaves it 2-aligned, not 4-aligned). One thread/row. */
+kernel void kernel_dense_mul_mv_q5_0_f32(
+        constant ds4_dense_mvq_args & a [[buffer(0)]],
+        device const char  * W   [[buffer(1)]],
+        device const float * x   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= a.out_dim) return;
+    const uint nblk = a.in_dim / 32u;
+    const uint BLK = 22u;
+    float acc = 0.0f;
+    for (uint bi = 0; bi < nblk; bi++) {
+        device const char * blk = W + (ulong)(row * nblk + bi) * BLK;
+        const float d = (float)(*(device const half *)(blk + 0));
+        device const uchar * qhb = (device const uchar *)(blk + 2);
+        const uint qh = (uint)qhb[0] | ((uint)qhb[1] << 8) | ((uint)qhb[2] << 16) | ((uint)qhb[3] << 24);
+        device const uchar * qs = (device const uchar *)(blk + 6);
+        device const float * xb = x + (ulong)bi * 32u;
+        float s = 0.0f;
+        for (uint j = 0; j < 16u; j++) {
+            const uint xh0 = ((qh >> (j +  0)) << 4) & 0x10u;
+            const uint xh1 = ( (qh >> (j + 12))      ) & 0x10u;
+            const int q0 = (int)((qs[j] & 0x0F) | xh0) - 16;
+            const int q1 = (int)((qs[j] >>   4) | xh1) - 16;
+            s += (float)q0 * xb[j] + (float)q1 * xb[j + 16u];
+        }
+        acc += d * s;
+    }
+    out[row] = acc;
+}
+
+/* Q5_1 legacy matvec: 24-byte blocks {half d; half m; uchar qh[4]; uchar qs[16]}. Unsigned 5-bit
+ * with a per-block min: value = d*q + m, so the block contributes d*(q·x) + m*(sum x). One thread/row. */
+kernel void kernel_dense_mul_mv_q5_1_f32(
+        constant ds4_dense_mvq_args & a [[buffer(0)]],
+        device const char  * W   [[buffer(1)]],
+        device const float * x   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= a.out_dim) return;
+    const uint nblk = a.in_dim / 32u;
+    const uint BLK = 24u;
+    float acc = 0.0f;
+    for (uint bi = 0; bi < nblk; bi++) {
+        device const char * blk = W + (ulong)(row * nblk + bi) * BLK;
+        const float d = (float)(*(device const half *)(blk + 0));
+        const float m = (float)(*(device const half *)(blk + 2));
+        device const uchar * qhb = (device const uchar *)(blk + 4);
+        const uint qh = (uint)qhb[0] | ((uint)qhb[1] << 8) | ((uint)qhb[2] << 16) | ((uint)qhb[3] << 24);
+        device const uchar * qs = (device const uchar *)(blk + 8);
+        device const float * xb = x + (ulong)bi * 32u;
+        float s = 0.0f, sx = 0.0f;
+        for (uint j = 0; j < 16u; j++) {
+            const uint xh0 = ((qh >> (j +  0)) << 4) & 0x10u;
+            const uint xh1 = ( (qh >> (j + 12))      ) & 0x10u;
+            const int q0 = (int)((qs[j] & 0x0F) | xh0);
+            const int q1 = (int)((qs[j] >>   4) | xh1);
+            s  += (float)q0 * xb[j] + (float)q1 * xb[j + 16u];
+            sx += xb[j] + xb[j + 16u];
+        }
+        acc += d * s + m * sx;
     }
     out[row] = acc;
 }
