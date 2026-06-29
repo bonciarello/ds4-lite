@@ -22760,11 +22760,14 @@ typedef enum {
     DS4_PRETOK_QWEN2 = 1,   /* Qwen2/GPT-2 byte-level split */
     DS4_PRETOK_SPM   = 2,   /* SentencePiece (llama/gemma): score-driven merge, no BPE merges */
     DS4_PRETOK_GPT4O = 3,   /* o200k / gpt-4o (gpt-oss): case-aware letters, \p{N}{1,3} */
+    DS4_PRETOK_RWKV  = 4,   /* RWKV world: byte-level greedy longest-match over the (unescaped) vocab */
 } ds4_pretok;
 
 struct ds4_vocab {
     ds4_str *token;
     int n_vocab;
+    int rwkv_max_len;       /* RWKV: longest token byte length (for the greedy match) */
+    uint8_t *rwkv_blob;     /* RWKV: backing storage for the unescaped token bytes (freed in vocab_free) */
     int bos_id;
     int eos_id;
     int unk_id;             /* SPM byte-fallback fallback token (-1 if none) */
@@ -23379,7 +23382,32 @@ static void spm_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
 
 /* JoyAI/DeepSeek pre-tokenization.  The split shape matters: different pieces
  * lead to different BPE merges even when the final text bytes are identical. */
+/* RWKV world tokenizer: greedy longest-match over the (unescaped) byte vocab. At each position take
+ * the longest vocab token that matches the upcoming bytes; every single byte is in the vocab so this
+ * always advances. Matches llama.cpp's trie tokenizer (which is also greedy-longest). */
+static void rwkv_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    const uint8_t *t = (const uint8_t *)text;
+    const size_t n = strlen(text);
+    size_t p = 0;
+    while (p < n) {
+        int best_id = -1, best_len = 0;
+        int maxl = vocab->rwkv_max_len;
+        if ((size_t)maxl > n - p) maxl = (int)(n - p);
+        for (int len = maxl; len >= 1; len--) {
+            int id;
+            if (table_get(&vocab->token_to_id, (const char *)(t + p), (uint64_t)len, &id)) { best_id = id; best_len = len; break; }
+        }
+        if (best_id < 0) { best_id = (int)t[p] + 1; best_len = 1; }   /* byte b -> id b+1 (rwkv byte tokens) */
+        token_vec_push(out, best_id);
+        p += (size_t)best_len;
+    }
+}
+
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    if (vocab->pre_type == DS4_PRETOK_RWKV) {
+        rwkv_tokenize_text(vocab, text, out);
+        return;
+    }
     if (vocab->pre_type == DS4_PRETOK_SPM) {
         spm_tokenize_text(vocab, text, out);
         return;
@@ -23495,19 +23523,50 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
      * "joyai-llm" => byte-level BPE (merges). gemma3 uses SPM. */
     ds4_str tmodel = {0};
     model_get_string(model, "tokenizer.ggml.model", &tmodel);
-    const bool is_spm = ds4_str_eq_cstr(tmodel, "llama");
+    const bool is_spm  = ds4_str_eq_cstr(tmodel, "llama");
+    const bool is_rwkv = ds4_str_eq_cstr(tmodel, "rwkv");
 
     vocab->n_vocab = (int)tokens.len;
     vocab->token = xcalloc((size_t)vocab->n_vocab, sizeof(vocab->token[0]));
     table_init(&vocab->token_to_id, tokens.len);
 
     ds4_cursor c = cursor_at(model, tokens.data_pos);
-    for (int i = 0; i < vocab->n_vocab; i++) {
-        if (!cursor_string(&c, &vocab->token[i])) ds4_die(c.error);
-        table_put(&vocab->token_to_id, vocab->token[i], i);
+    if (is_rwkv) {
+        /* RWKV world vocab: tokens are stored escaped (\xHH, \t, \n, \r, \\). Unescape each into a
+         * backing blob (unescaped length <= raw length), and map the raw BYTES -> id for the greedy
+         * longest-match tokenizer. */
+        ds4_cursor cz = cursor_at(model, tokens.data_pos); size_t total = 0;
+        for (int i = 0; i < vocab->n_vocab; i++) { ds4_str s; if (!cursor_string(&cz, &s)) ds4_die(cz.error); total += s.len; }
+        vocab->rwkv_blob = xmalloc(total ? total : 1);
+        uint8_t *bp = vocab->rwkv_blob; int maxlen = 0;
+        for (int i = 0; i < vocab->n_vocab; i++) {
+            ds4_str s; if (!cursor_string(&c, &s)) ds4_die(c.error);
+            uint8_t *start = bp; bool esc = false; int hexrem = 0; uint8_t hexacc = 0;
+            for (size_t j = 0; j < s.len; j++) { char ch = s.ptr[j];
+                if (hexrem) { uint8_t v = (ch >= 'a') ? (uint8_t)(ch - 'a' + 10) : (uint8_t)(ch - '0');
+                              hexacc = (uint8_t)((hexacc << 4) + v); if (--hexrem == 0) { *bp++ = hexacc; hexacc = 0; } continue; }
+                if (esc) { if (ch=='t') *bp++='\t'; else if (ch=='n') *bp++='\n'; else if (ch=='r') *bp++='\r';
+                           else if (ch=='x') hexrem=2; else *bp++=(uint8_t)ch; esc=false; continue; }
+                if (ch == '\\') { esc = true; continue; }
+                *bp++ = (uint8_t)ch;
+            }
+            const int len = (int)(bp - start);
+            vocab->token[i].ptr = (const char *)start; vocab->token[i].len = (size_t)len;
+            table_put(&vocab->token_to_id, vocab->token[i], i);
+            if (len > maxlen) maxlen = len;
+        }
+        vocab->rwkv_max_len = maxlen;
+    } else {
+        for (int i = 0; i < vocab->n_vocab; i++) {
+            if (!cursor_string(&c, &vocab->token[i])) ds4_die(c.error);
+            table_put(&vocab->token_to_id, vocab->token[i], i);
+        }
     }
 
-    if (is_spm) {
+    if (is_rwkv) {
+        table_init(&vocab->merge_rank, 1);    /* no merges; byte-level greedy match */
+        vocab->pre_type = DS4_PRETOK_RWKV;
+    } else if (is_spm) {
         /* SPM: load the per-token merge scores; no BPE merge table. */
         ds4_array_ref scores;
         if (!model_get_array(model, "tokenizer.ggml.scores", &scores) ||
@@ -23590,6 +23649,7 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
 static void vocab_free(ds4_vocab *vocab) {
     free(vocab->token);
     free(vocab->scores);
+    free(vocab->rwkv_blob);
     table_free(&vocab->token_to_id);
     table_free(&vocab->merge_rank);
     memset(vocab, 0, sizeof(*vocab));
@@ -26907,46 +26967,41 @@ static void build_rwkv7_desc(ds4_rwkv7_model_desc *desc, const ds4_model *model)
     }
 }
 
-/* Greedy generation on the RWKV-7 driver. The prompt is "ids:N,N,..." (the RWKV trie tokenizer is
- * not yet ported, so for validation the caller passes llama-tokenize ids); output is detokenized via
- * the raw vocab token bytes. */
+/* Greedy generation on the RWKV-7 driver. The prompt is plain text (RWKV world byte-level greedy
+ * tokenizer), or "ids:N,N,..." to feed token ids directly. Output is detokenized via the vocab bytes. */
 int ds4_rwkv7_generate(const char *model_path, const char *prompt, int n_predict,
                        char *err, size_t errlen) {
-    ds4_model model;
+    ds4_model model; ds4_vocab vocab;
     model_open(&model, model_path, false, true);
     config_validate_model(&model);
     if (!ds4_arch_is_rwkv7()) { if (errlen) snprintf(err,errlen,"not a rwkv7 model"); model_close(&model); return 1; }
-    /* token strings (for detok) */
-    ds4_array_ref toks_arr; const char **vtok=NULL; uint32_t nvt=0;
-    if (model_get_array(&model, "tokenizer.ggml.tokens", &toks_arr)) {
-        nvt=(uint32_t)toks_arr.len; vtok=xcalloc(nvt,sizeof(char*));
-        ds4_cursor cu=cursor_at(&model, toks_arr.data_pos);
-        for (uint32_t i=0;i<nvt;i++){ ds4_str s; if(cursor_string(&cu,&s)){ char*b=xmalloc(s.len+1); memcpy(b,s.ptr,s.len); b[s.len]=0; vtok[i]=b; } }
-    }
-    /* parse "ids:510,3158,..." */
+    vocab_load(&vocab, &model);
     token_vec toks={0};
     const char *p = prompt ? prompt : "";
     if (strncmp(p,"ids:",4)==0) { p+=4; while(*p){ token_vec_push(&toks,(int)strtol(p,(char**)&p,10)); if(*p==',')p++; else break; } }
-    if (toks.len==0) { if(errlen)snprintf(err,errlen,"rwkv7 needs prompt 'ids:N,N,...' (trie tokenizer TODO)"); model_close(&model); return 1; }
+    else bpe_tokenize_text(&vocab, p, &toks);
+    if (toks.len==0) { if(errlen)snprintf(err,errlen,"empty prompt"); vocab_free(&vocab); model_close(&model); return 1; }
     ds4_rwkv7_model_desc desc; build_rwkv7_desc(&desc,&model);
     ds4_rwkv7_gpu *g=ds4_rwkv7_gpu_create(&desc);
-    if (!g) { if(errlen)snprintf(err,errlen,"rwkv7 GPU create failed"); free(desc.layers); model_close(&model); return 1; }
+    if (!g) { if(errlen)snprintf(err,errlen,"rwkv7 GPU create failed"); free(desc.layers); token_vec_free(&toks); vocab_free(&vocab); model_close(&model); return 1; }
     float *logits=xmalloc((size_t)DS4_N_VOCAB*sizeof(float));
     int rc=0; uint32_t pos=0;
     for (uint32_t i=0;i<(uint32_t)toks.len && rc==0;i++)
         if (ds4_rwkv7_gpu_forward(g,&desc,toks.v[i],pos++,logits)!=0) rc=1;
     printf("=== ds4 rwkv7 greedy (%d tokens) ===\n", n_predict);
+    for (uint32_t i=0;i<(uint32_t)toks.len;i++) if (toks.v[i]>=0 && toks.v[i]<vocab.n_vocab)
+        fwrite(vocab.token[toks.v[i]].ptr, 1, vocab.token[toks.v[i]].len, stdout);
     int n_gen=0;
     while (rc==0 && n_gen<n_predict) {
         int next=sample_argmax(logits,DS4_N_VOCAB);
-        if (vtok && next>=0 && (uint32_t)next<nvt && vtok[next]) fputs(vtok[next],stdout);
+        if (next==vocab.eos_id) break;
+        if (next>=0 && next<vocab.n_vocab) fwrite(vocab.token[next].ptr, 1, vocab.token[next].len, stdout);
         fflush(stdout); n_gen++;
         if (ds4_rwkv7_gpu_forward(g,&desc,next,pos++,logits)!=0){ rc=1; break; }
     }
     printf("\n");
     free(logits); ds4_rwkv7_gpu_free(g); free(desc.layers);
-    if (vtok){ for(uint32_t i=0;i<nvt;i++) free((void*)vtok[i]); free(vtok); }
-    token_vec_free(&toks); model_close(&model);
+    token_vec_free(&toks); vocab_free(&vocab); model_close(&model);
     if (rc && errlen && !err[0]) snprintf(err,errlen,"rwkv7 forward failed");
     return rc;
 }
