@@ -349,6 +349,35 @@ int ds4_mamba_gpu_forward(ds4_mamba_gpu *g, const ds4_mamba_model_desc *desc,
                           int token, unsigned pos, float *logits);
 int ds4_mamba_generate(const char *model_path, const char *prompt, int n_predict,
                        char *err, size_t errlen);
+
+/* ---- RWKV-7 (Goose): linear-attention delta-rule recurrence + channel mix ---- */
+typedef struct {
+    ds4_dense_wdesc attn_norm, attn_norm_b, attn_norm_2, attn_norm_2_b;   /* LayerNorms (time / channel) */
+    ds4_dense_wdesc lerp_fused;                                           /* [n_embd, 6] token-shift lerps */
+    ds4_dense_wdesc w0, w1, w2;          /* decay LoRA + bias */
+    ds4_dense_wdesc a0, a1, a2;          /* in-context learning rate LoRA + bias */
+    ds4_dense_wdesc v0, v1, v2;          /* value-residual mix LoRA + bias */
+    ds4_dense_wdesc g1, g2;              /* gate LoRA */
+    ds4_dense_wdesc k_k, k_a, r_k;       /* per-channel scalars */
+    ds4_dense_wdesc key, value, receptance, output;   /* projections (Q8_0) */
+    ds4_dense_wdesc ln, ln_b;            /* group-norm on the WKV output */
+    ds4_dense_wdesc cm_lerp_k, cm_key, cm_value;      /* channel mix */
+} ds4_rwkv7_layer_desc;
+
+typedef struct {
+    unsigned n_layer, n_embd, n_vocab, head_size, n_head, n_ff;
+    float    eps;
+    ds4_dense_wdesc       token_embd, tok_norm, tok_norm_b, output_norm, output_norm_b, output;
+    ds4_rwkv7_layer_desc *layers;   /* [n_layer] */
+} ds4_rwkv7_model_desc;
+
+typedef struct ds4_rwkv7_gpu ds4_rwkv7_gpu;
+ds4_rwkv7_gpu *ds4_rwkv7_gpu_create(const ds4_rwkv7_model_desc *desc);
+void ds4_rwkv7_gpu_free(ds4_rwkv7_gpu *g);
+int ds4_rwkv7_gpu_forward(ds4_rwkv7_gpu *g, const ds4_rwkv7_model_desc *desc,
+                          int token, unsigned pos, float *logits);
+int ds4_rwkv7_generate(const char *model_path, const char *prompt, int n_predict,
+                       char *err, size_t errlen);
 /* Load a qwen3_next model and greedily generate n_predict tokens (EXPERIMENTAL). */
 int ds4_q3n_generate(const char *model_path, const char *prompt, int n_predict,
                      char *err, size_t errlen);

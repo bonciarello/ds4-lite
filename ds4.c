@@ -26872,6 +26872,85 @@ int ds4_mamba_generate(const char *model_path, const char *prompt, int n_predict
     return rc;
 }
 
+/* Build the RWKV-7 descriptor by reading the time-mix / channel-mix tensors directly. */
+static void build_rwkv7_desc(ds4_rwkv7_model_desc *desc, const ds4_model *model) {
+    memset(desc, 0, sizeof(*desc));
+    desc->n_layer=DS4_N_LAYER; desc->n_embd=DS4_N_EMBD; desc->n_vocab=DS4_N_VOCAB;
+    desc->head_size=g_ds4_shape.ssm_state_size; desc->n_ff=g_ds4_shape.n_ff;
+    desc->n_head = desc->head_size ? DS4_N_EMBD/desc->head_size : 0;
+    desc->eps=DS4_RMS_EPS;
+    desc->token_embd   = dense_wdesc_of(model, required_tensor(model,"token_embd.weight"));
+    desc->tok_norm     = dense_wdesc_of(model, required_tensor(model,"token_embd_norm.weight"));
+    desc->tok_norm_b   = dense_wdesc_of(model, required_tensor(model,"token_embd_norm.bias"));
+    desc->output_norm  = dense_wdesc_of(model, required_tensor(model,"output_norm.weight"));
+    desc->output_norm_b= dense_wdesc_of(model, required_tensor(model,"output_norm.bias"));
+    ds4_tensor *out=model_find_tensor(model,"output.weight");
+    desc->output = dense_wdesc_of(model, out?out:required_tensor(model,"token_embd.weight"));
+    desc->layers = xcalloc(desc->n_layer, sizeof(desc->layers[0]));
+    for (uint32_t il=0; il<desc->n_layer; il++) {
+        ds4_rwkv7_layer_desc *L=&desc->layers[il];
+        #define RW(field,name) L->field = dense_wdesc_of(model, required_tensorf(model, "blk.%u." name, il))
+        RW(attn_norm,"attn_norm.weight"); RW(attn_norm_b,"attn_norm.bias");
+        RW(attn_norm_2,"attn_norm_2.weight"); RW(attn_norm_2_b,"attn_norm_2.bias");
+        RW(lerp_fused,"time_mix_lerp_fused.weight");
+        RW(w0,"time_mix_w0.weight"); RW(w1,"time_mix_w1.weight"); RW(w2,"time_mix_w2.weight");
+        RW(a0,"time_mix_a0.weight"); RW(a1,"time_mix_a1.weight"); RW(a2,"time_mix_a2.weight");
+        RW(v0,"time_mix_v0.weight"); RW(v1,"time_mix_v1.weight"); RW(v2,"time_mix_v2.weight");
+        RW(g1,"time_mix_g1.weight"); RW(g2,"time_mix_g2.weight");
+        RW(k_k,"time_mix_k_k.weight"); RW(k_a,"time_mix_k_a.weight"); RW(r_k,"time_mix_r_k.weight");
+        RW(key,"time_mix_key.weight"); RW(value,"time_mix_value.weight");
+        RW(receptance,"time_mix_receptance.weight"); RW(output,"time_mix_output.weight");
+        RW(ln,"time_mix_ln.weight"); RW(ln_b,"time_mix_ln.bias");
+        RW(cm_lerp_k,"channel_mix_lerp_k.weight"); RW(cm_key,"channel_mix_key.weight");
+        RW(cm_value,"channel_mix_value.weight");
+        #undef RW
+    }
+}
+
+/* Greedy generation on the RWKV-7 driver. The prompt is "ids:N,N,..." (the RWKV trie tokenizer is
+ * not yet ported, so for validation the caller passes llama-tokenize ids); output is detokenized via
+ * the raw vocab token bytes. */
+int ds4_rwkv7_generate(const char *model_path, const char *prompt, int n_predict,
+                       char *err, size_t errlen) {
+    ds4_model model;
+    model_open(&model, model_path, false, true);
+    config_validate_model(&model);
+    if (!ds4_arch_is_rwkv7()) { if (errlen) snprintf(err,errlen,"not a rwkv7 model"); model_close(&model); return 1; }
+    /* token strings (for detok) */
+    ds4_array_ref toks_arr; const char **vtok=NULL; uint32_t nvt=0;
+    if (model_get_array(&model, "tokenizer.ggml.tokens", &toks_arr)) {
+        nvt=(uint32_t)toks_arr.len; vtok=xcalloc(nvt,sizeof(char*));
+        ds4_cursor cu=cursor_at(&model, toks_arr.data_pos);
+        for (uint32_t i=0;i<nvt;i++){ ds4_str s; if(cursor_string(&cu,&s)){ char*b=xmalloc(s.len+1); memcpy(b,s.ptr,s.len); b[s.len]=0; vtok[i]=b; } }
+    }
+    /* parse "ids:510,3158,..." */
+    token_vec toks={0};
+    const char *p = prompt ? prompt : "";
+    if (strncmp(p,"ids:",4)==0) { p+=4; while(*p){ token_vec_push(&toks,(int)strtol(p,(char**)&p,10)); if(*p==',')p++; else break; } }
+    if (toks.len==0) { if(errlen)snprintf(err,errlen,"rwkv7 needs prompt 'ids:N,N,...' (trie tokenizer TODO)"); model_close(&model); return 1; }
+    ds4_rwkv7_model_desc desc; build_rwkv7_desc(&desc,&model);
+    ds4_rwkv7_gpu *g=ds4_rwkv7_gpu_create(&desc);
+    if (!g) { if(errlen)snprintf(err,errlen,"rwkv7 GPU create failed"); free(desc.layers); model_close(&model); return 1; }
+    float *logits=xmalloc((size_t)DS4_N_VOCAB*sizeof(float));
+    int rc=0; uint32_t pos=0;
+    for (uint32_t i=0;i<(uint32_t)toks.len && rc==0;i++)
+        if (ds4_rwkv7_gpu_forward(g,&desc,toks.v[i],pos++,logits)!=0) rc=1;
+    printf("=== ds4 rwkv7 greedy (%d tokens) ===\n", n_predict);
+    int n_gen=0;
+    while (rc==0 && n_gen<n_predict) {
+        int next=sample_argmax(logits,DS4_N_VOCAB);
+        if (vtok && next>=0 && (uint32_t)next<nvt && vtok[next]) fputs(vtok[next],stdout);
+        fflush(stdout); n_gen++;
+        if (ds4_rwkv7_gpu_forward(g,&desc,next,pos++,logits)!=0){ rc=1; break; }
+    }
+    printf("\n");
+    free(logits); ds4_rwkv7_gpu_free(g); free(desc.layers);
+    if (vtok){ for(uint32_t i=0;i<nvt;i++) free((void*)vtok[i]); free(vtok); }
+    token_vec_free(&toks); model_close(&model);
+    if (rc && errlen && !err[0]) snprintf(err,errlen,"rwkv7 forward failed");
+    return rc;
+}
+
 /* Build the GPU-ready descriptor from the bound weights (Phase 2b data layer). Mirrors
  * build_q3n_desc; precomputes the YaRN rope params (gpt-oss: scaling factor 32, orig_ctx 4096,
  * ext_factor=1, attn_factor=1, beta_fast=32, beta_slow=1) including the ramp correction dims. */

@@ -5686,6 +5686,180 @@ void ds4_mamba_gpu_free(ds4_mamba_gpu *g) {
     free(g->conv_state); free(g->ssm_state); free(g->cpu); free(g);
 }
 
+/* ===== RWKV-7 (Goose) forward driver ======================================= *
+ * Linear-attention with a delta-rule recurrence + channel mixing, no attention/KV.
+ * Like the Mamba driver: matmul projections (Q8_0 / F16 LoRAs) on the GPU, the rest
+ * (token-shift, decay/iclr/gate, the WKV7 recurrence, group-norm, bonus) on the CPU.
+ * Recurrent state per layer: two token-shift vectors (prev time / channel inputs) +
+ * the WKV7 state S [n_head][head_size][head_size]. */
+struct ds4_rwkv7_gpu {
+    uint32_t n_layer, n_embd, n_vocab, head_size, n_head, n_ff;
+    float eps;
+    const void **wkey; ds4_gpu_tensor **wbuf; int nw, wcap;   /* GPU weight cache keyed by wdesc.data */
+    ds4_gpu_tensor *gA, *gB;                                   /* matmul scratch (in / out) */
+    float *prev_time, *prev_chan;   /* [n_layer*n_embd] token-shift recurrent states */
+    float *wkv;                     /* [n_layer*n_head*head_size*head_size] WKV7 state */
+    float *cpu;                     /* scratch block */
+};
+
+/* Cache a weight on the GPU (upload once), keyed by its CPU data pointer. */
+static ds4_gpu_tensor *rwkv_w(ds4_rwkv7_gpu *g, const ds4_dense_wdesc *W) {
+    for (int i=0;i<g->nw;i++) if (g->wkey[i]==W->data) return g->wbuf[i];
+    if (g->nw==g->wcap) { g->wcap=g->wcap?g->wcap*2:64;
+        g->wkey=realloc(g->wkey,(size_t)g->wcap*sizeof(void*)); g->wbuf=realloc(g->wbuf,(size_t)g->wcap*sizeof(void*)); }
+    ds4_gpu_tensor *t=ds4_gpu_tensor_alloc(W->bytes);
+    if (t) ds4_gpu_tensor_write(t,0,W->data,W->bytes);
+    g->wkey[g->nw]=W->data; g->wbuf[g->nw]=t; g->nw++;
+    return t;
+}
+
+/* Matmul out[out_dim] = W @ in[in_dim]. F32 -> CPU; Q8_0/F16 -> GPU (cached weight). */
+static bool rwkv_mm(ds4_rwkv7_gpu *g, const ds4_dense_wdesc *W, const float *in, uint32_t in_dim,
+                    float *out, uint32_t out_dim) {
+    if (W->type == 0) {
+        const float *w=(const float*)W->data;
+        for (uint32_t o=0;o<out_dim;o++){ const float *wr=w+(size_t)o*in_dim; double acc=0;
+            for (uint32_t i=0;i<in_dim;i++) acc+=(double)wr[i]*in[i]; out[o]=(float)acc; }
+        return true;
+    }
+    ds4_gpu_tensor *Wb=rwkv_w(g,W); if(!Wb) return false;
+    ds4_gpu_tensor_write(g->gA,0,in,(uint64_t)in_dim*4);
+    if (!mamba_matvec(Wb, W->type, g->gA, g->gB, in_dim, out_dim)) return false;
+    ds4_gpu_tensor_read(g->gB,0,out,(uint64_t)out_dim*4);
+    return true;
+}
+
+static inline float rwkv_sigmoid(float x){ return 1.0f/(1.0f+expf(-x)); }
+/* LayerNorm over n elements: (x-mean)/sqrt(var+eps)*w + b. */
+static void rwkv_layernorm(const float *x, const float *w, const float *b, uint32_t n, float eps, float *out) {
+    double m=0; for(uint32_t i=0;i<n;i++) m+=x[i]; m/=n;
+    double v=0; for(uint32_t i=0;i<n;i++){ double d=x[i]-m; v+=d*d; } v/=n;
+    const float inv=1.0f/sqrtf((float)v+eps);
+    for(uint32_t i=0;i<n;i++) out[i]=((float)(x[i]-m))*inv*w[i]+(b?b[i]:0.0f);
+}
+
+ds4_rwkv7_gpu *ds4_rwkv7_gpu_create(const ds4_rwkv7_model_desc *d) {
+    if (!g_initialized && !ds4_gpu_init()) return NULL;
+    ds4_rwkv7_gpu *g=calloc(1,sizeof(*g)); if(!g) return NULL;
+    g->n_layer=d->n_layer; g->n_embd=d->n_embd; g->n_vocab=d->n_vocab;
+    g->head_size=d->head_size; g->n_head=d->n_head; g->n_ff=d->n_ff; g->eps=d->eps;
+    const uint32_t ne=d->n_embd;
+    g->gA=ds4_gpu_tensor_alloc((uint64_t)(ne>d->n_ff?ne:d->n_ff)*4);
+    g->gB=ds4_gpu_tensor_alloc((uint64_t)(d->n_vocab>d->n_ff?d->n_vocab:d->n_ff)*4);
+    g->prev_time=calloc((size_t)d->n_layer*ne,sizeof(float));
+    g->prev_chan=calloc((size_t)d->n_layer*ne,sizeof(float));
+    g->wkv=calloc((size_t)d->n_layer*d->n_head*d->head_size*d->head_size,sizeof(float));
+    /* scratch: resid, cur, xmix[6*ne], r,w,k,v,a,g,kk,ka,out,tmp,vfirst, ff (n_ff) ... allocate generously */
+    g->cpu=calloc((size_t)(ne*20 + d->n_ff + 6*ne), sizeof(float));
+    if(!g->gA||!g->gB||!g->prev_time||!g->prev_chan||!g->wkv||!g->cpu){ ds4_rwkv7_gpu_free(g); return NULL; }
+    return g;
+}
+
+int ds4_rwkv7_gpu_forward(ds4_rwkv7_gpu *g, const ds4_rwkv7_model_desc *d,
+                          int token, unsigned pos, float *logits) {
+    (void)pos;
+    @autoreleasepool {
+        const uint32_t ne=g->n_embd, hs=g->head_size, nh=g->n_head, nff=g->n_ff;
+        float *c=g->cpu;
+        float *resid=c, *cur=resid+ne, *xm=cur+ne, *r=xm+6*ne, *wv=r+ne, *kv=wv+ne, *vv=kv+ne,
+              *av=vv+ne, *gv=av+ne, *kk=gv+ne, *outv=kk+ne, *tmp=outv+ne, *vfirst=tmp+ne, *ff=vfirst+ne;
+        float lo[256];  /* lora intermediate (rank <= 256) */
+        /* embedding (Q8_0) + ln0 (token_embd_norm) */
+        if (!ds4_dense_embed_row(d->token_embd.type, d->token_embd.data,(uint32_t)token,ne,resid)) return 2;
+        rwkv_layernorm(resid,(const float*)d->tok_norm.data,(const float*)d->tok_norm_b.data,ne,g->eps,resid);
+
+        for (uint32_t il=0; il<g->n_layer; il++) {
+            const ds4_rwkv7_layer_desc *L=&d->layers[il];
+            float *pt=g->prev_time+(size_t)il*ne, *pc=g->prev_chan+(size_t)il*ne;
+            float *S=g->wkv+(size_t)il*nh*hs*hs;
+            const float *lerp=(const float*)L->lerp_fused.data;   /* [ne,6] */
+
+            /* ---- time mix ---- */
+            rwkv_layernorm(resid,(const float*)L->attn_norm.data,(const float*)L->attn_norm_b.data,ne,g->eps,cur);
+            /* token-shift: xm[i*ne+j] = cur[j] + (pt[j]-cur[j])*lerp[i*ne+j], i in {r,w,k,v,a,g} */
+            for (uint32_t i=0;i<6;i++) for (uint32_t j=0;j<ne;j++)
+                xm[i*ne+j]=cur[j]+(pt[j]-cur[j])*lerp[i*ne+j];
+            float *xr=xm,*xw=xm+ne,*xk=xm+2*ne,*xv=xm+3*ne,*xa=xm+4*ne,*xg=xm+5*ne;
+            if (!rwkv_mm(g,&L->receptance,xr,ne,r,ne)) return 1;
+            /* w = exp(-0.606531 * sigmoid(w0 + w2 @ tanh(w1 @ xw))) */
+            if (!rwkv_mm(g,&L->w1,xw,ne,lo,(uint32_t)L->w1.dim1)) return 1;
+            for (uint32_t i=0;i<L->w1.dim1;i++) lo[i]=tanhf(lo[i]);
+            if (!rwkv_mm(g,&L->w2,lo,(uint32_t)L->w1.dim1,wv,ne)) return 1;
+            { const float *w0=(const float*)L->w0.data;
+              for (uint32_t j=0;j<ne;j++) wv[j]=expf(-0.606531f*rwkv_sigmoid(wv[j]+w0[j])); }
+            if (!rwkv_mm(g,&L->key,xk,ne,kv,ne)) return 1;
+            if (!rwkv_mm(g,&L->value,xv,ne,vv,ne)) return 1;
+            if (il==0) { memcpy(vfirst,vv,(size_t)ne*4); }
+            else { /* value residual: v += (vfirst-v)*sigmoid(v0 + v2@(v1@xv)) */
+                if (!rwkv_mm(g,&L->v1,xv,ne,lo,(uint32_t)L->v1.dim1)) return 1;
+                if (!rwkv_mm(g,&L->v2,lo,(uint32_t)L->v1.dim1,tmp,ne)) return 1;
+                const float *v0=(const float*)L->v0.data;
+                for (uint32_t j=0;j<ne;j++) vv[j]+=(vfirst[j]-vv[j])*rwkv_sigmoid(tmp[j]+v0[j]);
+            }
+            /* g = g2 @ sigmoid(g1 @ xg) */
+            if (!rwkv_mm(g,&L->g1,xg,ne,lo,(uint32_t)L->g1.dim1)) return 1;
+            for (uint32_t i=0;i<L->g1.dim1;i++) lo[i]=rwkv_sigmoid(lo[i]);
+            if (!rwkv_mm(g,&L->g2,lo,(uint32_t)L->g1.dim1,gv,ne)) return 1;
+            /* a = sigmoid(a0 + a2@(a1@xa)) */
+            if (!rwkv_mm(g,&L->a1,xa,ne,lo,(uint32_t)L->a1.dim1)) return 1;
+            if (!rwkv_mm(g,&L->a2,lo,(uint32_t)L->a1.dim1,av,ne)) return 1;
+            { const float *a0=(const float*)L->a0.data; for (uint32_t j=0;j<ne;j++) av[j]=rwkv_sigmoid(av[j]+a0[j]); }
+            /* kk = l2norm_per_head(k * k_k); k = k*(1 + k_a*(a-1)) */
+            { const float *kkw=(const float*)L->k_k.data, *kaw=(const float*)L->k_a.data;
+              for (uint32_t j=0;j<ne;j++) kk[j]=kv[j]*kkw[j];
+              for (uint32_t h=0;h<nh;h++){ double s=0; for(uint32_t i=0;i<hs;i++){ float val=kk[h*hs+i]; s+=(double)val*val; }
+                  float inv=1.0f/sqrtf((float)s+1e-12f); for(uint32_t i=0;i<hs;i++) kk[h*hs+i]*=inv; }
+              for (uint32_t j=0;j<ne;j++){ float ka=kv[j]*kaw[j]; kv[j]=kv[j]+(av[j]*ka-ka); } }
+            /* WKV7 recurrence: a_in=-kk, b_in=kk*a. out[h,i]=sum_j S[h,i,j]*r ; S update */
+            for (uint32_t h=0;h<nh;h++){ float *Sh=S+(size_t)h*hs*hs;
+                const float *rh=r+h*hs,*wh=wv+h*hs,*kh=kv+h*hs,*vh=vv+h*hs,*kkh=kk+h*hs,*ah=av+h*hs;
+                for (uint32_t i=0;i<hs;i++){ float *Si=Sh+(size_t)i*hs; float sa=0;
+                    for (uint32_t j=0;j<hs;j++) sa += (-kkh[j])*Si[j];
+                    float res=0;
+                    for (uint32_t j=0;j<hs;j++){ Si[j]=Si[j]*wh[j]+vh[i]*kh[j]+sa*(kkh[j]*ah[j]); res+=Si[j]*rh[j]; }
+                    outv[h*hs+i]=res;
+                }
+            }
+            /* group-norm per head (eps 64e-5) then *ln + ln_b */
+            { const float *lnw=(const float*)L->ln.data,*lnb=(const float*)L->ln_b.data;
+              for (uint32_t h=0;h<nh;h++){ float *o=outv+h*hs; double m=0; for(uint32_t i=0;i<hs;i++) m+=o[i]; m/=hs;
+                  double vr=0; for(uint32_t i=0;i<hs;i++){ double dd=o[i]-m; vr+=dd*dd; } vr/=hs;
+                  float inv=1.0f/sqrtf((float)vr+64e-5f);
+                  for(uint32_t i=0;i<hs;i++){ uint32_t idx=h*hs+i; o[i]=((float)(o[i]-m))*inv*lnw[idx]+lnb[idx]; } } }
+            /* r_k bonus: rk[h]=sum_j k[h,j]*r[h,j]*r_k[h,j]; out[h,i]+=v[h,i]*rk[h] */
+            { const float *rkw=(const float*)L->r_k.data;
+              for (uint32_t h=0;h<nh;h++){ float rk=0; for(uint32_t j=0;j<hs;j++) rk+=kv[h*hs+j]*r[h*hs+j]*rkw[h*hs+j];
+                  for(uint32_t i=0;i<hs;i++) outv[h*hs+i]+=vv[h*hs+i]*rk; } }
+            for (uint32_t j=0;j<ne;j++) outv[j]*=gv[j];                 /* gate */
+            if (!rwkv_mm(g,&L->output,outv,ne,tmp,ne)) return 1;        /* output proj */
+            for (uint32_t j=0;j<ne;j++) resid[j]+=tmp[j];
+            memcpy(pt,cur,(size_t)ne*4);                                /* token-shift state */
+
+            /* ---- channel mix ---- */
+            rwkv_layernorm(resid,(const float*)L->attn_norm_2.data,(const float*)L->attn_norm_2_b.data,ne,g->eps,cur);
+            { const float *lk=(const float*)L->cm_lerp_k.data;
+              for (uint32_t j=0;j<ne;j++) tmp[j]=cur[j]+(pc[j]-cur[j])*lk[j]; }
+            if (!rwkv_mm(g,&L->cm_key,tmp,ne,ff,nff)) return 1;
+            for (uint32_t j=0;j<nff;j++){ float v=ff[j]; v=v>0?v:0; ff[j]=v*v; }   /* relu^2 */
+            if (!rwkv_mm(g,&L->cm_value,ff,nff,tmp,ne)) return 1;
+            for (uint32_t j=0;j<ne;j++) resid[j]+=tmp[j];
+            memcpy(pc,cur,(size_t)ne*4);
+        }
+        /* final ln + output */
+        rwkv_layernorm(resid,(const float*)d->output_norm.data,(const float*)d->output_norm_b.data,ne,g->eps,cur);
+        if (!rwkv_mm(g,&d->output,cur,ne,logits,g->n_vocab)) return 1;
+        return 0;
+    }
+}
+
+void ds4_rwkv7_gpu_free(ds4_rwkv7_gpu *g) {
+    if (!g) return;
+    for (int i=0;i<g->nw;i++) ds4_gpu_tensor_free(g->wbuf[i]);
+    free(g->wkey); free(g->wbuf);
+    ds4_gpu_tensor_free(g->gA); ds4_gpu_tensor_free(g->gB);
+    free(g->prev_time); free(g->prev_chan); free(g->wkv); free(g->cpu); free(g);
+}
+
 /* ===== gpt-oss forward driver ============================================== */
 struct ds4_gptoss_gpu {
     uint32_t n_layer, n_embd, n_vocab, n_ctx, n_head, n_kv, head_dim, n_rot, qd, kvd, nff, n_expert, n_expert_used, n_swa;
