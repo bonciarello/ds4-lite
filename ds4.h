@@ -208,7 +208,9 @@ typedef struct {
     float    rope_base_local;   /* sliding-layer RoPE base (gemma: 10000) */
     float    rope_scale_local;  /* sliding-layer RoPE freq_scale (gemma: 1.0) */
     unsigned swa_window;        /* sliding-window size (gemma: 1024); 0 -> full attention */
-    unsigned swa_pattern;       /* 1 global every swa_pattern layers (gemma: 6) */
+    unsigned swa_pattern;       /* 1 global every swa_pattern layers (gemma3: 6, gemma2: 2) */
+    float    attn_softcap;      /* gemma-2 attn_logit_softcapping (=50); 0 -> off */
+    float    final_softcap;     /* gemma-2 final_logit_softcapping (=30); 0 -> off */
     /* MoE FFN (n_expert==0 -> plain dense FFN). qwen3moe etc.: router top-k of n_expert experts. */
     unsigned n_expert;          /* total experts; 0 = dense */
     unsigned n_expert_used;     /* experts routed per token (top-k) */

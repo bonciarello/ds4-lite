@@ -4371,9 +4371,15 @@ static bool dense_swiglu(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tens
 
 static bool dense_attn(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *q,
                        ds4_gpu_tensor *kc, ds4_gpu_tensor *vc,
-                       uint32_t nh, uint32_t nkv, uint32_t hd, uint32_t nctx, float scale) {
+                       uint32_t nh, uint32_t nkv, uint32_t hd, uint32_t nctx, float scale, float softcap) {
     struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale; } a = { nh, nkv, hd, nctx, scale };
     ds4_gpu_tensor *bufs[4] = { q, kc, vc, out };
+    if (softcap > 0.0f) {   /* gemma-2: logit soft-capping -> simdgroup softcap kernel (one simdgroup/head, f16 KV) */
+        struct __attribute__((packed)) { uint32_t n_head, n_kv, head_dim, n_ctx; float scale, softcap; } sc =
+            { nh, nkv, hd, nctx, scale, softcap };
+        return ds4_gpu_run_grid("kernel_dense_attn_decode_softcap_f32", &sc, sizeof(sc), bufs, 4,
+                                MTLSizeMake(nh, 1, 1), MTLSizeMake(32, 1, 1), "fwd attn softcap");
+    }
     if (getenv("DS4_ATTN_SCALAR"))  /* A/B: the old 28-thread kernel */
         return ds4_gpu_run_simple("kernel_dense_attn_decode_f32", &a, sizeof(a), bufs, 4, nh, "fwd attn");
 
@@ -4447,9 +4453,10 @@ static bool dense_kv_write(ds4_dense_gpu *g, ds4_dense_kv_layer *kv, uint32_t ws
 }
 /* Attention over the first n_attn cache slots [0, n_attn). */
 static bool dense_kv_read_attn(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_dense_kv_layer *kv,
-                               uint32_t nh, uint32_t nkv, uint32_t hd, uint32_t n_attn, float scale) {
+                               uint32_t nh, uint32_t nkv, uint32_t hd, uint32_t n_attn, float scale, float softcap) {
     const uint32_t kvd = nkv*hd;
     if (g->kv_int8) {
+        /* int8 KV path has no softcap variant; gemma-2 (the only softcap user) runs f16 KV by default. */
         ds4_gpu_tensor *kc  = ds4_gpu_tensor_view(kv->k, 0, (uint64_t)n_attn*kvd);
         ds4_gpu_tensor *vc  = ds4_gpu_tensor_view(kv->v, 0, (uint64_t)n_attn*kvd);
         ds4_gpu_tensor *ksc = ds4_gpu_tensor_view(kv->kscale, 0, (uint64_t)n_attn*4);
@@ -4460,7 +4467,7 @@ static bool dense_kv_read_attn(ds4_dense_gpu *g, ds4_gpu_tensor *out, ds4_gpu_te
     }
     ds4_gpu_tensor *kc = ds4_gpu_tensor_view(kv->k, 0, (uint64_t)n_attn*kvd*2);
     ds4_gpu_tensor *vc = ds4_gpu_tensor_view(kv->v, 0, (uint64_t)n_attn*kvd*2);
-    bool ok = kc && vc && dense_attn(g, out, q, kc, vc, nh, nkv, hd, n_attn, scale);
+    bool ok = kc && vc && dense_attn(g, out, q, kc, vc, nh, nkv, hd, n_attn, scale, softcap);
     ds4_gpu_tensor_free(kc); ds4_gpu_tensor_free(vc);
     return ok;
 }
@@ -5281,12 +5288,13 @@ static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d
               && dense_matvec(g, &L->attn_q, g->h, g->q)
               && dense_matvec(g, &L->attn_k, g->h, g->k)
               && dense_matvec(g, &L->attn_v, g->h, g->v)
-              && gemma_qk_norm(g, g->q, &L->attn_q_norm, nh,  hd, eps)
-              && gemma_qk_norm(g, g->k, &L->attn_k_norm, nkv, hd, eps)
+              /* QK-norm only if the model has it (gemma-3 yes, gemma-2 no). */
+              && (L->attn_q_norm.data ? gemma_qk_norm(g, g->q, &L->attn_q_norm, nh,  hd, eps) : true)
+              && (L->attn_k_norm.data ? gemma_qk_norm(g, g->k, &L->attn_k_norm, nkv, hd, eps) : true)
               && gemma_rope(g->q, nh,  hd, nrot, pos, rbase, rscale)
               && gemma_rope(g->k, nkv, hd, nrot, pos, rbase, rscale)
               && dense_kv_write(g, kv, wslot, kvd)                                  /* f16 or int8 + scale */
-              && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv, hd, n_attn, scale)
+              && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv, hd, n_attn, scale, d->attn_softcap)
               && dense_matvec(g, &L->attn_out, g->att, g->o)
               && gemma_rms(g, g->h, g->o, &L->attn_post_norm, ne, eps)
               && dense_add(g->x, g->h, ne)
@@ -5307,6 +5315,12 @@ static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d
         }
         if (!ok) return 1;
         ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)d->n_vocab*4);
+        /* gemma-2 final logit soft-capping: logits = cap*tanh(logits/cap). Monotonic, so it does
+         * not change the greedy argmax, but it matters for sampling and exact-logit parity. */
+        if (d->final_softcap > 0.0f) {
+            const float cap = d->final_softcap, inv = 1.0f / cap;
+            for (uint32_t i = 0; i < d->n_vocab; i++) logits[i] = cap * tanhf(logits[i] * inv);
+        }
         return 0;
     }
 }
@@ -5419,7 +5433,7 @@ int ds4_dense_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d,
               && dense_rope(g->q, nh,  hd, nrot, pos, base)
               && dense_rope(g->k, nkv, hd, nrot, pos, base)
               && dense_kv_write(g, kv, pos, kvd)
-              && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv, hd, pos+1, scale)
+              && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv, hd, pos+1, scale, 0.0f)
               && dense_matvec(g, &L->attn_out, g->att, g->o)
               && dense_add_bias(g, g->o, &L->attn_out_bias, ne);   /* g->o = attention output (pre-residual) + bias (phi-2) */
             const double ta1 = g->profile ? ds4_gpu_now_ms() : 0.0;

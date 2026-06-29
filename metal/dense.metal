@@ -1818,6 +1818,75 @@ kernel void kernel_dense_attn_decode_f32(
     for (uint d = 0; d < hd; d++) oh[d] *= inv;
 }
 
+// gemma-2 attention decode with logit soft-capping. Mirrors kernel_dense_attn_decode_f32_sg
+// (one simdgroup of 32 lanes per query head, online softmax, f16 KV cache), adding the cap:
+// s = cap * tanh(s / cap) applied to each score AFTER q·k·scale, BEFORE the softmax. The tanh
+// argument is clamped to ±15 (Metal fast-math tanh overflows -> NaN for large |arg|; gemma-2
+// has no QK-norm so q·k can be huge). Dispatch: threadgroups=(n_head,1,1), threads=(32,1,1).
+struct ds4_dense_attn_softcap_args {
+    uint  n_head;
+    uint  n_kv;
+    uint  head_dim;
+    uint  n_ctx;
+    float scale;
+    float softcap;
+};
+kernel void kernel_dense_attn_decode_softcap_f32(
+        constant ds4_dense_attn_softcap_args & a [[buffer(0)]],
+        device const float * q      [[buffer(1)]],
+        device const float * kcache [[buffer(2)]],
+        device const float * vcache [[buffer(3)]],
+        device       float * out    [[buffer(4)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]]) {
+    const uint hq = tgpig.x;
+    if (hq >= a.n_head) return;
+    const uint group = a.n_head / a.n_kv;
+    const uint hkv = hq / group;
+    const uint hd = a.head_dim;
+    const uint kvdim = a.n_kv * hd;
+    const float cap = a.softcap;
+    device const float * qh = q + hq * hd;
+    device       float * oh = out + hq * hd;
+
+    const uint ndl = (hd + 31u) / 32u;   // dims per lane (<= 8)
+    float qreg[8];
+    float acc[8];
+    for (uint j = 0; j < ndl; j++) {
+        const uint d = lane + 32u*j;
+        qreg[j] = (d < hd) ? qh[d] : 0.0f;
+        acc[j]  = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (uint t = 0; t < a.n_ctx; t++) {
+        device const half * kt = (device const half *)kcache + (ulong)t*kvdim + hkv*hd;
+        float p = 0.0f;
+        for (uint j = 0; j < ndl; j++) {
+            const uint d = lane + 32u*j;
+            if (d < hd) p += qreg[j] * (float)kt[d];
+        }
+        float s = simd_sum(p) * a.scale;
+        if (cap > 0.0f) s = cap * tanh(clamp(s / cap, -15.0f, 15.0f));
+        const float m_new = max(m, s);
+        const float corr  = exp(m - m_new);     // first iter: exp(-inf)=0
+        const float pe    = exp(s - m_new);
+        l = l * corr + pe;
+        device const half * vt = (device const half *)vcache + (ulong)t*kvdim + hkv*hd;
+        for (uint j = 0; j < ndl; j++) {
+            const uint d = lane + 32u*j;
+            if (d < hd) acc[j] = acc[j]*corr + pe * (float)vt[d];
+        }
+        m = m_new;
+    }
+    const float inv = 1.0f / l;
+    for (uint j = 0; j < ndl; j++) {
+        const uint d = lane + 32u*j;
+        if (d < hd) oh[d] = acc[j] * inv;
+    }
+}
+
 // Optimized attention decode (Fase opt step 3). One simdgroup (32 lanes) per
 // query head, single online-softmax pass over the KV cache. Lane L owns output
 // dims {L, L+32, ...}; the q·k score is reduced across the 32 lanes via

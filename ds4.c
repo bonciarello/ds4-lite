@@ -157,6 +157,7 @@ typedef enum {
     DS4_ARCH_QWEN3NEXT = 2,  /* hybrid Gated-DeltaNet linear-attn + MoE (see docs/QWEN3NEXT_PLAN.md) */
     DS4_ARCH_GEMMA3    = 3,  /* dense transformer + gemma quirks: 4 norms/layer, QK-norm, GeGLU, sliding-window */
     DS4_ARCH_GPTOSS    = 4,  /* gpt-oss: MoE (top-4/32) + GQA + attention sinks + sliding-window + YaRN + MXFP4 */
+    DS4_ARCH_GEMMA2    = 5,  /* like gemma3 but NO QK-norm + logit soft-capping (attn 50, final 30), SWA every other layer */
 } ds4_arch_family;
 
 typedef struct {
@@ -379,6 +380,7 @@ static int g_ds4_lock_fd = -1;
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_deepseek(void) { return DS4_ARCH == DS4_ARCH_DEEPSEEK; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_qwen3next(void) { return DS4_ARCH == DS4_ARCH_QWEN3NEXT; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma3(void) { return DS4_ARCH == DS4_ARCH_GEMMA3; }
+DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma2(void) { return DS4_ARCH == DS4_ARCH_GEMMA2; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gptoss(void) { return DS4_ARCH == DS4_ARCH_GPTOSS; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_moe(void)     { return DS4_N_EXPERT != 0; }
 DS4_MAYBE_UNUSED static inline bool ds4_has_mla(void)     { return DS4_N_LORA_Q != 0; }
@@ -4219,6 +4221,18 @@ static void config_build_gemma3_shape(const ds4_model *m) {
     g_ds4_shape.n_swa = swa ? swa : 1024u;
 }
 
+/* gemma2 (general.architecture == "gemma2"): the predecessor of gemma3 — same sandwich norms
+ * (4/layer), GeGLU and embedding scale, but NO per-head QK-norm, plus attention + final logit
+ * soft-capping and sliding window on every OTHER layer (pattern 2). Runs the gemma forward. */
+static void config_build_gemma2_shape(const ds4_model *m) {
+    config_build_dense_shape(m, "gemma2");
+    g_ds4_shape.arch = DS4_ARCH_GEMMA2;
+    g_ds4_shape.name = "gemma2";
+    uint32_t swa = 0;
+    model_get_u32_ns(m, "gemma2", "attention.sliding_window", &swa);
+    g_ds4_shape.n_swa = swa ? swa : 4096u;
+}
+
 /* gpt-oss (general.architecture == "gpt-oss"): MoE (top-4/32) transformer with GQA,
  * per-head attention sinks, alternating sliding-window/full attention, YaRN RoPE, and a
  * clamped-SwiGLU expert activation. Phase 0: read the shape; the forward is NOT built yet
@@ -4301,6 +4315,10 @@ static void config_validate_model(const ds4_model *m) {
     }
     if (ds4_str_eq_cstr(arch, "gemma3")) {           /* dense + gemma quirks (runs the dense driver) */
         config_build_gemma3_shape(m);
+        return;
+    }
+    if (ds4_str_eq_cstr(arch, "gemma2")) {           /* gemma quirks + soft-capping (runs the gemma forward) */
+        config_build_gemma2_shape(m);
         return;
     }
     if (ds4_str_eq_cstr(arch, "gpt-oss")) {          /* MoE + sinks + sliding-window + YaRN (Phase 0: shape only) */
@@ -4612,8 +4630,8 @@ static void weights_bind_layer_dense(ds4_layer_weights *l, const ds4_model *m, u
      * (qwen2/llama/mistral). The dense forward applies it (before RoPE) only when present. */
     l->attn_q_norm = tensor_by_namef(m, "blk.%u.attn_q_norm.weight", il);
     l->attn_k_norm = tensor_by_namef(m, "blk.%u.attn_k_norm.weight", il);
-    /* gemma3 extra norms: post-attention + post-ffn (gemma-only). */
-    if (ds4_arch_is_gemma3()) {
+    /* gemma2/gemma3 extra norms: post-attention + post-ffn (same tensor names in both). */
+    if (ds4_arch_is_gemma3() || ds4_arch_is_gemma2()) {
         l->attn_post_norm = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);
         l->ffn_post_norm  = required_tensorf(m, "blk.%u.post_ffw_norm.weight", il);
     }
@@ -26436,24 +26454,49 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
     {
         const char *arch = g_ds4_shape.name ? g_ds4_shape.name : "";
         desc->ffn_geglu = (strcmp(arch, "gemma2") == 0);
-        desc->parallel_residual = (strcmp(arch, "gptneox") == 0 || strcmp(arch, "phi2") == 0 ||
-                                   strcmp(arch, "stablelm") == 0 || strcmp(arch, "persimmon") == 0);
+        const bool arch_parallel = (strcmp(arch, "gptneox") == 0 || strcmp(arch, "phi2") == 0 ||
+                                    strcmp(arch, "stablelm") == 0 || strcmp(arch, "persimmon") == 0);
+        /* Parallel residual is only taken when the arch has NO separate ffn_norm: with one
+         * present (e.g. stablelm-2), llama.cpp ignores use_parallel_residual and runs the
+         * standard sequential graph — attn residual, then ffn_norm, then FFN. Gating on the
+         * bound ffn_norm tensor matches that exactly (phi-2/gptneox have none -> parallel). */
+        desc->parallel_residual = arch_parallel && (weights->layer[0].ffn_norm == NULL);
     }
     /* gemma3: dense transformer with gemma quirks. Embedding scaling, attention
      * scale on query_pre_attn_scalar (= n_embd/n_head for the 27B), GeGLU, per-head
      * QK-norm, 4 norms/layer, and sliding-window attention with a separate RoPE base
      * (10000, freq_scale 1.0) on local layers vs the global base (1e6, freq_scale
      * 0.125). See config_build_gemma3_shape. */
-    const bool gemma = ds4_arch_is_gemma3();
+    const bool gemma3 = ds4_arch_is_gemma3();
+    const bool gemma2 = ds4_arch_is_gemma2();
+    const bool gemma = gemma3 || gemma2;
     if (gemma) {
         desc->gemma            = 1;
         desc->embed_scale      = sqrtf((float)DS4_N_EMBD);
+        desc->swa_window       = g_ds4_shape.n_swa ? g_ds4_shape.n_swa : (gemma2 ? 4096u : 1024u);
+    }
+    if (gemma3) {
         desc->attn_scale       = 1.0f / sqrtf((float)DS4_N_EMBD / (float)DS4_N_HEAD);
         desc->rope_scale       = 0.125f;     /* global linear freq_scale (rope_scale_factor 8) */
         desc->rope_base_local  = 10000.0f;
         desc->rope_scale_local = 1.0f;
-        desc->swa_window       = g_ds4_shape.n_swa ? g_ds4_shape.n_swa : 1024u;
         desc->swa_pattern      = 6u;
+    } else if (gemma2) {
+        /* gemma-2: single RoPE base (no linear scaling), sliding window on every OTHER layer
+         * (pattern 2 -> global at il%2==1), NO per-head QK-norm, and logit soft-capping on both
+         * the attention scores (=50) and the final logits (=30). Attention scale is
+         * 1/sqrt(query_pre_attn_scalar) when set, else 1/sqrt(head_dim) (exact for the 2B, where
+         * query_pre_attn_scalar == head_dim == 256). */
+        float qpas = 0.0f;
+        model_get_f32_ns(model, "gemma2", "attention.query_pre_attn_scalar", &qpas);
+        desc->attn_scale       = qpas > 0.0f ? 1.0f / sqrtf(qpas) : 0.0f;  /* 0 -> forward uses 1/sqrt(hd) */
+        desc->rope_scale       = 1.0f;
+        desc->rope_base_local  = desc->rope_base;
+        desc->rope_scale_local = 1.0f;
+        desc->swa_pattern      = 2u;
+        float sc = 0.0f;
+        desc->attn_softcap  = model_get_f32_ns(model, "gemma2", "attn_logit_softcapping",  &sc) ? sc : 50.0f;
+        desc->final_softcap = model_get_f32_ns(model, "gemma2", "final_logit_softcapping", &sc) ? sc : 30.0f;
     }
     /* YaRN / NTK-aware context extension: when the requested context exceeds the
      * model's native training context, scale the RoPE base so positions stay in
@@ -28475,7 +28518,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         return 1;
     }
     const int is_q3n = ds4_arch_is_qwen3next();   /* same chat loop drives dense + qwen3_next */
-    const int is_gemma = ds4_arch_is_gemma3();    /* gemma3 uses its own turn template */
+    const int is_gemma = ds4_arch_is_gemma3() || ds4_arch_is_gemma2();  /* gemma turn template (same for 2/3) */
     vocab_load(&vocab, &model);
     if (ds4_arch_is_gptoss()) {                   /* gpt-oss: its own harmony REPL */
         const int rc = ds4_gptoss_chat(&model, &vocab, model_path, ctx_size);
