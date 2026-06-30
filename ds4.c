@@ -23766,6 +23766,10 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
             vocab->user_id      = vocab_lookup_optional(vocab, "<start_of_turn>");
             vocab->assistant_id = vocab_lookup_optional(vocab, "<end_of_turn>");
         }
+        if (vocab->user_id < 0) {                            /* gemma4: <|turn> (turn start) / <turn|> (turn end) */
+            vocab->user_id      = vocab_lookup_optional(vocab, "<|turn>");
+            vocab->assistant_id = vocab_lookup_optional(vocab, "<turn|>");
+        }
         if (vocab->user_id < 0) {                            /* phi-3: role-specific <|user|>/<|assistant|>/<|end|> */
             const int pu = vocab_lookup_optional(vocab, "<|user|>");
             const int pa = vocab_lookup_optional(vocab, "<|assistant|>");
@@ -27729,6 +27733,22 @@ static char *dense_chat_gen_response(int is_q3n, ds4_dense_gpu *g, const ds4_den
                 md_flush(&md); if (md.emitted_any) putchar('\n');
                 dense_sbuf_append(&ans, &ans_len, &ans_cap, "<tool_call>", 11);
                 printf("\033[2m\xe2\x80\xa6\033[0m"); fflush(stdout);
+            } else if (pend_len >= 10 && memcmp(pend + pend_len - 10, "<channel|>", 10) == 0) {
+                /* gemma4 reasoning-channel CLOSE (like </think>): the reasoning printed dimmed,
+                 * the marker is dropped, and what follows prints as the normal answer. */
+                const int pre = pend_len - 10;
+                if (pre > 0) { if (in_think) fwrite(pend, 1, (size_t)pre, stdout);
+                               else { md_feed(&md, pend, pre); dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); } }
+                pend_len = 0;
+                if (in_think) { printf("\033[0m\n"); in_think = false; }
+            } else if (pend_len >= 10 && memcmp(pend + pend_len - 10, "<|channel>", 10) == 0) {
+                /* gemma4 reasoning-channel OPEN (like <think>): dim the channel content (its name
+                 * + reasoning) so only the post-channel answer prints normally. */
+                const int pre = pend_len - 10;
+                if (pre > 0) { if (in_think) fwrite(pend, 1, (size_t)pre, stdout);
+                               else { md_feed(&md, pend, pre); dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); } }
+                pend_len = 0;
+                if (!in_think) { printf("\033[2m\xf0\x9f\x92\xad "); in_think = true; }
             } else if (pend_len > 11) {
                 const char b = pend[0];
                 if (in_think) { fwrite(&b, 1, 1, stdout); }
@@ -28115,9 +28135,19 @@ static int dense_term_width(void);   /* fwd: current terminal width (clamped) */
 static void dense_tool_render(const char *name, const char *args, const char *res, size_t rl) {
     const int tw = dense_term_width();
     int maxw = tw - 2 - 2*DENSE_MARGIN; if (maxw < 16) maxw = 16;   /* margin + "│ " + line */
-    /* header: (margin) 🔧 name  (args dimmed, clipped to width) */
+    /* header: (margin) 🔧 name  <key arg>. Show the MEANINGFUL argument (path/command/pattern)
+     * instead of the raw JSON blob — write_file's args are the whole file content, which is
+     * unreadable as JSON. */
+    char summ[2048] = {0};
+    if      (!strcmp(name, "bash"))                              dense_json_str(args, "command", summ, sizeof summ);
+    else if (!strcmp(name, "grep") || !strcmp(name, "glob"))     dense_json_str(args, "pattern", summ, sizeof summ);
+    else if (!strcmp(name, "web_search"))                        dense_json_str(args, "query",   summ, sizeof summ);
+    else if (!strcmp(name, "web_fetch"))                         dense_json_str(args, "url",     summ, sizeof summ);
+    else                                                         dense_json_str(args, "path",    summ, sizeof summ);
+    if (!summ[0]) snprintf(summ, sizeof summ, "%s", args ? args : "{}");   /* fallback: raw args */
+    for (char *s = summ; *s; s++) if (*s == '\n' || *s == '\r' || *s == '\t') *s = ' ';   /* one line */
     char hdr[4096]; int argroom = maxw - (int)strlen(name) - 2; if (argroom < 4) argroom = 4;
-    int hl = snprintf(hdr, sizeof hdr, "\033[1;36m\xf0\x9f\x94\xa7 %s\033[0m \033[2m%.*s\033[0m", name, argroom, args ? args : "{}");
+    int hl = snprintf(hdr, sizeof hdr, "\033[1;36m\xf0\x9f\x94\xa7 %s\033[0m  \033[2m%.*s\033[0m", name, argroom, summ);
     if (hl >= (int)sizeof hdr) hl = (int)sizeof hdr - 1;
     putchar('\n'); dense_emit_wrapped(hdr, hl, 0);
     /* write_file/edit_file: render the captured diff instead of the plain result */
@@ -28456,13 +28486,14 @@ static char *dense_readline(const char *prompt, const char *model_path,
  * response token (the prefill wait). Runs on its own thread; the main thread sets
  * g_spin_run = 0 and joins when output is about to stream. */
 static volatile sig_atomic_t g_spin_run = 0;
+static const char *g_spin_msg = "thinking…";   /* spinner label (set per phase: thinking / working) */
 static void *dense_spinner_thread(void *arg) {
     (void)arg;
     static const char *fr[10] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
     const double t0 = now_sec();
     for (int i = 0; g_spin_run; i++) {
-        printf("\r\033[36m%s\033[0m \033[2mthinking… %.1fs\033[0m\033[K",
-               fr[i % 10], now_sec() - t0);
+        printf("\r\033[36m%s\033[0m \033[2m%s %.1fs\033[0m\033[K",
+               fr[i % 10], g_spin_msg, now_sec() - t0);
         fflush(stdout);
         usleep(90000);
     }
@@ -29016,7 +29047,7 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
         return 1;
     }
     const int is_q3n = ds4_arch_is_qwen3next();   /* same chat loop drives dense + qwen3_next */
-    const int is_gemma = ds4_arch_is_gemma3() || ds4_arch_is_gemma2();  /* gemma turn template (same for 2/3) */
+    const int is_gemma = ds4_arch_is_gemma3() || ds4_arch_is_gemma2() || ds4_arch_is_gemma4();  /* gemma turn template (2/3 use <start/end_of_turn>+"model"; gemma4 uses <|turn>/<turn|>+"model") */
     vocab_load(&vocab, &model);
     if (ds4_arch_is_gptoss()) {                   /* gpt-oss: its own harmony REPL */
         const int rc = ds4_gptoss_chat(&model, &vocab, model_path, ctx_size);
@@ -29490,9 +29521,19 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                 dense_open_asst(&tr, &vocab, im_start, asst_primer);
                 if (think_turn) bpe_tokenize_text(&vocab, "<think>\n", &tr);
                 (void)wn;
+                /* loading spinner while the model digests the tool result (prefill) before it
+                 * streams the next step — otherwise this gap shows no activity. */
+                pthread_t tspin; int tspin_on = 0;
+                if (isatty(STDOUT_FILENO)) {
+                    g_spin_msg = "working…";
+                    printf("\r\033[36m\xe2\xa0\x8b\033[0m \033[2mworking…\033[0m\033[K"); fflush(stdout);
+                    g_spin_run = 1;
+                    if (pthread_create(&tspin, NULL, dense_spinner_thread, NULL) == 0) tspin_on = 1; else g_spin_run = 0;
+                }
                 for (uint32_t i = 0; i < (uint32_t)tr.len && pos < n_ctx - 1u && rc == 0; i++)
                     if (chat_step(is_q3n, g, &desc, qg, &qdesc, tr.v[i], pos++, logits) != 0) rc = 1;
                 token_vec_free(&tr);
+                if (tspin_on) { g_spin_run = 0; pthread_join(tspin, NULL); g_spin_msg = "thinking…"; }
                 if (rc) break;
                 free(ans);
                 ans = dense_chat_gen_response(is_q3n, g, &desc, qg, &qdesc, &vocab, &pos, n_ctx, logits, im_end,
