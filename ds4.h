@@ -191,6 +191,12 @@ typedef struct {
     ds4_dense_wdesc attn_norm_bias, ffn_norm_bias;
     /* phi-2: bias on attn_output + the FFN up/down projections (NULL when absent). */
     ds4_dense_wdesc attn_out_bias, ffn_up_bias, ffn_down_bias;
+    /* gemma4: heterogeneous per-layer attention dims (0 -> use the model-wide d->head_dim/n_kv/n_rot).
+     * SWA layers: head_dim 256 / 16 KV heads / rope base 1e4; FULL: 512 / 4 / 1e6 + rope_freqs. */
+    unsigned head_dim, n_kv, n_rot;     /* per-layer; 0 = fall back to the uniform model values */
+    float    rope_base_layer;           /* per-layer rope base (gemma4 swa 1e4 / full 1e6); 0 = use desc */
+    float    out_scale;                 /* gemma4 layer_output_scale scalar (cur *= out_scale); 0 = none */
+    ds4_dense_wdesc rope_freqs;         /* gemma4 full-attn proportional-rope freq factors [n_rot/2]; NULL otherwise */
 } ds4_dense_layer_desc;
 
 typedef struct {
@@ -202,6 +208,7 @@ typedef struct {
     unsigned long long  model_size; /* mmapped model size in bytes */
     /* gemma3 extensions (gemma==0 -> plain dense path, all fields below ignored). */
     int      gemma;             /* 1 when the gemma3 forward variant should run */
+    int      gemma4;            /* 1 for gemma4: per-layer head dims, V-norm, layer out_scale, rope freq_factors */
     float    embed_scale;       /* token embeddings scaled by this (sqrt(n_embd)) */
     float    attn_scale;        /* attention softmax scale; 0 -> default 1/sqrt(head_dim) */
     float    rope_scale;        /* global-layer RoPE linear freq_scale (gemma: 0.125) */

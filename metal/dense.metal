@@ -1877,9 +1877,9 @@ kernel void kernel_dense_attn_decode_softcap_f32(
     device const float * qh = q + hq * hd;
     device       float * oh = out + hq * hd;
 
-    const uint ndl = (hd + 31u) / 32u;   // dims per lane (<= 8)
-    float qreg[8];
-    float acc[8];
+    const uint ndl = (hd + 31u) / 32u;   // dims per lane (<= 16, i.e. head_dim <= 512 for gemma4 full layers)
+    float qreg[16];
+    float acc[16];
     for (uint j = 0; j < ndl; j++) {
         const uint d = lane + 32u*j;
         qreg[j] = (d < hd) ? qh[d] : 0.0f;
@@ -1938,9 +1938,9 @@ kernel void kernel_dense_attn_decode_f32_sg(
     device const float * qh = q + hq * hd;
     device       float * oh = out + hq * hd;
 
-    const uint ndl = (hd + 31u) / 32u;   // dims per lane (<= 8)
-    float qreg[8];
-    float acc[8];
+    const uint ndl = (hd + 31u) / 32u;   // dims per lane (<= 16, i.e. head_dim <= 512 for gemma4 full layers)
+    float qreg[16];
+    float acc[16];
     for (uint j = 0; j < ndl; j++) {
         const uint d = lane + 32u*j;
         qreg[j] = (d < hd) ? qh[d] : 0.0f;
@@ -2209,10 +2209,11 @@ kernel void kernel_dense_gelu_f32(
 }
 
 // Gemma NEOX RoPE with a linear freq_scale: theta = pos * freq_scale * freq.
-struct ds4_gemma_rope_args { uint n_head; uint head_dim; uint n_rot; uint pos; float freq_base; float freq_scale; };
+struct ds4_gemma_rope_args { uint n_head; uint head_dim; uint n_rot; uint pos; float freq_base; float freq_scale; uint use_ff; };
 kernel void kernel_gemma_rope_neox_f32(
         constant ds4_gemma_rope_args & a [[buffer(0)]],
         device float * x [[buffer(1)]],
+        device const float * ff [[buffer(2)]],   /* freq_factors [n_rot/2]; used only when a.use_ff */
         uint gid [[thread_position_in_grid]]) {
     const uint rot_half = a.n_rot / 2u;
     const uint total = a.n_head * rot_half;
@@ -2221,7 +2222,10 @@ kernel void kernel_gemma_rope_neox_f32(
     const uint i = gid % rot_half;
     device float * head = x + h * a.head_dim;
     const float freq  = pow(a.freq_base, -2.0f * (float)i / (float)a.n_rot);
-    const float theta = (float)a.pos * a.freq_scale * freq;
+    /* gemma4 full-attention layers scale the per-dim frequency by rope_freqs (proportional rope):
+     * theta_i = pos * freq_scale * freq / freq_factors[i]. */
+    const float ffac  = a.use_ff ? ff[i] : 1.0f;
+    const float theta = (float)a.pos * a.freq_scale * freq / ffac;
     const float c = cos(theta);
     const float s = sin(theta);
     const float x0 = head[i];
@@ -2588,8 +2592,8 @@ kernel void kernel_dense_attn_decode_split_f32(
     const uint t0 = sp * a.chunk;
     uint t1 = t0 + a.chunk; if (t1 > a.n_ctx) t1 = a.n_ctx;
 
-    const uint ndl = (hd + 31u) / 32u;
-    float qreg[8], acc[8];
+    const uint ndl = (hd + 31u) / 32u;   // <= 16 (head_dim <= 512 for gemma4 full layers)
+    float qreg[16], acc[16];
     for (uint j = 0; j < ndl; j++) { const uint d = lane + 32u*j; qreg[j] = (d < hd) ? qh[d] : 0.0f; acc[j] = 0.0f; }
     float m = -INFINITY, l = 0.0f;
     for (uint t = t0; t < t1; t++) {
@@ -2926,6 +2930,34 @@ kernel void kernel_dense_mul_mv_q8_0_f32(
         device const float  * xb = x + (ulong)bi * 32u;
         float s = 0.0f;
         for (uint l = 0; l < 32u; l++) s += (float)qs[l] * xb[l];
+        acc += d * s;
+    }
+    out[row] = acc;
+}
+
+/* Q4_0 legacy matvec: 18-byte blocks {half d; uchar qs[16]}. Signed 4-bit (q-8): lo-nibble j -> pos j,
+ * hi-nibble j -> pos j+16. One thread/row. */
+kernel void kernel_dense_mul_mv_q4_0_f32(
+        constant ds4_dense_mvq_args & a [[buffer(0)]],
+        device const char  * W   [[buffer(1)]],
+        device const float * x   [[buffer(2)]],
+        device       float * out [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= a.out_dim) return;
+    const uint nblk = a.in_dim / 32u;
+    const uint BLK = 18u;
+    float acc = 0.0f;
+    for (uint bi = 0; bi < nblk; bi++) {
+        device const char * blk = W + (ulong)(row * nblk + bi) * BLK;
+        const float d = (float)(*(device const half *)(blk + 0));
+        device const uchar * qs = (device const uchar *)(blk + 2);
+        device const float * xb = x + (ulong)bi * 32u;
+        float s = 0.0f;
+        for (uint j = 0; j < 16u; j++) {
+            const int q0 = (int)(qs[j] & 0x0F) - 8;
+            const int q1 = (int)(qs[j] >>   4) - 8;
+            s += (float)q0 * xb[j] + (float)q1 * xb[j + 16u];
+        }
         acc += d * s;
     }
     out[row] = acc;
@@ -3536,6 +3568,38 @@ kernel void kernel_dense_head_rms_norm_f32(
     for (uint i = 0; i < a.head_dim; ++i) ss += xh[i] * xh[i];
     const float scale = 1.0f / sqrt(ss / (float)a.head_dim + a.eps);
     for (uint i = 0; i < a.head_dim; ++i) oh[i] = xh[i] * scale * w[i];
+}
+
+/* gemma4 weightless per-head RMS on V before the attention (Vcur = ggml_rms_norm, no gain). One
+ * thread per head; in-place safe (each head reads fully then writes). bufs: x(in/out). */
+kernel void kernel_gemma_v_norm_f32(
+        constant dense_head_rms_args & a [[buffer(0)]],
+        device       float * x   [[buffer(1)]],   /* [n_head, head_dim] in-place */
+        uint h [[thread_position_in_grid]]) {
+    if (h >= a.n_head) return;
+    device float * xh = x + (size_t)h * a.head_dim;
+    float ss = 0.0f;
+    for (uint i = 0; i < a.head_dim; ++i) ss += xh[i] * xh[i];
+    const float scale = 1.0f / sqrt(ss / (float)a.head_dim + a.eps);
+    for (uint i = 0; i < a.head_dim; ++i) xh[i] = xh[i] * scale;
+}
+
+/* Scale a vector by a scalar in place: x[i] *= s. (gemma4 per-layer layer_output_scale.) */
+struct dense_scale_args { uint n; float s; };
+kernel void kernel_dense_scale_f32(
+        constant dense_scale_args & a [[buffer(0)]],
+        device float * x [[buffer(1)]],
+        uint i [[thread_position_in_grid]]) {
+    if (i < a.n) x[i] *= a.s;
+}
+
+/* Copy a vector: out[i] = in[i]. (gemma4 full-attn layers reuse the raw K projection as V.) */
+kernel void kernel_dense_copy_f32(
+        constant uint & n [[buffer(0)]],
+        device const float * in  [[buffer(1)]],
+        device       float * out [[buffer(2)]],
+        uint i [[thread_position_in_grid]]) {
+    if (i < n) out[i] = in[i];
 }
 
 /* Sigmoid output gate: out[i] = x[i] * sigmoid(gate[i]). qwen3_next gates both the

@@ -4203,6 +4203,20 @@ static bool ds4_dense_embed_row(int type, const void *data, uint32_t token, uint
             }
             return true;
         }
+        case 2: {  /* Q4_0: 32-elem blocks (2B f16 d + 16B qs) = 18B; signed nibble q-8 */
+            const uint32_t nblk = ne / 32u;
+            const uint8_t *row = (const uint8_t *)data + (size_t)token*nblk*18u;
+            for (uint32_t b = 0; b < nblk; b++) {
+                const uint8_t *blk = row + (size_t)b*18u;
+                __fp16 dh; memcpy(&dh, blk, 2); const float d = (float)dh;
+                const uint8_t *qs = blk + 2;
+                for (uint32_t j = 0; j < 16; j++) {
+                    out[b*32u + j]      = d * (float)((int)(qs[j] & 0x0F) - 8);
+                    out[b*32u + j + 16] = d * (float)((int)(qs[j] >>   4) - 8);
+                }
+            }
+            return true;
+        }
         case 6: {  /* Q5_0: 32-elem blocks (2B f16 d + 4B qh hi-bits + 16B qs lo-nibbles) = 22B */
             const uint32_t nblk = ne / 32u;
             const uint8_t *row = (const uint8_t *)data + (size_t)token*nblk*22u;
@@ -4328,6 +4342,7 @@ static const char *dense_kquant_kernel(int type) {
         case 1:  return "kernel_dense_mul_mv_f16_f32";     /* F16 (full-precision models) */
         case 30: return "kernel_dense_mul_mv_bf16_f32";    /* BF16 (common HF native format) */
         case 8:  return "kernel_dense_mul_mv_q8_0_f32";    /* Q8_0 (32-block; gpt-oss) */
+        case 2:  return "kernel_dense_mul_mv_q4_0_f32";    /* Q4_0 legacy (32-block; gemma4 QAT) */
         case 6:  return "kernel_dense_mul_mv_q5_0_f32";    /* Q5_0 legacy (32-block; falcon) */
         case 7:  return "kernel_dense_mul_mv_q5_1_f32";    /* Q5_1 legacy (32-block; falcon) */
         case 10: return "kernel_dense_mul_mv_q2_K_f32";
@@ -4604,14 +4619,18 @@ ds4_dense_gpu *ds4_dense_gpu_create(const ds4_dense_model_desc *d) {
     g->kv = calloc(d->n_layer, sizeof(g->kv[0]));
     for (uint32_t il = 0; il < d->n_layer; il++) {
         const uint64_t cap = dense_kv_cap(g, il);   /* sliding layers cap at swa_window slots */
+        /* gemma4 has per-layer KV dims (swa 16x256=4096, full 4x512=2048); size each layer's cache to
+         * its own kvd. Other archs use the uniform g->kvd. */
+        const uint64_t lkvd = (d->gemma4 && d->layers[il].head_dim)
+                              ? (uint64_t)d->layers[il].n_kv * d->layers[il].head_dim : (uint64_t)g->kvd;
         if (g->kv_int8) {                            /* int8 KV (cap*kvd bytes) + per-slot f32 scale */
-            g->kv[il].k = ds4_gpu_tensor_alloc(cap*g->kvd);
-            g->kv[il].v = ds4_gpu_tensor_alloc(cap*g->kvd);
+            g->kv[il].k = ds4_gpu_tensor_alloc(cap*lkvd);
+            g->kv[il].v = ds4_gpu_tensor_alloc(cap*lkvd);
             g->kv[il].kscale = ds4_gpu_tensor_alloc(cap*4);
             g->kv[il].vscale = ds4_gpu_tensor_alloc(cap*4);
         } else {                                     /* f16 KV (cap*kvd*2 bytes) */
-            g->kv[il].k = ds4_gpu_tensor_alloc(cap*g->kvd*2);
-            g->kv[il].v = ds4_gpu_tensor_alloc(cap*g->kvd*2);
+            g->kv[il].k = ds4_gpu_tensor_alloc(cap*lkvd*2);
+            g->kv[il].v = ds4_gpu_tensor_alloc(cap*lkvd*2);
         }
     }
     /* split-KV attention partials: [n_head, S_max] and [n_head, S_max, head_dim] */
@@ -5294,6 +5313,30 @@ static bool gemma_qk_norm(ds4_dense_gpu *g, ds4_gpu_tensor *x, const ds4_dense_w
                             MTLSizeMake(n_head, 1, 1), MTLSizeMake(32, 1, 1), "gemma qk norm");
 }
 
+/* gemma4 weightless per-head RMS on V before attention (Vcur = ggml_rms_norm, no gain). In-place. */
+static bool gemma_v_norm(ds4_dense_gpu *g, ds4_gpu_tensor *x, uint32_t n_head, uint32_t head_dim, float eps) {
+    (void)g;
+    struct __attribute__((packed)) { uint32_t n_head, head_dim; float eps; } a = { n_head, head_dim, eps };
+    ds4_gpu_tensor *bufs[1] = { x };
+    return ds4_gpu_run_grid("kernel_gemma_v_norm_f32", &a, sizeof(a), bufs, 1,
+                            MTLSizeMake(n_head, 1, 1), MTLSizeMake(32, 1, 1), "gemma v norm");
+}
+
+/* Scale a vector in place by a scalar (gemma4 per-layer layer_output_scale). */
+static bool dense_scale(ds4_dense_gpu *g, ds4_gpu_tensor *x, float s, uint32_t n) {
+    (void)g;
+    struct __attribute__((packed)) { uint32_t n; float s; } a = { n, s };
+    ds4_gpu_tensor *bufs[1] = { x };
+    return ds4_gpu_run_simple("kernel_dense_scale_f32", &a, sizeof(a), bufs, 1, n, "gemma out scale");
+}
+
+/* Copy n floats src -> dst on the GPU (gemma4 full-attn layers: V = raw K projection). */
+static bool dense_copy(ds4_dense_gpu *g, ds4_gpu_tensor *dst, ds4_gpu_tensor *src, uint32_t n) {
+    (void)g;
+    ds4_gpu_tensor *bufs[2] = { src, dst };
+    return ds4_gpu_run_simple("kernel_dense_copy_f32", &n, sizeof(n), bufs, 2, n, "gemma v=k copy");
+}
+
 /* GeGLU activation: out[i] = gelu_tanh(gate[i]) * up[i]. */
 static bool gemma_geglu(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, uint32_t n) {
     ds4_gpu_tensor *bufs[3] = { gate, up, out };
@@ -5301,12 +5344,14 @@ static bool gemma_geglu(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tenso
 }
 
 /* NEOX RoPE with a linear freq_scale (global layers 0.125, local 1.0). */
-static bool gemma_rope(ds4_gpu_tensor *x, uint32_t nh, uint32_t hd, uint32_t nrot,
-                       uint32_t pos, float base, float freq_scale) {
-    struct __attribute__((packed)) { uint32_t n_head, head_dim, n_rot, pos; float fb, fs; }
-        a = { nh, hd, nrot, pos, base, freq_scale };
-    ds4_gpu_tensor *bufs[1] = { x };
-    return ds4_gpu_run_simple("kernel_gemma_rope_neox_f32", &a, sizeof(a), bufs, 1, nh*(nrot/2), "gemma rope");
+static bool gemma_rope(ds4_dense_gpu *g, ds4_gpu_tensor *x, uint32_t nh, uint32_t hd, uint32_t nrot,
+                       uint32_t pos, float base, float freq_scale, const ds4_dense_wdesc *freq_factors) {
+    ds4_gpu_tensor *ff = (freq_factors && freq_factors->data)
+                         ? dense_cached_weight(g, freq_factors->data, freq_factors->bytes) : NULL;
+    struct __attribute__((packed)) { uint32_t n_head, head_dim, n_rot, pos; float fb, fs; uint32_t use_ff; }
+        a = { nh, hd, nrot, pos, base, freq_scale, ff ? 1u : 0u };
+    ds4_gpu_tensor *bufs[2] = { x, ff ? ff : x };   /* dummy-bind x when no freq_factors (Metal needs buffer 2) */
+    return ds4_gpu_run_simple("kernel_gemma_rope_neox_f32", &a, sizeof(a), bufs, 2, nh*(nrot/2), "gemma rope");
 }
 
 /* Debug: read a GPU f32 buffer back and report nan/inf/min/max (gemma bring-up). */
@@ -5318,7 +5363,7 @@ static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d
                                  int token, unsigned pos, float *logits) {
     @autoreleasepool {
         const uint32_t ne=d->n_embd, nff=d->n_ff, nh=d->n_head, nkv=d->n_kv, hd=d->head_dim;
-        const uint32_t kvd=g->kvd, nrot=d->n_rot;
+        const uint32_t nrot=d->n_rot;   /* per-layer kvd/hd/nkv are derived in the loop (gemma4) */
         const float eps=d->rms_eps;
         const float scale = d->attn_scale > 0.0f ? d->attn_scale : 1.0f/sqrtf((float)hd);
         const uint32_t pattern = d->swa_pattern ? d->swa_pattern : 6u;
@@ -5350,18 +5395,30 @@ static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d
             const uint32_t cap = dense_kv_cap(g, il);
             const uint32_t wslot = pos % cap;
             const uint32_t n_attn = (n_keys < cap) ? n_keys : cap;
+            /* gemma4: per-layer attention dims (SWA head_dim 256 / 16 KV, FULL 512 / 4). n_head is
+             * constant; only head_dim / n_kv / n_rot / kv_dim vary. Other gemma archs use the uniform
+             * values (L->head_dim == 0 -> fall back). */
+            const uint32_t hd_il   = L->head_dim ? L->head_dim : hd;
+            const uint32_t nkv_il  = L->n_kv     ? L->n_kv     : nkv;
+            const uint32_t nrot_il = L->n_rot    ? L->n_rot    : nrot;
+            const uint32_t kvd_il  = nkv_il * hd_il;
 
             ok = gemma_rms(g, g->h, g->x, &L->attn_norm, ne, eps)
               && dense_matvec(g, &L->attn_q, g->h, g->q)
               && dense_matvec(g, &L->attn_k, g->h, g->k)
-              && dense_matvec(g, &L->attn_v, g->h, g->v)
-              /* QK-norm only if the model has it (gemma-3 yes, gemma-2 no). */
-              && (L->attn_q_norm.data ? gemma_qk_norm(g, g->q, &L->attn_q_norm, nh,  hd, eps) : true)
-              && (L->attn_k_norm.data ? gemma_qk_norm(g, g->k, &L->attn_k_norm, nkv, hd, eps) : true)
-              && gemma_rope(g->q, nh,  hd, nrot, pos, rbase, rscale)
-              && gemma_rope(g->k, nkv, hd, nrot, pos, rbase, rscale)
-              && dense_kv_write(g, kv, wslot, kvd)                                  /* f16 or int8 + scale */
-              && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv, hd, n_attn, scale, d->attn_softcap, 0)
+              /* V = wv@h, or the raw K projection when wv is absent (gemma4 full-attn layers). The
+               * copy must happen here, before K gets its QK-norm + RoPE, so V captures the raw K. */
+              && (L->attn_v.data ? dense_matvec(g, &L->attn_v, g->h, g->v)
+                                 : dense_copy(g, g->v, g->k, kvd_il))
+              /* QK-norm only if the model has it (gemma-3/gemma-4 yes, gemma-2 no). */
+              && (L->attn_q_norm.data ? gemma_qk_norm(g, g->q, &L->attn_q_norm, nh,     hd_il, eps) : true)
+              && (L->attn_k_norm.data ? gemma_qk_norm(g, g->k, &L->attn_k_norm, nkv_il, hd_il, eps) : true)
+              /* gemma4 normalizes V (weightless per-head RMS) before caching it. */
+              && (d->gemma4 ? gemma_v_norm(g, g->v, nkv_il, hd_il, eps) : true)
+              && gemma_rope(g, g->q, nh,     hd_il, nrot_il, pos, rbase, rscale, is_global ? &L->rope_freqs : NULL)
+              && gemma_rope(g, g->k, nkv_il, hd_il, nrot_il, pos, rbase, rscale, is_global ? &L->rope_freqs : NULL)
+              && dense_kv_write(g, kv, wslot, kvd_il)                               /* f16 or int8 + scale */
+              && dense_kv_read_attn(g, g->att, g->q, kv, nh, nkv_il, hd_il, n_attn, scale, d->attn_softcap, 0)
               && dense_matvec(g, &L->attn_out, g->att, g->o)
               && gemma_rms(g, g->h, g->o, &L->attn_post_norm, ne, eps)
               && dense_add(g->x, g->h, ne)
@@ -5371,7 +5428,9 @@ static int ds4_gemma_gpu_forward(ds4_dense_gpu *g, const ds4_dense_model_desc *d
               && gemma_geglu(g->act, g->gate, g->up, nff)
               && dense_matvec(g, &L->ffn_down, g->act, g->down)
               && gemma_rms(g, g->h2, g->down, &L->ffn_post_norm, ne, eps)
-              && dense_add(g->x, g->h2, ne);
+              && dense_add(g->x, g->h2, ne)
+              /* gemma4 per-layer output scalar: cur *= layer_output_scale. */
+              && (d->gemma4 && L->out_scale != 0.0f ? dense_scale(g, g->x, L->out_scale, ne) : true);
         }
         ok = ok && gemma_rms(g, g->h, g->x, &d->output_norm, ne, eps)
                 && dense_matvec(g, &d->output, g->h, g->logits);

@@ -162,6 +162,7 @@ typedef enum {
     DS4_ARCH_RWKV7     = 7,  /* RWKV-7 (Goose): linear-attention delta-rule recurrence + channel mix, no attention */
     DS4_ARCH_BERT      = 8,  /* BERT encoder-only: bidirectional attention, learned pos/type embeddings, embedding output */
     DS4_ARCH_T5        = 9,  /* T5 encoder-decoder: bidirectional encoder + causal decoder w/ cross-attention, relative pos bias */
+    DS4_ARCH_GEMMA4    = 10, /* gemma4: per-layer head dims (256 swa / 512 full), V-norm, layer out_scale, attn scale 1.0, final softcap */
 } ds4_arch_family;
 
 typedef struct {
@@ -385,6 +386,7 @@ DS4_MAYBE_UNUSED static inline bool ds4_arch_is_deepseek(void) { return DS4_ARCH
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_qwen3next(void) { return DS4_ARCH == DS4_ARCH_QWEN3NEXT; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma3(void) { return DS4_ARCH == DS4_ARCH_GEMMA3; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma2(void) { return DS4_ARCH == DS4_ARCH_GEMMA2; }
+DS4_MAYBE_UNUSED static inline bool ds4_arch_is_gemma4(void) { return DS4_ARCH == DS4_ARCH_GEMMA4; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_mamba(void) { return DS4_ARCH == DS4_ARCH_MAMBA; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_rwkv7(void) { return DS4_ARCH == DS4_ARCH_RWKV7; }
 DS4_MAYBE_UNUSED static inline bool ds4_arch_is_bert(void) { return DS4_ARCH == DS4_ARCH_BERT; }
@@ -3199,6 +3201,8 @@ typedef struct {
      * pre-attention / pre-feedforward norms. */
     ds4_tensor *attn_post_norm;  /* blk.%u.post_attention_norm */
     ds4_tensor *ffn_post_norm;   /* blk.%u.post_ffw_norm */
+    ds4_tensor *layer_out_scale; /* gemma4 blk.%u.layer_output_scale — per-layer scalar [1] (NULL otherwise) */
+    ds4_tensor *rope_freqs;      /* gemma4 blk.%u.rope_freqs — full-attn proportional-rope factors [n_rot/2] */
 } ds4_layer_weights;
 
 typedef struct {
@@ -4243,6 +4247,23 @@ static void config_build_gemma2_shape(const ds4_model *m) {
     g_ds4_shape.n_swa = swa ? swa : 4096u;
 }
 
+/* gemma4 (general.architecture == "gemma4"): NEW arch — text decoder of the multimodal gemma-4.
+ * Like gemma3 (QK-norm, sandwich norms, GeGLU, embedding scale, SWA pattern 6, dual rope) PLUS several
+ * novelties: HETEROGENEOUS per-layer attention dims (SWA layers head_dim 256 / 16 KV heads, FULL layers
+ * head_dim 512 / 4 KV heads), a weightless RMS-norm on V before attention, a per-layer scalar
+ * layer_output_scale, attention scale fixed at 1.0 (not 1/sqrt(head_dim)), final logit soft-capping (30),
+ * and proportional rope (freq_factors) on the full-attention layers. The per-layer head_dim/n_kv/rope are
+ * DERIVED from the bound tensor dims in dense_build_desc; key_length here (512, the full-layer value) sizes
+ * the scratch q buffer to the max. Runs the gemma forward (gemma4 branch). Vision tower is out of scope. */
+static void config_build_gemma4_shape(const ds4_model *m) {
+    config_build_dense_shape(m, "gemma4");
+    g_ds4_shape.arch = DS4_ARCH_GEMMA4;
+    g_ds4_shape.name = "Gemma 4";
+    uint32_t swa = 0;
+    model_get_u32_ns(m, "gemma4", "attention.sliding_window", &swa);
+    g_ds4_shape.n_swa = swa ? swa : 1024u;
+}
+
 /* gpt-oss (general.architecture == "gpt-oss"): MoE (top-4/32) transformer with GQA,
  * per-head attention sinks, alternating sliding-window/full attention, YaRN RoPE, and a
  * clamped-SwiGLU expert activation. Phase 0: read the shape; the forward is NOT built yet
@@ -4376,8 +4397,8 @@ static void config_build_t5_shape(const ds4_model *m) {
  * per-arch builder. Returns true + fills `ns` (the arch as a C string) when applicable. */
 static bool ds4_is_generic_dense(const ds4_model *m, ds4_str arch, char *ns, size_t ns_cap) {
     if (arch.len == 0 || ds4_str_eq_cstr(arch, "qwen3next") || ds4_str_eq_cstr(arch, "gpt-oss") ||
-        ds4_str_eq_cstr(arch, "gemma3") || ds4_str_eq_cstr(arch, "mamba") || ds4_str_eq_cstr(arch, "rwkv7") ||
-        ds4_str_eq_cstr(arch, "bert") || ds4_str_eq_cstr(arch, "t5"))
+        ds4_str_eq_cstr(arch, "gemma3") || ds4_str_eq_cstr(arch, "gemma4") || ds4_str_eq_cstr(arch, "mamba") ||
+        ds4_str_eq_cstr(arch, "rwkv7") || ds4_str_eq_cstr(arch, "bert") || ds4_str_eq_cstr(arch, "t5"))
         return false;
     size_t n = arch.len < ns_cap - 1 ? arch.len : ns_cap - 1;
     memcpy(ns, arch.ptr, n); ns[n] = '\0';
@@ -4412,6 +4433,10 @@ static void config_validate_model(const ds4_model *m) {
     }
     if (ds4_str_eq_cstr(arch, "gemma2")) {           /* gemma quirks + soft-capping (runs the gemma forward) */
         config_build_gemma2_shape(m);
+        return;
+    }
+    if (ds4_str_eq_cstr(arch, "gemma4")) {           /* gemma4: per-layer head dims + V-norm + out_scale (gemma forward) */
+        config_build_gemma4_shape(m);
         return;
     }
     if (ds4_str_eq_cstr(arch, "mamba")) {            /* state-space model — selective scan, no attention */
@@ -4659,12 +4684,12 @@ static void weights_validate_layout_dense(const ds4_weights *w, uint32_t start,
         dense_expect_dims(l->attn_norm, 1, n_embd, 0);
         if (l->attn_qkv) {                              /* phi-3 fused QKV: [n_embd, q_dim + 2*kv_dim] */
             dense_expect_dims(l->attn_qkv, 2, n_embd, q_dim + 2u*kv_dim);
-        } else {
+        } else if (!ds4_arch_is_gemma4()) {             /* gemma4: heterogeneous per-layer attn dims -> skip */
             dense_expect_dims(l->attn_q,  2, n_embd, q_dim);
             dense_expect_dims(l->attn_k,  2, n_embd, kv_dim);
             dense_expect_dims(l->attn_v,  2, n_embd, kv_dim);
         }
-        dense_expect_dims(l->attn_out,  2, q_dim,  n_embd);
+        if (!ds4_arch_is_gemma4()) dense_expect_dims(l->attn_out,  2, q_dim,  n_embd);
         dense_expect_dims_opt(l->attn_q_bias, 1, q_dim,  0);
         dense_expect_dims_opt(l->attn_k_bias, 1, kv_dim, 0);
         dense_expect_dims_opt(l->attn_v_bias, 1, kv_dim, 0);
@@ -4714,7 +4739,9 @@ static void weights_bind_layer_dense(ds4_layer_weights *l, const ds4_model *m, u
     if (!l->attn_qkv) {
         l->attn_q  = required_tensorf(m, "blk.%u.attn_q.weight", il);
         l->attn_k  = required_tensorf(m, "blk.%u.attn_k.weight", il);
-        l->attn_v  = required_tensorf(m, "blk.%u.attn_v.weight", il);
+        /* gemma4 full-attention layers omit attn_v (V reuses the raw K projection); make it optional. */
+        l->attn_v  = ds4_arch_is_gemma4() ? tensor_by_namef(m, "blk.%u.attn_v.weight", il)
+                                          : required_tensorf(m, "blk.%u.attn_v.weight", il);
     }
     l->attn_out      = required_tensorf(m, "blk.%u.attn_output.weight", il);
     l->attn_out_bias = tensor_by_namef(m, "blk.%u.attn_output.bias", il);  /* phi-2 / gpt-oss */
@@ -4742,10 +4769,15 @@ static void weights_bind_layer_dense(ds4_layer_weights *l, const ds4_model *m, u
      * (qwen2/llama/mistral). The dense forward applies it (before RoPE) only when present. */
     l->attn_q_norm = tensor_by_namef(m, "blk.%u.attn_q_norm.weight", il);
     l->attn_k_norm = tensor_by_namef(m, "blk.%u.attn_k_norm.weight", il);
-    /* gemma2/gemma3 extra norms: post-attention + post-ffn (same tensor names in both). */
-    if (ds4_arch_is_gemma3() || ds4_arch_is_gemma2()) {
+    /* gemma2/gemma3/gemma4 extra norms: post-attention + post-ffn (same tensor names). */
+    if (ds4_arch_is_gemma3() || ds4_arch_is_gemma2() || ds4_arch_is_gemma4()) {
         l->attn_post_norm = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);
         l->ffn_post_norm  = required_tensorf(m, "blk.%u.post_ffw_norm.weight", il);
+    }
+    /* gemma4 extras: per-layer output scalar + proportional-rope freq factors (full-attn layers only). */
+    if (ds4_arch_is_gemma4()) {
+        l->layer_out_scale = tensor_by_namef(m, "blk.%u.layer_output_scale.weight", il);
+        l->rope_freqs      = tensor_by_namef(m, "blk.%u.rope_freqs.weight", il);
     }
 }
 
@@ -23622,7 +23654,7 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
      * "joyai-llm" => byte-level BPE (merges). gemma3 uses SPM. */
     ds4_str tmodel = {0};
     model_get_string(model, "tokenizer.ggml.model", &tmodel);
-    const bool is_spm  = ds4_str_eq_cstr(tmodel, "llama");
+    const bool is_spm  = ds4_str_eq_cstr(tmodel, "llama") || ds4_str_eq_cstr(tmodel, "gemma4");
     const bool is_rwkv = ds4_str_eq_cstr(tmodel, "rwkv");
     const bool is_bert = ds4_str_eq_cstr(tmodel, "bert");
 
@@ -26705,11 +26737,26 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
      * 0.125). See config_build_gemma3_shape. */
     const bool gemma3 = ds4_arch_is_gemma3();
     const bool gemma2 = ds4_arch_is_gemma2();
-    const bool gemma = gemma3 || gemma2;
+    const bool gemma4 = ds4_arch_is_gemma4();
+    const bool gemma = gemma3 || gemma2 || gemma4;
     if (gemma) {
         desc->gemma            = 1;
         desc->embed_scale      = sqrtf((float)DS4_N_EMBD);
         desc->swa_window       = g_ds4_shape.n_swa ? g_ds4_shape.n_swa : (gemma2 ? 4096u : 1024u);
+    }
+    if (gemma4) {
+        /* gemma4: attention scale fixed at 1.0 (NOT 1/sqrt(hd)); global rope base 1e6 (freq_scale 1.0,
+         * proportional rope via per-layer freq_factors), local (swa) base 1e4; full-attention every 6th
+         * layer; final logit soft-cap 30, no attention soft-cap. Per-layer head dims + V-norm + layer
+         * out_scale are filled in the layer loop below. */
+        desc->gemma4           = 1;
+        desc->attn_scale       = 1.0f;
+        desc->rope_scale       = 1.0f;
+        desc->rope_base_local  = 10000.0f;
+        desc->rope_scale_local = 1.0f;
+        desc->swa_pattern      = 6u;
+        desc->attn_softcap     = 0.0f;
+        desc->final_softcap    = 30.0f;
     }
     if (gemma3) {
         desc->attn_scale       = 1.0f / sqrtf((float)DS4_N_EMBD / (float)DS4_N_HEAD);
@@ -26803,6 +26850,23 @@ static void dense_build_desc(ds4_dense_model_desc *desc, const ds4_model *model,
         L->ffn_down_exps = dense_wdesc_of(model, lw->ffn_down_exps);
         L->attn_norm_bias = dense_wdesc_of(model, lw->attn_norm_bias);   /* LayerNorm beta (NULL on RMSNorm) */
         L->ffn_norm_bias  = dense_wdesc_of(model, lw->ffn_norm_bias);
+        /* gemma4: heterogeneous per-layer attention dims, DERIVED from the bound tensor shapes (n_head is
+         * constant across layers). SWA layers come out head_dim 256 / 16 KV heads, FULL layers 512 / 4.
+         * Also the per-layer scalar layer_output_scale (read straight from the F32 [1] tensor) and the
+         * full-attention proportional-rope freq_factors. */
+        if (ds4_arch_is_gemma4() && DS4_N_HEAD) {
+            L->head_dim   = L->attn_q.dim1 / DS4_N_HEAD;
+            L->n_kv       = L->head_dim ? (L->attn_k.dim1 / L->head_dim) : 0u;
+            L->n_rot      = L->head_dim;
+            const ds4_dense_wdesc os = dense_wdesc_of(model, lw->layer_out_scale);
+            L->out_scale  = (os.data && os.type == 0) ? ((const float *)os.data)[0] : 0.0f;
+            /* full-attention layers (il%6==5) use proportional rope via the SHARED rope_freqs.weight
+             * tensor (one global tensor, llama TENSOR_DUPLICATED); swa layers leave it NULL. */
+            if (il % 6u == 5u) {
+                ds4_tensor *rf = model_find_tensor(model, "rope_freqs.weight");
+                if (rf) L->rope_freqs = dense_wdesc_of(model, rf);
+            }
+        }
     }
 }
 

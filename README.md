@@ -76,8 +76,12 @@ Metal engine, selected automatically from the GGUF `general.architecture`:
 - **DeepSeek V4** (PRO/FLASH) — the original MLA+MoE engine.
 - **Dense families**: `qwen2`, `qwen3` (with QK-norm), `llama`, `mistral`, plus a **generic
   fallback** that runs *any* unlisted llama-style transformer with no per-arch code.
-- **gemma-2 / gemma-3** (`gemma2`, `gemma3`): sandwich norms (4/layer), GeGLU, embedding scale,
-  sliding-window; gemma-3 adds QK-norm, gemma-2 adds attention + final logit soft-capping.
+- **gemma-2 / gemma-3 / gemma-4** (`gemma2`, `gemma3`, `gemma4`): sandwich norms (4/layer), GeGLU,
+  embedding scale, sliding-window; gemma-3 adds QK-norm, gemma-2 adds attention + final logit
+  soft-capping. **gemma-4-31B** (the multimodal model's text decoder) is byte-exact vs llama.cpp and
+  was the first arch with **heterogeneous per-layer attention dims** (sliding layers 256-wide / 16 KV
+  heads, full layers 512-wide / 4 KV heads), plus a weightless V-norm, a per-layer output scalar, and
+  proportional ("partial-NoPE") RoPE on the full-attention layers — all on the shared gemma forward.
 - **qwen3_next** (`qwen3next`): hybrid Gated-DeltaNet + MoE, SSD-streamed.
 - **gpt-oss** (`gpt-oss`): MoE + attention sinks + sliding-window + YaRN + harmony chat/tools.
 - **MoE** on the dense driver: `qwen3moe` (softmax→top-k→renorm routing).
@@ -88,7 +92,7 @@ Metal engine, selected automatically from the GGUF `general.architecture`:
 - **ALiBi & multi-query**: `bloom`/`mpt`/`jais` use ALiBi linear-bias attention (per-head slope, no
   RoPE); `falcon` runs parallel-residual + extreme multi-query (1 KV head, fused QKV) + NEOX RoPE.
   Both **mpt** and **falcon** are byte-exact vs llama.cpp.
-- **Weight dtypes**: F32, F16, BF16, Q2_K–Q6_K, Q8_0, **Q5_0/Q5_1** (legacy), IQ2_XXS — matvec kernels
+- **Weight dtypes**: F32, F16, BF16, Q2_K–Q6_K, Q8_0, **Q4_0/Q5_0/Q5_1** (legacy, incl. Google QAT), IQ2_XXS — matvec kernels
   numerically validated against an f32 CPU reference (F16/BF16 rel_err ≈ 4e-7).
 
 ### Benchmarks (M1 Max, 32 GB, greedy decode, N=64)
@@ -109,6 +113,7 @@ streaming — e.g. ds4's gpt-oss is 26 GB RSS but only **10.7 GB** private).
 | mpt-7B Q4_K_M | dense (generic, ALiBi) | 4.1 GB | 10.4 t/s | 42 t/s | **0.06 GB** | 4.3 GB |
 | falcon-7B Q4_K_M | dense (generic, multi-query) | 4.6 GB | 10.1 t/s | 39 t/s | **0.03 GB** | 4.7 GB |
 | gemma-3-27B Q4_K_M | dense (gemma) | 15.4 GB | 10.6 t/s | 12.0 t/s | 13.9 GB | 15.6 GB |
+| gemma-4-31B Q4_0 (QAT) | dense (gemma4) | 16.4 GB | 4.1 t/s | 15.2 t/s | **0.18 GB** | 16.8 GB |
 | gpt-oss-20B Q8_0 | MoE (gpt-oss) | 20.7 GB | 2.6 t/s | 58 t/s | 10.7 GB † | 20.5 GB |
 | Qwen3-Next-80B Q4_K_M | MoE (qwen3next) | 45.2 GB | 2.8 t/s | *can't* ‡ | 6.4 GB † | — ‡ |
 
@@ -121,10 +126,10 @@ Highlights:
 - **Dense: matches llama at 7B+, on less RAM.** For 7B–27B models decode is **82–89 %** of
   llama.cpp; below that, fixed per-token GPU-dispatch overhead dominates the tiny matmuls, so the
   smallest models run a larger fraction behind (stablelm-1.6B 17 %, phi-2 32 %, gemma-2-2B 63 %,
-  phi-3 82 %). The two 7B outliers — **mpt** and **falcon** at ~25 % — are quant-bound, not
-  arch-bound: their GGUFs carry legacy **Q5_0/Q5_1** weights whose matvec kernels are still the
-  correctness-first reference (one thread per row, no simdgroup variant yet), so they leave most of
-  the GPU idle. RAM stays *below* llama throughout — ds4 zero-copy-wraps the mmap'd weights instead
+  phi-3 82 %). The outliers — **mpt**/**falcon** (~25 %) and **gemma-4-31B** (~27 %) — are quant-bound,
+  not arch-bound: their GGUFs carry legacy **Q4_0/Q5_0/Q5_1** weights (gemma-4 is Google's QAT Q4_0)
+  whose matvec kernels are still the correctness-first reference (one thread per row, no simdgroup
+  variant yet), so they leave most of the GPU idle. RAM stays *below* llama throughout — ds4 zero-copy-wraps the mmap'd weights instead
   of copying: stablelm 0.4 vs 1.1 GB, gemma-2 0.3 vs 1.7, qwen2 3.8 vs 4.5, gemma-3 13.9 vs 15.6,
   and the zero-copy footprint of mpt/falcon is just **0.06 / 0.03 GB** (4 GB working set, all
   reclaimable file-backed mmap).
