@@ -28326,6 +28326,25 @@ static void dense_print_topbar(void) {
 /* Model basename shown in the input footer's shortcut line (set by ds4_dense_chat). */
 static char g_dense_status_model[64] = "";
 
+/* This process's resident RAM (RSS — the working set incl. the mmap'd model) and the
+ * system's currently-available RAM, in GiB. Shown live in the context bar. */
+#if defined(__APPLE__)
+#include <mach/mach.h>
+static void dense_mem_stats(double *used_gb, double *avail_gb) {
+    *used_gb = *avail_gb = 0.0;
+    task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS)
+        *used_gb = (double)vi.resident_size / 1073741824.0;
+    mach_port_t host = mach_host_self();
+    vm_size_t pg = 0; host_page_size(host, &pg);
+    vm_statistics64_data_t vm; mach_msg_type_number_t c = HOST_VM_INFO64_COUNT;
+    if (pg && host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm, &c) == KERN_SUCCESS)
+        *avail_gb = (double)((uint64_t)(vm.free_count + vm.inactive_count + vm.purgeable_count) * pg) / 1073741824.0;
+}
+#else
+static void dense_mem_stats(double *u, double *a) { *u = *a = 0.0; }
+#endif
+
 static void dense_ctx_status(char *out, size_t cap, uint32_t used, uint32_t total) {
     const int W = dense_box_w();
     size_t o = 0;
@@ -28338,12 +28357,20 @@ static void dense_ctx_status(char *out, size_t cap, uint32_t used, uint32_t tota
     SAPP("╯\033[0m\n");
     char lu[16], lt[16];
     dense_fmt_tok(used, lu, sizeof lu); dense_fmt_tok(total, lt, sizeof lt);
-    char left[48]; int lcells = snprintf(left, sizeof left, "context %s/%s", lu, lt);
     double frac = total ? (double)used / (double)total : 0.0; if (frac > 1.0) frac = 1.0;
     const int pct = (int)(frac * 100.0 + 0.5);
     const int barw = W < 52 ? 10 : 18;
     int filled = (int)(frac * barw + 0.5); if (filled > barw) filled = barw;
     char pctbuf[8]; int pl = snprintf(pctbuf, sizeof pctbuf, "%d%%", pct);
+    /* left = "context U/T", plus a live RAM segment (this process's RSS + system free)
+     * when the line is wide enough. ASCII only, so the byte length == display cells. */
+    char left[96]; int lcells = snprintf(left, sizeof left, "context %s/%s", lu, lt);
+    double used_gb = 0.0, avail_gb = 0.0; dense_mem_stats(&used_gb, &avail_gb);
+    char ram[48]; int raml = snprintf(ram, sizeof ram, "   RAM %.1fG used  %.1fG free", used_gb, avail_gb);
+    if (raml > 0 && W >= lcells + raml + barw + 1 + pl + 1) {
+        int more = snprintf(left + lcells, sizeof left - (size_t)lcells, "%s", ram);
+        if (more > 0) lcells += more;
+    }
     int pad = W - lcells - (barw + 1 + pl); if (pad < 1) pad = 1;
     SAPP("\033[2m%s", left);
     for (int i = 0; i < pad; i++) SAPP(" ");
@@ -28455,23 +28482,20 @@ static char *dense_readline(const char *prompt, const char *model_path,
                 struct timeval tv = { 0, 140000 };
                 if (select(wp + 1, &wf, NULL, NULL, &tv) <= 0) break;
             }
-            /* Clear the visible screen (scrollback preserved) so the previous,
-             * now-reflowed box doesn't linger garbled above the fresh one. The banner
-             * uses '\n' for line breaks, but linenoise has the tty in raw mode where
-             * '\n' is a bare line feed (no carriage return) — so temporarily re-enable
-             * output post-processing (ONLCR: \n -> \r\n) for the redraw, then restore. */
+            /* Redraw ONLY the input box at the new width — do NOT clear the whole screen
+             * or reprint the banner (that wiped the visible conversation, so a resize
+             * looked like the chat reset). linenoiseHide clears the linenoise-managed rows
+             * (prompt + input + 2 status rows) and leaves the cursor at the prompt row;
+             * we step up one row to clear+reprint the box's top border, then re-show at the
+             * new width. Everything above (the conversation) is left untouched. */
             linenoiseHide(&ls);
-            fputs("\033[H\033[2J", stdout);
-            struct termios traw; int have_t = (tcgetattr(STDOUT_FILENO, &traw) == 0);
-            if (have_t) { struct termios tc = traw; tc.c_oflag |= (OPOST | ONLCR);
-                          tcsetattr(STDOUT_FILENO, TCSANOW, &tc); }
-            dense_print_banner(model_path, n_ctx, device_str, init_text);
-            if (have_t) tcsetattr(STDOUT_FILENO, TCSANOW, &traw);
-            dense_print_topbar(); fputs("\r\n", stdout);          /* input-box top border */
             ls.cols = (size_t)dense_term_width();                 /* linenoise: follow new width */
+            fputs("\033[1A\r\033[0K", stdout);                    /* up to the top-border row + clear it */
+            dense_print_topbar(); fputs("\r\n", stdout);          /* reprint the box top border at new width */
             dense_ctx_status(stbuf, sizeof stbuf, used, n_ctx);   /* bar/box width follows resize */
             linenoiseEditSetStatus(&ls, stbuf, NULL, NULL);
             linenoiseShow(&ls);
+            (void)model_path; (void)device_str; (void)init_text;  /* banner no longer reprinted on resize */
         }
         if (FD_ISSET(STDIN_FILENO, &rf)) {
             res = linenoiseEditFeed(&ls);
