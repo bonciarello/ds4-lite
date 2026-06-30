@@ -27672,9 +27672,21 @@ static void md_feed(md_state *m, const char *buf, int n) {
 }
 static void md_flush(md_state *m) { if (m->llen > 0) { md_emit_line(m, m->line, m->llen); m->llen = 0; } }
 
-/* Generate one assistant response: stream tokens (sampling), render any
- * <think>...</think> reasoning dimmed with the markers suppressed, and return the
- * malloc'd answer text (everything after </think>). Advances *pos_io; sets *rc_io
+/* Emit one byte of dimmed "thinking" output. For a gemma4 reasoning channel, *cn (chan_name)
+ * is set on open: skip the channel-name line (up to the first '\n'); then the 💭 marker is
+ * printed LAZILY on the first real content byte (*cs), so an empty "thought" channel produces
+ * no stray marker. For the <think>-reflection path *cn==0 and *cs==1 (marker already printed),
+ * so this just streams the byte. */
+static void dense_think_emit(char b, int *cn, int *cs) {
+    if (*cn) { if (b == '\n') *cn = 0; return; }          /* skip "thought\n" header */
+    if (!*cs) { if (b == ' ' || b == '\n' || b == '\r' || b == '\t') return;   /* drop leading ws */
+                printf("\xf0\x9f\x92\xad "); *cs = 1; }    /* first reasoning byte -> show 💭 */
+    fwrite(&b, 1, 1, stdout);
+}
+
+/* Generate one assistant response: stream tokens (sampling), render any reasoning
+ * (<think>...</think> or gemma4 <|channel>thought…<channel|>) dimmed with the markers
+ * suppressed, and return the malloc'd answer text. Advances *pos_io; sets *rc_io
  * non-zero on a forward error. Shared by the normal turn and tool-response rounds. */
 static char *dense_chat_gen_response(int is_q3n, ds4_dense_gpu *g, const ds4_dense_model_desc *desc,
                                      ds4_q3n_gpu *qg, const ds4_q3n_model_desc *qdesc,
@@ -27683,6 +27695,11 @@ static char *dense_chat_gen_response(int is_q3n, ds4_dense_gpu *g, const ds4_den
                                      float temp, float top_p, int top_k, uint64_t *rng, int *rc_io) {
     uint32_t pos = *pos_io;
     bool in_think = think_turn, answer_started = false, in_toolcall = false;
+    /* gemma4 reasoning channels (<|channel>thought\n…<channel|>): skip the channel-name line
+     * and show the 💭 marker LAZILY, only once real reasoning content arrives — so empty
+     * "thought" scaffolding produces no stray "💭 thought". chan_shown starts set for the
+     * <think>-reflection path (it prints 💭 up front). */
+    int chan_name = 0, chan_shown = think_turn ? 1 : 0;
     char pend[16]; int pend_len = 0;
     char *ans = NULL; size_t ans_len = 0, ans_cap = 0;
     md_state md; md_init(&md);   /* claude-code-style markdown rendering of the answer */
@@ -27737,21 +27754,21 @@ static char *dense_chat_gen_response(int is_q3n, ds4_dense_gpu *g, const ds4_den
                 /* gemma4 reasoning-channel CLOSE (like </think>): the reasoning printed dimmed,
                  * the marker is dropped, and what follows prints as the normal answer. */
                 const int pre = pend_len - 10;
-                if (pre > 0) { if (in_think) fwrite(pend, 1, (size_t)pre, stdout);
+                if (pre > 0) { if (in_think) for (int k = 0; k < pre; k++) dense_think_emit(pend[k], &chan_name, &chan_shown);
                                else { md_feed(&md, pend, pre); dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); } }
                 pend_len = 0;
-                if (in_think) { printf("\033[0m\n"); in_think = false; }
+                if (in_think) { printf("\033[0m"); if (chan_shown) putchar('\n'); in_think = false; chan_name = 0; chan_shown = 0; }
             } else if (pend_len >= 10 && memcmp(pend + pend_len - 10, "<|channel>", 10) == 0) {
-                /* gemma4 reasoning-channel OPEN (like <think>): dim the channel content (its name
-                 * + reasoning) so only the post-channel answer prints normally. */
+                /* gemma4 reasoning-channel OPEN: enter dimmed mode + skip the channel-name line; the
+                 * 💭 marker is shown lazily (only if real reasoning follows) by dense_think_emit. */
                 const int pre = pend_len - 10;
-                if (pre > 0) { if (in_think) fwrite(pend, 1, (size_t)pre, stdout);
+                if (pre > 0) { if (in_think) for (int k = 0; k < pre; k++) dense_think_emit(pend[k], &chan_name, &chan_shown);
                                else { md_feed(&md, pend, pre); dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pre); } }
                 pend_len = 0;
-                if (!in_think) { printf("\033[2m\xf0\x9f\x92\xad "); in_think = true; }
+                if (!in_think) { printf("\033[2m"); in_think = true; chan_name = 1; chan_shown = 0; }
             } else if (pend_len > 11) {
                 const char b = pend[0];
-                if (in_think) { fwrite(&b, 1, 1, stdout); }
+                if (in_think) { dense_think_emit(b, &chan_name, &chan_shown); }
                 else if (in_toolcall) { dense_sbuf_append(&ans, &ans_len, &ans_cap, &b, 1); }
                 else {
                     dense_sbuf_append(&ans, &ans_len, &ans_cap, &b, 1);
@@ -27767,7 +27784,7 @@ static char *dense_chat_gen_response(int is_q3n, ds4_dense_gpu *g, const ds4_den
                     : ds4_dense_gpu_forward(g, desc, next, pos++, logits)) != 0) { *rc_io = 1; break; }
     }
     if (pend_len > 0) {
-        if (in_think) fwrite(pend, 1, (size_t)pend_len, stdout);
+        if (in_think) for (int k = 0; k < pend_len; k++) dense_think_emit(pend[k], &chan_name, &chan_shown);
         else if (in_toolcall) dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pend_len);
         else {
             dense_sbuf_append(&ans, &ans_len, &ans_cap, pend, (size_t)pend_len);
@@ -28326,6 +28343,38 @@ static void dense_print_topbar(void) {
 /* Model basename shown in the input footer's shortcut line (set by ds4_dense_chat). */
 static char g_dense_status_model[64] = "";
 
+/* Running transcript of the visible conversation, so a terminal RESIZE can reprint it
+ * (instead of clearing the screen or leaving a garbled reflowed box). Capped; oldest
+ * content is dropped when it would overflow. Appended by the chat loop, read by the
+ * resize handler in dense_readline. */
+static char  *g_transcript = NULL;
+static size_t g_transcript_len = 0, g_transcript_cap = 0;
+#define DS4_TRANSCRIPT_MAX (512u*1024u)
+static void dense_transcript_append(const char *s) {
+    if (!s) return;
+    size_t n = strlen(s);
+    if (n == 0) return;
+    if (g_transcript_len + n + 1 > g_transcript_cap) {
+        size_t nc = g_transcript_cap ? g_transcript_cap * 2 : 8192;
+        while (nc < g_transcript_len + n + 1) nc *= 2;
+        if (nc > DS4_TRANSCRIPT_MAX && g_transcript_len + n + 1 <= DS4_TRANSCRIPT_MAX) nc = DS4_TRANSCRIPT_MAX;
+        char *nb = realloc(g_transcript, nc);
+        if (!nb) return;
+        g_transcript = nb; g_transcript_cap = nc;
+    }
+    /* drop oldest half if we're over the cap (keep the tail = most recent turns) */
+    if (g_transcript_len + n + 1 > g_transcript_cap && g_transcript_len > 0) {
+        size_t keep = g_transcript_cap / 2;
+        if (keep > g_transcript_len) keep = g_transcript_len;
+        memmove(g_transcript, g_transcript + (g_transcript_len - keep), keep);
+        g_transcript_len = keep;
+    }
+    if (g_transcript_len + n + 1 <= g_transcript_cap) {
+        memcpy(g_transcript + g_transcript_len, s, n + 1);
+        g_transcript_len += n;
+    }
+}
+
 /* This process's resident RAM (RSS — the working set incl. the mmap'd model) and the
  * system's currently-available RAM, in GiB. Shown live in the context bar. */
 #if defined(__APPLE__)
@@ -28482,20 +28531,25 @@ static char *dense_readline(const char *prompt, const char *model_path,
                 struct timeval tv = { 0, 140000 };
                 if (select(wp + 1, &wf, NULL, NULL, &tv) <= 0) break;
             }
-            /* Redraw ONLY the input box at the new width — do NOT clear the whole screen
-             * or reprint the banner (that wiped the visible conversation, so a resize
-             * looked like the chat reset). linenoiseHide clears the linenoise-managed rows
-             * (prompt + input + 2 status rows) and leaves the cursor at the prompt row;
-             * we step up one row to clear+reprint the box's top border, then re-show at the
-             * new width. Everything above (the conversation) is left untouched. */
+            /* On resize the terminal reflows the scrollback and linenoise's cached cursor
+             * math goes stale, so an in-place box redraw garbles. Instead REPRINT the whole
+             * conversation cleanly at the new width: clear the screen (scrollback preserved),
+             * replay the running transcript, then redraw the input box. The transcript wraps
+             * naturally to the new width. linenoise is in raw mode (bare '\n'), so enable
+             * ONLCR ('\n'->'\r\n') just for the replay. */
             linenoiseHide(&ls);
-            ls.cols = (size_t)dense_term_width();                 /* linenoise: follow new width */
-            fputs("\033[1A\r\033[0K", stdout);                    /* up to the top-border row + clear it */
-            dense_print_topbar(); fputs("\r\n", stdout);          /* reprint the box top border at new width */
+            ls.cols = (size_t)dense_term_width();
+            fputs("\033[H\033[2J", stdout);
+            struct termios traw; int have_t = (tcgetattr(STDOUT_FILENO, &traw) == 0);
+            if (have_t) { struct termios tc = traw; tc.c_oflag |= (OPOST | ONLCR);
+                          tcsetattr(STDOUT_FILENO, TCSANOW, &tc); }
+            dense_print_banner(model_path, n_ctx, device_str, init_text);   /* header */
+            if (g_transcript && g_transcript_len) fwrite(g_transcript, 1, g_transcript_len, stdout);
+            if (have_t) tcsetattr(STDOUT_FILENO, TCSANOW, &traw);
+            dense_print_topbar(); fputs("\r\n", stdout);          /* input-box top border */
             dense_ctx_status(stbuf, sizeof stbuf, used, n_ctx);   /* bar/box width follows resize */
             linenoiseEditSetStatus(&ls, stbuf, NULL, NULL);
             linenoiseShow(&ls);
-            (void)model_path; (void)device_str; (void)init_text;  /* banner no longer reprinted on resize */
         }
         if (FD_ISSET(STDIN_FILENO, &rf)) {
             res = linenoiseEditFeed(&ls);
@@ -28516,10 +28570,11 @@ static void *dense_spinner_thread(void *arg) {
     static const char *fr[10] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
     const double t0 = now_sec();
     for (int i = 0; g_spin_run; i++) {
-        printf("\r\033[36m%s\033[0m \033[2m%s %.1fs\033[0m\033[K",
-               fr[i % 10], g_spin_msg, now_sec() - t0);
+        double ug = 0.0, ag = 0.0; dense_mem_stats(&ug, &ag);
+        printf("\r\033[36m%s\033[0m \033[2m%s %.1fs \xc2\xb7 RAM %.1fG used %.1fG free\033[0m\033[K",
+               fr[i % 10], g_spin_msg, now_sec() - t0, ug, ag);
         fflush(stdout);
-        usleep(90000);
+        usleep(200000);   /* 5 Hz: enough for a live RAM readout without flicker */
     }
     printf("\r\033[K");                  /* clear the spinner line */
     fflush(stdout);
@@ -29410,6 +29465,11 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
 
         const bool think_turn = think;
 
+        /* record the user turn for the resize-replay transcript */
+        dense_transcript_append("\033[1m›\033[0m ");
+        dense_transcript_append(line);
+        dense_transcript_append("\n\n");
+
         /* system block (first turn only) stays permanently in history. gemma has no
          * system role: emit a single <bos> instead (the conversation start marker). */
         if (first) {
@@ -29614,6 +29674,9 @@ int ds4_dense_chat(const char *model_path, const char *system, int ctx_size,
                 token_vec_free(&turn_clean);
             }
         }
+        /* record the assistant answer for the resize-replay transcript (raw text; the
+         * thinking channels and tool boxes are transient and not replayed). */
+        if (ans && *ans) { dense_transcript_append(ans); dense_transcript_append("\n\n"); }
         free(ans);
         printf("\n");
         fflush(stdout);
